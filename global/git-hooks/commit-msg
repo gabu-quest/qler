@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Strip AI-generated trailers from commit messages.
+# Runs automatically on every commit via git's commit-msg hook.
+#
+# Setup (one-time, per machine):
+#   git config --global core.hooksPath ~/the-standard/global/git-hooks
+#
+# Or symlink into your global hooks path:
+#   mkdir -p ~/.config/git/hooks
+#   ln -sf ~/the-standard/global/git-hooks/commit-msg ~/.config/git/hooks/commit-msg
+
+set -euo pipefail
+
+msg_file="$1"
+
+# Remove known AI trailers (case-insensitive, anchored to line start)
+# Covers: Co-Authored-By, Co-authored-by, Signed-off-by, Reviewed-by,
+#         Acked-by, Generated-by, and any "Co-authored-by: *Claude*" variant
+sed -i \
+  -e '/^[Cc]o-[Aa]uthored-[Bb]y:/d' \
+  -e '/^[Ss]igned-[Oo]ff-[Bb]y:/d' \
+  -e '/^[Rr]eviewed-[Bb]y:/d' \
+  -e '/^[Aa]cked-[Bb]y:/d' \
+  -e '/^[Gg]enerated-[Bb]y:/d' \
+  "$msg_file"
+
+# Remove trailing blank lines left after stripping
+sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$msg_file"
