@@ -25,7 +25,7 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 | File | Purpose |
 |------|---------|
 | `SPEC.md` | **MVP build spec** — what to build, how it works |
-| `ROADMAP.md` | **Phased milestones** — M0 (sqler gaps) through v0.2+ |
+| `ROADMAP.md` | **Phased milestones** — M-2 (sqler gaps) through v0.2+ |
 | `NORTH_STAR.md` | Vision, philosophy, non-negotiable principles |
 | `SQLER_GAPS.md` | Blocking sqler features (prerequisite) |
 | `BRAINSTORM.md` | Design exploration, competitive analysis |
@@ -130,3 +130,9 @@ tests/
 ├── unit/                # Immediate mode, fast
 └── integration/         # Real worker, slow
 ```
+
+---
+
+## Active Roadmaps
+
+- [ROADMAP.md](./ROADMAP.md) — current milestone: M-2 (sqler gaps)
