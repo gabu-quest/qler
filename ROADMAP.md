@@ -2,34 +2,59 @@
 
 ## Milestones
 
-### M0: sqler Gaps (prerequisite) ⬚
+### M-2: sqler Gaps (prerequisite) ⬚
 
 Resolve blocking features in sqler before qler implementation begins. See [SQLER_GAPS.md](SQLER_GAPS.md).
 
-- Multi-field `order_by()` — deterministic claim query
-- Promoted columns — real SQLite columns for hot fields
-- F-expressions in `update()` — atomic counter increments
-- `update_one()` returning model — race-free claiming (soft blocker, SafeModel works as fallback)
+**Where:** `/home/gabu/projects/pypi/sqler/`
+
+- Multi-field `order_by("-priority", "eta", "ulid")` — deterministic claim query (small effort)
+- Promoted columns (`__promoted__`, `__checks__`) — real SQLite columns for hot fields (large effort)
+- F-expressions in `update(attempts=F("attempts") + 1)` — atomic counter increments (medium effort)
+- `update_one()` with `RETURNING` — race-free claiming (medium effort, soft blocker but prioritize)
+
+**Exit criteria:** qler's claim query, schema, and atomic counters all expressible via sqler API.
+
+### M-1: logler Correlation Bridge ⬚
+
+Add log emission with correlation tracking to logler, so qler gets "why did this job fail → see all logs" from day one.
+
+**Where:** `/home/gabu/projects/logler/`
+
+- `logler.correlation_context(id)` — ContextVar-based context manager
+- `logler.CorrelationFilter` — Python logging filter that injects correlation_id
+- `logler.JsonHandler` — logging handler that emits JSON structured logs
+- Validate `logler llm search --correlation-id <id>` works with emitted JSON logs
+
+**Exit criteria:** `with logler.correlation_context("job-123"): logger.info("hello")` → logs with correlation_id → searchable via logler CLI.
+
+### M0: Project Scaffold ⬚
+
+Minimal package structure so `import qler` works.
+
+- `pyproject.toml` (uv, PEP 621, entry point `qler`)
+- `src/qler/__init__.py` — public API exports
+- `src/qler/exceptions.py` — error types
+- `tests/conftest.py` — shared fixtures
+- `uv init` + `uv sync`
+
+**Exit criteria:** `uv run python -c "import qler"` works.
 
 ### M1: Core Library ⬚
 
 Models, enqueue, claim, execute, complete/fail, retry. The inner loop.
 
-- Job + JobAttempt sqler models with promoted columns
-- `@task` decorator (async + sync via `to_thread`)
+- Enums: `JobStatus`, `AttemptStatus`, `FailureKind`
+- Models: `Job`, `JobAttempt` (sqler models with promoted columns)
 - `Queue` class (standalone DB or shared sqler `Database`)
+- `@task` decorator (async + sync via `to_thread`)
 - Enqueue with `_delay`, `_eta`, `_priority`, `_idempotency_key`
-- Payload validation + size limits at enqueue time
-- Claim via SafeModel optimistic locking
-- Success completion + failure recording
-- Retry with exponential backoff + jitter
+- Payload validation + size limits
+- Claim via SafeModel (upgrade to `update_one` when available)
+- Complete / fail / retry operations
 - `job.wait()`, `job.cancel()`, `job.retry()`
-- Exceptions: `JobFailedError`, `JobCancelledError`, `PayloadTooLargeError`, etc.
-- Task identity constraint (reject nested functions, lambdas)
-- Task resolution (`--module` / `--app`)
-- Signature mismatch → permanent failure
 
-**Exit criteria:** Can enqueue a job, have a worker claim and execute it, see it complete or fail with attempt history.
+**Exit criteria:** Can enqueue → claim → execute → complete/fail with attempt history.
 
 ### M2: Worker + Lease Management ⬚
 
@@ -37,31 +62,26 @@ The production-ready worker loop.
 
 - Worker loop with concurrency semaphore
 - Automatic lease renewal (background asyncio task)
-- Manual lease renewal escape hatch (`current_job().renew_lease()`)
+- Manual renewal escape hatch (`current_job().renew_lease()`)
 - Lease expiry recovery (periodic scan)
 - Graceful shutdown (SIGTERM → drain → exit)
-- Worker ID format: `{hostname}:{pid}:{ulid}`
+- logler correlation context wrapping job execution
 
-**Exit criteria:** Worker runs reliably, recovers from crashes, handles concurrent jobs, shuts down cleanly.
+**Exit criteria:** Worker runs reliably, recovers from crashes, handles concurrent jobs, shuts down cleanly, logs are correlated.
 
 ### M3: CLI ⬚
 
 Human-first CLI with `--json` flag.
 
-- `qler init` — create DB, set PRAGMAs, auto-add to .gitignore
-- `qler worker` — start worker process
-- `qler status` — queue depths and totals
-- `qler jobs` — list/filter (--status, --since, --limit, --task)
-- `qler job <id>` — detail with last attempt
-- `qler attempts <id>` — full attempt history
-- `qler retry` — re-enqueue by ID or filter
-- `qler cancel` — cancel pending by ID or filter
-- `qler purge` — delete terminal jobs older than threshold
-- `qler doctor` — health checks (schema, WAL, orphaned tasks, stale jobs)
-- `--json` flag on all commands
-- JSON robustness (never crash on corrupt data)
+- `qler init` — create DB, PRAGMAs, auto-gitignore
+- `qler worker` — start worker (--app/--module, --queues, --concurrency)
+- `qler status` — queue depths
+- `qler jobs` / `qler job <id>` / `qler attempts <id>` — list/detail
+- `qler retry` / `qler cancel` / `qler purge` — bulk operations
+- `qler doctor` — health checks
+- Human-first output, `--json` flag on all commands
 
-**Exit criteria:** All commands work, human output is readable, `--json` output is parseable.
+**Exit criteria:** All commands work, human output readable, --json parseable.
 
 ### M4: Testing + Polish ⬚
 
@@ -69,14 +89,12 @@ Test suite and pre-release polish.
 
 - Immediate mode (`Queue(..., immediate=True)`)
 - `task.run_now()` for direct execution
-- Unit test suite (immediate mode)
-- Integration test suite (real worker)
-- Tests for: completion, retry, lease expiry, attempt history, idempotency, cancel, signature mismatch
-- `pyproject.toml` with proper metadata
-- `py.typed` marker (PEP 561)
-- README with real examples (not aspirational)
+- Unit tests (immediate mode)
+- Integration tests (real worker)
+- `pyproject.toml` metadata finalized
+- README with real (not aspirational) examples
 
-**Exit criteria:** Test suite passes, package installable via `uv pip install`, README accurate.
+**Exit criteria:** Tests pass, `uv pip install .` works, README accurate.
 
 ---
 
@@ -86,9 +104,7 @@ These are explicitly NOT in v0.1. Ordered by likely priority.
 
 | Feature | Notes |
 |---------|-------|
-| logler integration | Correlation context in worker, `qler logs` command |
 | procler integration | Health endpoint, worker process definitions |
-| `update_one()` claim | Atomic claim when sqler ships the feature |
 | Cooperative cancellation | `cancel_requested` flag for running jobs |
 | Periodic/cron tasks | `@cron` decorator |
 | Web dashboard | Vue 3 + Naive UI (read-only + operational) |
