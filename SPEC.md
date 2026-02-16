@@ -1,7 +1,7 @@
 # qler — MVP Build Spec
 
 **Version:** 0.1.0
-**Status:** Build-ready (pending sqler gaps)
+**Status:** Build-ready (sqler gaps resolved)
 **Date:** 2026-02-16
 
 ---
@@ -39,10 +39,10 @@ qler uses sqler's native API for ALL database operations. See [SQLER_GAPS.md](SQ
 | `AsyncSQLerSafeModel` | **Exists** | Job/Attempt models with optimistic locking |
 | `F()` expressions in filter | **Exists** | All queries |
 | `db.transaction()` | **Exists** | Atomic multi-model operations |
-| Multi-field `order_by()` | **Gap** | Claim query ordering |
-| Promoted columns | **Gap** | Real columns for hot fields |
-| `F()` in `update()` | **Gap** | Atomic counter increments |
-| `update_one()` returning model | **Gap (soft blocker)** | Race-free claiming without thundering herd |
+| Multi-field `order_by()` | **Exists** | Claim query ordering |
+| Promoted columns | **Exists** | Real columns for hot fields |
+| `F()` in `update()` | **Exists** | Atomic counter increments |
+| `update_one()` returning model | **Exists** | Race-free claiming without thundering herd |
 
 **Note:** API signatures for gap features are aspirational. Semantics are stable; method names may evolve.
 
