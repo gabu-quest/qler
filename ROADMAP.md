@@ -2,20 +2,25 @@
 
 ## Milestones
 
-### M-2: sqler Gaps (prerequisite) ⬚
+### M-2: sqler Gaps (prerequisite) ✅
 
-Resolve blocking features in sqler before qler implementation begins. See [SQLER_GAPS.md](SQLER_GAPS.md).
+Resolved all blocking sqler features. See [SQLER_GAPS.md](SQLER_GAPS.md).
 
-**Where:** `/home/gabu/projects/pypi/sqler/`
+**Where:** `/home/gabu/projects/pypi/sqler/` — branch `feat/qler-prerequisites`
 
-- Multi-field `order_by("-priority", "eta", "ulid")` — deterministic claim query (small effort)
-- Promoted columns (`__promoted__`, `__checks__`) — real SQLite columns for hot fields (large effort)
-- F-expressions in `update(attempts=F("attempts") + 1)` — atomic counter increments (medium effort)
-- `update_one()` with `RETURNING` — race-free claiming (medium effort, soft blocker but prioritize)
+- ✅ Multi-field `order_by("-priority", "eta", "ulid")` — Django-style, `-` prefix = DESC
+- ✅ Promoted columns (`__promoted__`, `__checks__`) — real SQLite columns, CHECK constraints, SQL rewriting
+- ✅ F-expressions in `update(attempts=F("attempts") + 1)` — atomic increments via `SQLerUpdateExpression`
+- ✅ `update_one()` with `RETURNING` — atomic update-and-return, race-free claiming
 
-**Exit criteria:** qler's claim query, schema, and atomic counters all expressible via sqler API.
+**Exit criteria met:** qler's claim query is now fully expressible:
+```python
+Job.query().filter(...).order_by("-priority", "eta", "ulid").update_one(
+    status="running", attempts=F("attempts") + 1
+)
+```
 
-### M-1: logler-sqler Bridge ⬚
+### M-1: logler-sqler Bridge ⬚ ← next
 
 Give logler the ability to ingest directly from sqler SQLite databases — no manual file exports, no temp file management by the user. logler handles everything behind the scenes.
 
