@@ -20,7 +20,7 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 
 ## Project Status
 
-**Pre-implementation.** The spec is build-ready but blocked on sqler gaps.
+**Pre-implementation.** The spec is build-ready. sqler gaps resolved (M-2 complete).
 
 | File | Purpose |
 |------|---------|
@@ -86,16 +86,16 @@ All -ler libraries MUST integrate through their public APIs.
 
 ---
 
-## Blockers (sqler Gaps)
+## sqler Gaps (Resolved)
 
-Implementation MUST NOT begin until hard blockers are resolved. See `SQLER_GAPS.md`.
+All sqler prerequisites have been implemented on branch `feat/qler-prerequisites`. See `SQLER_GAPS.md`.
 
 | Gap | Status | Impact |
 |-----|--------|--------|
-| Multi-field ordering | **Hard blocker** | Deterministic claim query |
-| Promoted columns | **Hard blocker** | CHECK constraints, indexes |
-| F-expressions in update | **Hard blocker** | Atomic counters |
-| Atomic update-and-return | **Soft blocker** | SafeModel works but thundering herds under concurrency |
+| Multi-field ordering | **Resolved** | Deterministic claim query |
+| Promoted columns | **Resolved** | CHECK constraints, indexes |
+| F-expressions in update | **Resolved** | Atomic counters |
+| Atomic update-and-return | **Resolved** | Race-free claiming via `update_one()` |
 
 ---
 
@@ -135,4 +135,4 @@ tests/
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — current milestone: M-2 (sqler gaps)
+- [ROADMAP.md](./ROADMAP.md) — current milestone: M-1 (logler-sqler bridge)

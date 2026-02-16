@@ -1,7 +1,7 @@
 # sqler Gaps for qler
 
-**Purpose:** Features sqler needs before qler implementation begins.  
-**Status:** Pre-implementation  
+**Purpose:** Features sqler needs before qler implementation begins.
+**Status:** All gaps resolved (2026-02-16) — sqler branch `feat/qler-prerequisites`
 **Priority:** Must-have for qler v0.1
 
 ---
@@ -287,14 +287,16 @@ Low implementation effort. Internally, store a list of `(field, desc)` tuples in
 
 ---
 
-## Implementation Priority
+## Implementation Status
 
-| Gap | Effort | qler Blocked? | Notes |
-|-----|--------|:---:|-------|
-| **Multi-field ordering** | Small | **Yes** | Claim query needs deterministic ordering |
-| **Promoted columns** | Large | **Yes** | CHECK constraints + index performance are non-negotiable for correctness |
-| **F-expressions in update** | Medium | **Yes** | Atomic counter increments, no safe workaround |
-| **Update-and-return** | Medium | **Soft blocker** | SafeModel claim works but thundering herds under any real concurrency — see below |
+All gaps resolved on 2026-02-16 in sqler branch `feat/qler-prerequisites` (commit `0d6f9b0`).
+
+| Gap | Status | sqler API |
+|-----|--------|-----------|
+| **Multi-field ordering** | ✅ Resolved | `order_by("-priority", "eta", "ulid")` |
+| **Promoted columns** | ✅ Resolved | `__promoted__` dict + `__checks__` dict on model class |
+| **F-expressions in update** | ✅ Resolved | `update(count=F("count") + 1)` via `SQLerUpdateExpression` |
+| **Update-and-return** | ✅ Resolved | `update_one(status="running", attempts=F("attempts") + 1)` |
 
 ### Update-and-return: Soft Blocker (Revised Assessment)
 
