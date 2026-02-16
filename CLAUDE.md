@@ -20,13 +20,14 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 
 ## Project Status
 
-**Pre-implementation.** The spec is complete but implementation is blocked on sqler gaps.
+**Pre-implementation.** The spec is build-ready but blocked on sqler gaps.
 
 | File | Purpose |
 |------|---------|
-| `SPEC.md` | Full technical specification (77KB) — **the source of truth** |
+| `SPEC.md` | **MVP build spec** — what to build, how it works |
+| `ROADMAP.md` | **Phased milestones** — M0 (sqler gaps) through v0.2+ |
 | `NORTH_STAR.md` | Vision, philosophy, non-negotiable principles |
-| `SQLER_GAPS.md` | Blocking sqler features that must exist before implementation |
+| `SQLER_GAPS.md` | Blocking sqler features (prerequisite) |
 | `BRAINSTORM.md` | Design exploration, competitive analysis |
 
 **No source code exists yet.** When implementation begins, the package will live in `src/qler/`.
@@ -40,15 +41,16 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 | Primary key | ULID (text) | Sortable, unique, no coordination needed |
 | Job claiming | Lease-based | Predictable recovery without separate coordinator |
 | Delivery guarantee | At-least-once | Explicit; tasks SHOULD be idempotent |
-| Storage model | Promoted columns + JSON blob | Hot fields (status, queue, priority, eta) get real columns for indexes/CHECK; everything else stays in sqler's JSON document |
-| Failure tracking | `FailureKind` enum | Structured reasons prevent ghost states, enable smart retry logic |
+| Storage model | Promoted columns + JSON blob | Hot fields get real columns; rest stays in sqler's document store |
+| Failure tracking | `FailureKind` enum | Structured reasons prevent ghost states |
+| CLI output | Human-first, `--json` flag | Readable by default, machine-parseable on demand |
 | Config | Code, not YAML | Git-friendly, code-reviewable |
 
 ---
 
 ## The -ler Stack
 
-qler is one piece of a cohesive toolkit. All -ler libraries MUST integrate through their public APIs.
+All -ler libraries MUST integrate through their public APIs.
 
 | Layer | Tool | Responsibility |
 |-------|------|----------------|
@@ -58,48 +60,42 @@ qler is one piece of a cohesive toolkit. All -ler libraries MUST integrate throu
 | Processes | **procler** | Process management, health checks |
 | Future | **dagler** | DAG/pipeline orchestration (post qler v1.0) |
 
-**Key integration:** A job's `correlation_id` connects the job record (qler) → logs (logler) → worker process (procler).
-
 ---
 
 ## Non-Negotiable Rules
 
 ### 1. Never bypass the -ler stack
 
-- All DB operations MUST go through sqler's model API — no `db.adapter.execute()`, no raw SQL
-- All logging MUST go through logler — no raw file reads
+- All DB operations MUST go through sqler's model API — no raw SQL
 - If sqler can't express an operation, **fix sqler** — don't work around it
 
 ### 2. SQLite is the design center
 
 - NEVER add features that "work better with Postgres"
 - Use WAL mode, `UPDATE...RETURNING`, partial indexes — lean into SQLite strengths
-- Single-file deployment is a feature, not a limitation
 
 ### 3. Debuggability over features
 
 - Every design decision MUST answer: "Does this make debugging easier?"
 - Full attempt history preserved, structured failure kinds, correlation IDs
-- CLI outputs JSON for LLM consumption
 
 ### 4. Explicit over magic
 
 - No auto-discovery of tasks — explicit `@task` decorator required
 - Workers MUST specify which queues to process
-- No UI-only settings that can't be code-reviewed
 
 ---
 
 ## Blockers (sqler Gaps)
 
-Implementation MUST NOT begin until these sqler features exist. See `SQLER_GAPS.md` for full details.
+Implementation MUST NOT begin until hard blockers are resolved. See `SQLER_GAPS.md`.
 
-| Gap | What | Blocks |
-|-----|------|--------|
-| Multi-field ordering | `order_by("-priority", "eta", "ulid")` | Deterministic claim query |
-| Promoted columns | Real SQLite columns for hot fields | CHECK constraints, indexes |
-| F-expressions in update | `update(attempts=F("attempts") + 1)` | Atomic counters |
-| Atomic update-and-return | `update_one()` with `RETURNING` | Race-free job claiming |
+| Gap | Status | Impact |
+|-----|--------|--------|
+| Multi-field ordering | **Hard blocker** | Deterministic claim query |
+| Promoted columns | **Hard blocker** | CHECK constraints, indexes |
+| F-expressions in update | **Hard blocker** | Atomic counters |
+| Atomic update-and-return | **Soft blocker** | SafeModel works but thundering herds under concurrency |
 
 ---
 
@@ -110,28 +106,27 @@ Implementation MUST NOT begin until these sqler features exist. See `SQLER_GAPS.
 | Python | 3.12+ | Runtime |
 | asyncio | stdlib | Async foundation |
 | SQLite | WAL mode | Storage (via sqler) |
-| uv | latest | Package management, task running |
+| uv | latest | Package management |
 | sqler | latest | Database operations |
+| click | latest | CLI |
 
 ---
 
-## When Implementation Begins
-
-The package structure SHOULD follow:
+## File Structure (when implementation begins)
 
 ```
 src/qler/
-├── __init__.py          # Public API: Queue, task, Job
+├── __init__.py          # Public API: Queue, task, current_job
 ├── queue.py             # Queue class
 ├── task.py              # @task decorator
-├── models.py            # Job, JobAttempt (sqler models)
-├── worker.py            # Worker loop
-├── cli.py               # CLI interface
+├── models/
+│   ├── job.py           # Job model
+│   └── attempt.py       # JobAttempt model
+├── worker.py            # Worker loop + lease renewal
+├── cli.py               # Click CLI
+├── exceptions.py        # Error types
 └── py.typed             # PEP 561 marker
 tests/
-├── conftest.py
-├── test_queue.py
-├── test_task.py
-├── test_worker.py
-└── test_models.py
+├── unit/                # Immediate mode, fast
+└── integration/         # Real worker, slow
 ```

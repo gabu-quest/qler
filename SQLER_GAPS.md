@@ -291,17 +291,29 @@ Low implementation effort. Internally, store a list of `(field, desc)` tuples in
 
 | Gap | Effort | qler Blocked? | Notes |
 |-----|--------|:---:|-------|
-| **Multi-field ordering** | Small | Yes | Claim query needs deterministic ordering |
-| **F-expressions in update** | Medium | Partial | Optimistic claim works without it, but atomic increment needs it |
-| **Promoted columns** | Large | Partial | qler CAN work with pure JSON, but loses CHECK constraints + index performance |
-| **Update-and-return** | Medium | No | Optimistic claim (with StaleVersionError retry) works as fallback |
+| **Multi-field ordering** | Small | **Yes** | Claim query needs deterministic ordering |
+| **Promoted columns** | Large | **Yes** | CHECK constraints + index performance are non-negotiable for correctness |
+| **F-expressions in update** | Medium | **Yes** | Atomic counter increments, no safe workaround |
+| **Update-and-return** | Medium | **Soft blocker** | SafeModel claim works but thundering herds under any real concurrency — see below |
+
+### Update-and-return: Soft Blocker (Revised Assessment)
+
+Originally classified as "No" (not blocking). Revised to **soft blocker**.
+
+The SafeModel fallback (read → modify → save, retry on `StaleVersionError`) works in single-worker or low-contention scenarios. But with 2+ concurrent workers, every claim attempt becomes:
+1. Both workers SELECT the same pending job
+2. Both try UPDATE with version check
+3. One wins, one retries (wasted round-trip)
+4. Under sustained load, this compounds into thundering herd behavior
+
+This is acceptable for getting started but will be the first thing you hit in integration testing with `concurrency > 1`. Prioritize shipping `update_one()` in sqler alongside or immediately after the hard blockers.
 
 ### Suggested order
 
 1. Multi-field ordering (unblocks basic queries)
 2. Promoted columns (unblocks proper schema)
 3. F-expressions in update (unblocks atomic counters)
-4. Update-and-return (performance optimization for high-contention)
+4. **Update-and-return (prioritize — soft blocker for real-world concurrency)**
 
 ---
 
