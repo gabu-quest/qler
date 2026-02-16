@@ -15,18 +15,27 @@ Resolve blocking features in sqler before qler implementation begins. See [SQLER
 
 **Exit criteria:** qler's claim query, schema, and atomic counters all expressible via sqler API.
 
-### M-1: logler Correlation Bridge ⬚
+### M-1: logler-sqler Bridge ⬚
 
-Add log emission with correlation tracking to logler, so qler gets "why did this job fail → see all logs" from day one.
+Give logler the ability to ingest directly from sqler SQLite databases — no manual file exports, no temp file management by the user. logler handles everything behind the scenes.
 
 **Where:** `/home/gabu/projects/logler/`
 
-- `logler.correlation_context(id)` — ContextVar-based context manager
-- `logler.CorrelationFilter` — Python logging filter that injects correlation_id
-- `logler.JsonHandler` — logging handler that emits JSON structured logs
-- Validate `logler llm search --correlation-id <id>` works with emitted JSON logs
+**Database source (the main bridge):**
+- `Investigator.load_from_db(db_path)` — new data source that reads sqler SQLite tables directly
+- Map sqler model rows → LogEntry format (timestamps, levels, messages extracted from JSON data column)
+- CLI: `logler llm search --db path/to/app.db` (or similar flag) — user just points at a DB
+- If Rust/DuckDB need intermediate files internally, logler handles that transparently
 
-**Exit criteria:** `with logler.correlation_context("job-123"): logger.info("hello")` → logs with correlation_id → searchable via logler CLI.
+**Correlation context (runtime log emission):**
+- `logler.correlation_context(id)` — ContextVar-based context manager
+- `logler.CorrelationFilter` — Python logging filter that injects correlation_id into log records
+- `logler.JsonHandler` — logging handler that emits JSON structured logs logler can parse
+
+**Exit criteria:**
+- `logler llm search --db qler.db` → shows job attempts, failures, etc. without manual steps
+- `with logler.correlation_context("job-123"): logger.info("hello")` → logs with correlation_id → searchable via logler CLI
+- logler can correlate DB records + runtime logs for end-to-end job investigation
 
 ### M0: Project Scaffold ⬚
 
