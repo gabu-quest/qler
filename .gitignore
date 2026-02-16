@@ -32,6 +32,9 @@ htmlcov/
 *.swp
 *.swo
 
+# Local Claude context (personal; do not share)
+CLAUDE.local.md
+
 # OS
 .DS_Store
 Thumbs.db
