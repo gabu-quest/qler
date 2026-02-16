@@ -1,131 +1,137 @@
-# Claude Context: The Standard Repository
+# Claude Context: qler
 
-**Version:** 1.2.0 | **Type:** Engineering Doctrine Repository
-
-**This file provides context for AI agents working ON this repository.**
-
----
-
-## What This Repo Is
-
-**The Standard** is an engineering doctrine repository for AI-assisted software development. It defines opinionated standards for tooling, testing, and code quality.
-
-**This is a documentation repository, not a code repository.** When working here, you're maintaining the doctrine itself.
+**Version:** 0.1.0 (pre-implementation)
+**Type:** Python library — background job queue on SQLite
 
 ---
 
-## Repository Structure
+## What qler Is
 
-```
-/
-├── CLAUDE.md              ← This file (for contributors)
-├── agents.md              ← Core agent doctrine (START HERE)
-├── README.md              ← Repo introduction
-├── CHANGELOG.md           ← Version history
-├── LICENSE
-├── docs/                  ← Doctrine documents
-│   ├── testing.md         ← Testing doctrine (critical)
-│   ├── doctrine/          ← Domain-specific doctrines
-│   ├── testing-*.md       ← Framework-specific testing guides
-│   └── quick-reference/   ← One-page summaries
-├── examples/              ← Reference implementations
-├── adoption/              ← Adoption checklist
-├── .github/               ← Issue/PR templates
-└── global/                ← Personal global Claude config (see below)
-    └── .claude/           ← Symlinked to ~/.claude
-```
+qler is an **async-first background job queue** for Python, built on SQLite via sqler.
+
+**One sentence:** "Background jobs without Redis, with first-class debugging."
+
+- SQLite is the **only** infrastructure — no Redis, no RabbitMQ
+- Async-native (`asyncio` first, sync compatibility layer second)
+- Built for the **-ler ecosystem** (sqler, logler, procler)
+- Debuggability over features — every failure is fully explainable
 
 ---
 
-## Key Files
+## Project Status
+
+**Pre-implementation.** The spec is complete but implementation is blocked on sqler gaps.
 
 | File | Purpose |
 |------|---------|
-| [`agents.md`](./agents.md) | Core operating rules, workflow, roles |
-| [`docs/testing.md`](./docs/testing.md) | Testing doctrine - "A failing test is a gift" |
-| [`docs/doctrine/README.md`](./docs/doctrine/README.md) | Index of all domain doctrines |
-| [`examples/`](./examples/) | Reference implementations |
+| `SPEC.md` | Full technical specification (77KB) — **the source of truth** |
+| `NORTH_STAR.md` | Vision, philosophy, non-negotiable principles |
+| `SQLER_GAPS.md` | Blocking sqler features that must exist before implementation |
+| `BRAINSTORM.md` | Design exploration, competitive analysis |
+
+**No source code exists yet.** When implementation begins, the package will live in `src/qler/`.
 
 ---
 
-## Working in This Repository
+## Core Architecture Decisions
 
-### Principles
-
-1. **Clarity is paramount** - Docs must be clear for both humans and AI
-2. **Normative language** - Use MUST/MUST NOT/SHOULD (RFC 2119)
-3. **Opinionated with rationale** - Strong opinions, justified
-4. **Internal consistency** - All doctrine docs must align
-
-### Common Tasks
-
-**Adding doctrine:** Create in `docs/doctrine/`, update `docs/doctrine/README.md`, add quick-reference.
-
-**Adding examples:** Put in `examples/` with README explaining what it shows.
-
-See existing files for templates and patterns.
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Primary key | ULID (text) | Sortable, unique, no coordination needed |
+| Job claiming | Lease-based | Predictable recovery without separate coordinator |
+| Delivery guarantee | At-least-once | Explicit; tasks SHOULD be idempotent |
+| Storage model | Promoted columns + JSON blob | Hot fields (status, queue, priority, eta) get real columns for indexes/CHECK; everything else stays in sqler's JSON document |
+| Failure tracking | `FailureKind` enum | Structured reasons prevent ghost states, enable smart retry logic |
+| Config | Code, not YAML | Git-friendly, code-reviewable |
 
 ---
 
-## Instruction Hierarchy
+## The -ler Stack
 
-When editing this repo:
+qler is one piece of a cohesive toolkit. All -ler libraries MUST integrate through their public APIs.
 
-1. User's explicit request
-2. This CLAUDE.md
-3. agents.md (our own standards apply to us)
-4. Existing patterns in this repo
+| Layer | Tool | Responsibility |
+|-------|------|----------------|
+| Storage | **sqler** | SQLite ORM, async, optimistic locking |
+| Queues | **qler** | Background job execution |
+| Logs | **logler** | Log aggregation, correlation IDs |
+| Processes | **procler** | Process management, health checks |
+| Future | **dagler** | DAG/pipeline orchestration (post qler v1.0) |
 
----
-
-## ADRs (Architectural Decisions)
-
-### ADR-001: Normative Language
-
-All doctrine uses RFC 2119 style (MUST/MUST NOT/SHOULD) to remove ambiguity for AI agents.
-
-### ADR-002: Flat Doctrine Structure
-
-Doctrine lives in `docs/doctrine/` as flat files, not nested. Easy to link and reference.
-
-### ADR-003: Separation of Concerns
-
-The Standard separates two concerns:
-
-1. **Doctrine** (top-level) - Engineering standards for adopters/contributors
-2. **Personal Config** (`global/`) - User's Claude agents, rules, skills
-
-The `global/.claude/` directory is symlinked to `~/.claude` for personal use. It contains agents, rules, and skills that apply to ALL projects, not just this repo.
+**Key integration:** A job's `correlation_id` connects the job record (qler) → logs (logler) → worker process (procler).
 
 ---
 
-## Versioning
+## Non-Negotiable Rules
 
-Semantic versioning in `CHANGELOG.md`:
-- **MAJOR:** Breaking changes to core doctrine
-- **MINOR:** New doctrines or significant additions
-- **PATCH:** Clarifications, typo fixes
+### 1. Never bypass the -ler stack
+
+- All DB operations MUST go through sqler's model API — no `db.adapter.execute()`, no raw SQL
+- All logging MUST go through logler — no raw file reads
+- If sqler can't express an operation, **fix sqler** — don't work around it
+
+### 2. SQLite is the design center
+
+- NEVER add features that "work better with Postgres"
+- Use WAL mode, `UPDATE...RETURNING`, partial indexes — lean into SQLite strengths
+- Single-file deployment is a feature, not a limitation
+
+### 3. Debuggability over features
+
+- Every design decision MUST answer: "Does this make debugging easier?"
+- Full attempt history preserved, structured failure kinds, correlation IDs
+- CLI outputs JSON for LLM consumption
+
+### 4. Explicit over magic
+
+- No auto-discovery of tasks — explicit `@task` decorator required
+- Workers MUST specify which queues to process
+- No UI-only settings that can't be code-reviewed
 
 ---
 
-## Before Committing
+## Blockers (sqler Gaps)
 
-- [ ] Does this align with existing doctrine?
-- [ ] Are cross-references updated?
-- [ ] Is CHANGELOG.md updated?
-- [ ] Would both a human and AI understand this?
+Implementation MUST NOT begin until these sqler features exist. See `SQLER_GAPS.md` for full details.
+
+| Gap | What | Blocks |
+|-----|------|--------|
+| Multi-field ordering | `order_by("-priority", "eta", "ulid")` | Deterministic claim query |
+| Promoted columns | Real SQLite columns for hot fields | CHECK constraints, indexes |
+| F-expressions in update | `update(attempts=F("attempts") + 1)` | Atomic counters |
+| Atomic update-and-return | `update_one()` with `RETURNING` | Race-free job claiming |
 
 ---
 
-## About `global/.claude/`
+## Tech Stack
 
-The `global/` directory contains personal Claude configuration:
+| Tool | Version | Purpose |
+|------|---------|---------|
+| Python | 3.12+ | Runtime |
+| asyncio | stdlib | Async foundation |
+| SQLite | WAL mode | Storage (via sqler) |
+| uv | latest | Package management, task running |
+| sqler | latest | Database operations |
 
-- `global/.claude/CLAUDE.md` - Global instructions (multilingual, delegation, testing philosophy)
-- `global/.claude/agents/` - Reusable agents (code-reviewer, test-runner, etc.)
-- `global/.claude/rules/` - Rules that apply to all projects
-- `global/.claude/skills/` - Skills (memory, commit, etc.)
+---
 
-This directory is symlinked to `~/.claude` so these configurations apply globally.
+## When Implementation Begins
 
-**Do not edit `global/` when contributing to The Standard doctrine.** It's personal config, not shareable doctrine.
+The package structure SHOULD follow:
+
+```
+src/qler/
+├── __init__.py          # Public API: Queue, task, Job
+├── queue.py             # Queue class
+├── task.py              # @task decorator
+├── models.py            # Job, JobAttempt (sqler models)
+├── worker.py            # Worker loop
+├── cli.py               # CLI interface
+└── py.typed             # PEP 561 marker
+tests/
+├── conftest.py
+├── test_queue.py
+├── test_task.py
+├── test_worker.py
+└── test_models.py
+```
