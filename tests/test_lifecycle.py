@@ -1,6 +1,7 @@
 """End-to-end lifecycle tests — full job flows from enqueue to terminal state."""
 
 import asyncio
+import re
 
 import pytest
 
@@ -13,6 +14,8 @@ from qler.queue import Queue
 from qler.task import task
 from sqler import F
 
+_ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
+
 
 # Module-level task function for decorator tests
 async def process_order(order_id, notify=False):
@@ -23,6 +26,8 @@ class TestHappyPath:
     """enqueue → claim → complete with attempt history."""
 
     async def test_full_lifecycle(self, queue):
+        before = now_epoch()
+
         # Enqueue
         job = await queue.enqueue(
             "my_module.process",
@@ -31,6 +36,7 @@ class TestHappyPath:
             queue_name="default",
             priority=5,
         )
+        assert _ULID_PATTERN.match(job.ulid), f"Expected ULID format, got {job.ulid!r}"
         assert job.status == "pending"
         assert job.attempts == 0
 
@@ -45,9 +51,10 @@ class TestHappyPath:
         # Complete
         await queue.complete_job(claimed, "worker-1", result={"processed": True})
         await claimed.refresh()
+        after = now_epoch()
         assert claimed.status == "completed"
         assert claimed.result == {"processed": True}
-        assert claimed.finished_at is not None
+        assert before <= claimed.finished_at <= after
         assert claimed.worker_id == ""
         assert claimed.lease_expires_at is None
 
@@ -59,6 +66,7 @@ class TestHappyPath:
         assert attempts[0].status == "completed"
         assert attempts[0].attempt_number == 1
         assert attempts[0].worker_id == "worker-1"
+        assert before <= attempts[0].finished_at <= after
 
 
 class TestRetryFlow:
@@ -106,6 +114,7 @@ class TestExhaustedRetries:
     """enqueue → claim → fail exhausted → FAILED terminal."""
 
     async def test_exhausted_retries(self, queue):
+        before = now_epoch()
         job = await queue.enqueue("my_task", max_retries=0)
 
         claimed = await queue.claim_job("worker-1", ["default"])
@@ -113,23 +122,28 @@ class TestExhaustedRetries:
         await queue.fail_job(claimed, "worker-1", ValueError("permanent"))
 
         await claimed.refresh()
+        after = now_epoch()
         assert claimed.status == "failed"
-        assert claimed.finished_at is not None
+        assert before <= claimed.finished_at <= after
         assert claimed.last_error == "permanent"
         assert claimed.last_failure_kind == "exception"
+        assert claimed.worker_id == ""
+        assert claimed.lease_expires_at is None
 
 
 class TestCancel:
     """Cancel lifecycle tests."""
 
     async def test_cancel_pending(self, queue):
+        before = now_epoch()
         job = await queue.enqueue("my_task")
         assert job.status == "pending"
 
         result = await job.cancel()
+        after = now_epoch()
         assert result is True
         assert job.status == "cancelled"
-        assert job.finished_at is not None
+        assert before <= job.finished_at <= after
 
     async def test_cancel_running_fails(self, queue):
         await queue.enqueue("my_task")
@@ -309,6 +323,7 @@ class TestTaskDecoratorLifecycle:
 
         # Enqueue via decorator
         job = await wrapped.enqueue(42, notify=True)
+        assert _ULID_PATTERN.match(job.ulid), f"Expected ULID format, got {job.ulid!r}"
         assert job.task == wrapped.task_path
         assert job.payload == {"args": [42], "kwargs": {"notify": True}}
 
