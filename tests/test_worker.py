@@ -9,7 +9,7 @@ from sqler import AsyncSQLerDB
 
 from qler._context import current_job
 from qler.enums import AttemptStatus, FailureKind, JobStatus
-from qler.exceptions import ConfigurationError
+from qler.exceptions import ConfigurationError, JobFailedError
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
@@ -163,6 +163,14 @@ class TestWorkerInit:
         assert w.poll_interval == 1.0
         assert w.shutdown_timeout == 30.0
 
+    def test_rejects_zero_shutdown_timeout(self, worker_queue):
+        with pytest.raises(ConfigurationError, match="shutdown_timeout must be > 0"):
+            Worker(worker_queue, shutdown_timeout=0)
+
+    def test_rejects_negative_shutdown_timeout(self, worker_queue):
+        with pytest.raises(ConfigurationError, match="shutdown_timeout must be > 0"):
+            Worker(worker_queue, shutdown_timeout=-1.0)
+
     def test_custom_queues(self, worker_queue):
         w = Worker(worker_queue, queues=["high", "low"])
         assert w.queues == ["high", "low"]
@@ -198,16 +206,9 @@ class TestWorkerExecution:
         job = await worker_queue.enqueue("nonexistent.task_fn")
 
         w = _make_worker(worker_queue)
-        worker_task = asyncio.create_task(w.run())
-        try:
-            await asyncio.sleep(0.2)
-        finally:
-            w._running = False
-            worker_task.cancel()
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                pass
+        with pytest.raises(JobFailedError) as exc_info:
+            await _run_worker_until_job_done(w, job)
+        assert exc_info.value.failure_kind == FailureKind.TASK_NOT_FOUND.value
 
         await job.refresh()
         assert job.status == "failed"
@@ -223,23 +224,16 @@ class TestWorkerExecution:
         )
 
         w = _make_worker(worker_queue)
-        worker_task = asyncio.create_task(w.run())
-        try:
-            await asyncio.sleep(0.2)
-        finally:
-            w._running = False
-            worker_task.cancel()
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                pass
+        with pytest.raises(JobFailedError) as exc_info:
+            await _run_worker_until_job_done(w, job)
+        assert exc_info.value.failure_kind == FailureKind.SIGNATURE_MISMATCH.value
 
         await job.refresh()
         assert job.status == "failed"
         assert job.last_failure_kind == FailureKind.SIGNATURE_MISMATCH.value
 
     async def test_exception_with_retries(self, worker_queue):
-        """Task raises → retry if max_retries allows."""
+        """Task raises → retry if max_retries allows. First failure retries."""
         q = Queue(worker_queue.db, default_lease_duration=5, default_max_retries=1)
         await q.init_db()
         wrapped = task(q)(failing_task)
@@ -248,16 +242,21 @@ class TestWorkerExecution:
         w = _make_worker(q)
         worker_task = asyncio.create_task(w.run())
         try:
-            await asyncio.sleep(0.3)
+            # Wait for first attempt to fail and job to go back to pending
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                await job.refresh()
+                if job.retry_count >= 1:
+                    break
         finally:
             w._running = False
+            await asyncio.sleep(0.05)
             worker_task.cancel()
             try:
                 await worker_task
             except asyncio.CancelledError:
                 pass
 
-        await job.refresh()
         # After 1 failure with max_retries=1, job goes back to pending for retry
         assert job.status == "pending"
         assert job.retry_count == 1
@@ -270,16 +269,8 @@ class TestWorkerExecution:
         job = await wrapped.enqueue()
 
         w = _make_worker(worker_queue)
-        worker_task = asyncio.create_task(w.run())
-        try:
-            await asyncio.sleep(0.2)
-        finally:
-            w._running = False
-            worker_task.cancel()
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                pass
+        with pytest.raises(JobFailedError):
+            await _run_worker_until_job_done(w, job)
 
         await job.refresh()
         assert job.status == "failed"
@@ -378,12 +369,17 @@ class TestWorkerConcurrency:
             except asyncio.CancelledError:
                 pass
 
-        # With concurrency=1, first job ends before second starts
+        # With concurrency=1, one job must fully complete before the next starts.
+        # Order is non-deterministic (a or b first), but must be serial.
         assert len(_execution_log) == 4
-        first_end = _execution_log.index(f"{_execution_log[0].replace('_start', '')}_end")
-        second_start_name = _execution_log[first_end + 1] if first_end + 1 < len(_execution_log) else None
-        assert second_start_name is not None
-        assert second_start_name.endswith("_start")
+        first_name = _execution_log[0].replace("_start", "")
+        second_name = "b" if first_name == "a" else "a"
+        assert _execution_log == [
+            f"{first_name}_start",
+            f"{first_name}_end",
+            f"{second_name}_start",
+            f"{second_name}_end",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +416,7 @@ class TestWorkerShutdown:
         assert job.status == "completed"
 
     async def test_running_flag_stops_claim_loop(self, worker_queue):
-        """Setting _running = False stops the claim loop."""
+        """Setting _running = False causes the worker task to exit cleanly."""
         w = _make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
 
@@ -428,15 +424,13 @@ class TestWorkerShutdown:
         assert w._running is True
 
         w._running = False
-        await asyncio.sleep(0.1)
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+        # Worker has poll_interval=0.01, so 0.15s is plenty of time to exit
+        await asyncio.sleep(0.15)
+        assert worker_task.done(), "Worker claim loop did not exit after _running=False"
 
-        # Worker stopped without error
-        assert w._running is False
+        # Cleanup: ensure no exception was raised
+        if not worker_task.cancelled():
+            worker_task.result()  # raises if the task raised
 
 
 # ---------------------------------------------------------------------------
