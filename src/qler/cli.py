@@ -623,6 +623,8 @@ def retry_cmd(
 @click.option("--queue", "filter_queue", help="Filter by queue name")
 @click.option("--task", "filter_task", help="Filter by task path")
 @click.option("--all", "cancel_all", is_flag=True, help="Cancel all matching jobs")
+@click.option("--running", "include_running", is_flag=True,
+              help="Also request cancellation of running jobs")
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
 def cancel_cmd(
     ulid: str | None,
@@ -630,6 +632,7 @@ def cancel_cmd(
     filter_queue: str | None,
     filter_task: str | None,
     cancel_all: bool,
+    include_running: bool,
     output_json: bool,
 ) -> None:
     """Cancel pending jobs by ID or filter."""
@@ -638,22 +641,37 @@ def cancel_cmd(
     if ulid is None and not cancel_all:
         raise click.UsageError("Provide a job ULID or use --all for bulk cancel")
 
-    async def _cancel() -> list[str]:
+    async def _cancel() -> tuple[list[str], list[str]]:
         q = await _get_queue(db)
         try:
             cancelled: list[str] = []
+            requested: list[str] = []
             if ulid:
                 j = await Job.query().filter(F("ulid") == ulid).first()
                 if j is None:
                     raise click.ClickException(f"Job {ulid} not found")
-                ok = await j.cancel()
-                if ok:
-                    cancelled.append(j.ulid)
+                if j.status == JobStatus.RUNNING.value:
+                    if not include_running:
+                        raise click.ClickException(
+                            f"Job {ulid} is running. Use --running to request cancellation."
+                        )
+                    ok = await j.request_cancel()
+                    if ok:
+                        requested.append(j.ulid)
+                    else:
+                        raise click.ClickException(
+                            f"Cannot request cancellation for job {ulid}"
+                        )
                 else:
-                    raise click.ClickException(
-                        f"Cannot cancel job {ulid} (status: {j.status})"
-                    )
+                    ok = await j.cancel()
+                    if ok:
+                        cancelled.append(j.ulid)
+                    else:
+                        raise click.ClickException(
+                            f"Cannot cancel job {ulid} (status: {j.status})"
+                        )
             else:
+                # Cancel PENDING jobs
                 filters = [F("status") == JobStatus.PENDING.value]
                 if filter_queue:
                     filters.append(F("queue_name") == filter_queue)
@@ -667,20 +685,46 @@ def cancel_cmd(
                     ok = await j.cancel()
                     if ok:
                         cancelled.append(j.ulid)
-            return cancelled
+
+                # Request cancellation for RUNNING jobs if --running
+                if include_running:
+                    running_filters = [F("status") == JobStatus.RUNNING.value]
+                    if filter_queue:
+                        running_filters.append(F("queue_name") == filter_queue)
+                    if filter_task:
+                        running_filters.append(F("task") == filter_task)
+                    combined = running_filters[0]
+                    for f in running_filters[1:]:
+                        combined = combined & f
+                    running_jobs = await Job.query().filter(combined).all()
+                    for j in running_jobs:
+                        ok = await j.request_cancel()
+                        if ok:
+                            requested.append(j.ulid)
+
+            return cancelled, requested
         finally:
             await q.close()
 
-    result = _run(_cancel())
+    cancelled, requested = _run(_cancel())
 
     if output_json:
-        _echo_json({"cancelled": len(result), "ulids": result})
+        _echo_json({
+            "cancelled": len(cancelled),
+            "cancellation_requested": len(requested),
+            "cancelled_ulids": cancelled,
+            "requested_ulids": requested,
+        })
     else:
-        if result:
-            click.echo(f"Cancelled {len(result)} job(s):")
-            for u in result:
+        if cancelled:
+            click.echo(f"Cancelled {len(cancelled)} job(s):")
+            for u in cancelled:
                 click.echo(f"  {u}")
-        else:
+        if requested:
+            click.echo(f"Cancellation requested for {len(requested)} running job(s):")
+            for u in requested:
+                click.echo(f"  {u}")
+        if not cancelled and not requested:
             click.echo("No jobs cancelled.")
 
 

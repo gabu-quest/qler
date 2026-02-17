@@ -952,7 +952,7 @@ class TestCancel:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["cancelled"] == 1
-        assert data["ulids"] == [ulid]
+        assert data["cancelled_ulids"] == [ulid]
 
 
 # -----------------------------------------------------------------------
