@@ -40,4 +40,7 @@ async def is_cancellation_requested() -> bool:
     refreshed = await Job.query().filter(F("ulid") == job.ulid).first()
     if refreshed is None:
         return False
+    # Only trust the flag if this worker still owns the job
+    if refreshed.worker_id and refreshed.worker_id != job.worker_id:
+        return False
     return refreshed.cancel_requested
