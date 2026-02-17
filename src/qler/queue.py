@@ -301,6 +301,9 @@ class Queue:
                 result = await asyncio.to_thread(task_wrapper.fn, *args, **kwargs)
             else:
                 result = await task_wrapper.fn(*args, **kwargs)
+        except asyncio.CancelledError:
+            await self.fail_job(job, worker_id, failure_kind=FailureKind.CANCELLED)
+            raise
         except Exception as exc:
             task_exc = exc
 
