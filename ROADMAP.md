@@ -20,7 +20,7 @@ Job.query().filter(...).order_by("-priority", "eta", "ulid").update_one(
 )
 ```
 
-### M-1: logler-sqler Bridge ⬚ ← next
+### M-1: logler-sqler Bridge ✅
 
 Give logler the ability to ingest directly from sqler SQLite databases — no manual file exports, no temp file management by the user. logler handles everything behind the scenes.
 
@@ -42,7 +42,7 @@ Give logler the ability to ingest directly from sqler SQLite databases — no ma
 - `with logler.correlation_context("job-123"): logger.info("hello")` → logs with correlation_id → searchable via logler CLI
 - logler can correlate DB records + runtime logs for end-to-end job investigation
 
-### M0: Project Scaffold ⬚
+### M0: Project Scaffold 🔄 ← next
 
 Minimal package structure so `import qler` works.
 
@@ -130,6 +130,10 @@ These are explicitly NOT in v0.1. Ordered by likely priority.
 | Per-task idempotency key generators | `idempotency_key=lambda order_id: f"charge:{order_id}"` |
 | `qler backup` command | Safe backup via SQLite backup API |
 | `qler tasks` command | List registered tasks with config |
+| logler db_source input validation | Sanitize user-supplied table names beyond SQL quoting; allowlist approach |
+| logler JsonHandler robustness | Graceful degradation when stream write fails mid-entry |
+| logler db_source temp file cleanup | Context manager API for automatic temp file cleanup on exception paths |
+| logler correlation context OTel bridge | Optional trace_id propagation from OpenTelemetry spans |
 
 ---
 
