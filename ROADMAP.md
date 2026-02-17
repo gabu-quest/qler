@@ -110,6 +110,20 @@ Test suite and pre-release polish.
 
 **Exit criteria:** Tests pass, `uv pip install .` works, README accurate.
 
+### M5: v0.1.0 Tag, Hardening, Cooperative Cancellation ✅
+
+Tag MVP, harden edge cases, implement first post-MVP feature.
+
+- v0.1.0 tag on `feat/m4-polish`
+- `CHANGELOG.md` with v0.1.0 entry
+- Hardened `_execute_immediate` — try/finally attempt finalization
+- Hardening tests: retry exhaustion, idempotency after cancellation
+- Cooperative cancellation: `cancel_requested` field, `request_cancel()`, `is_cancellation_requested()`
+- CLI `--running` flag on `qler cancel` command
+- 10+ cancellation tests
+
+**Exit criteria:** All tests pass, cooperative cancellation works end-to-end.
+
 ---
 
 ## Post-MVP (v0.2+)
@@ -119,7 +133,6 @@ These are explicitly NOT in v0.1. Ordered by likely priority.
 | Feature | Notes |
 |---------|-------|
 | procler integration | Health endpoint, worker process definitions |
-| Cooperative cancellation | `cancel_requested` flag for running jobs |
 | Periodic/cron tasks | `@cron` decorator |
 | Web dashboard | Vue 3 + Naive UI (read-only + operational) |
 | Rate limiting | Per-queue or per-task |
@@ -128,9 +141,6 @@ These are explicitly NOT in v0.1. Ordered by likely priority.
 | Prometheus metrics | Export queue depths, throughput, failure rates |
 | Payload encryption | Optional encryption for sensitive fields |
 | Per-task idempotency key generators | `idempotency_key=lambda order_id: f"charge:{order_id}"` |
-| Test: retry exhaustion in immediate mode | Drive max_retries=N job through all retries → assert FAILED |
-| Test: idempotency after cancellation | Cancel job, re-enqueue same key → new execution occurs |
-| Harden `_execute_immediate` attempt finalization | try/finally to terminalize attempt if fail_job/complete_job raise |
 | `qler backup` command | Safe backup via SQLite backup API |
 | `qler tasks` command | List registered tasks with config |
 | logler db_source input validation | Sanitize user-supplied table names beyond SQL quoting; allowlist approach |

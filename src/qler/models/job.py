@@ -53,6 +53,7 @@ class Job(AsyncSQLerSafeModel):
     last_attempt_id: Optional[str] = None
     correlation_id: str = ""
     idempotency_key: Optional[str] = None
+    cancel_requested: bool = False
     created_at: int = 0
     updated_at: int = 0
     finished_at: Optional[int] = None
@@ -70,11 +71,12 @@ class Job(AsyncSQLerSafeModel):
         return json.loads(self.payload_json)
 
     async def cancel(self) -> bool:
-        """Cancel a PENDING job. Returns True if cancelled, False otherwise.
+        """Cancel a job. PENDING jobs are cancelled immediately; RUNNING jobs
+        get a cooperative cancellation request.
 
-        Uses atomic update_one() to avoid version mismatch between the
-        _version column and the JSON blob after prior update_one() calls.
+        Returns True if cancelled or cancellation was requested, False otherwise.
         """
+        # Try immediate cancellation (PENDING → CANCELLED)
         now = now_epoch()
         updated = await Job.query().filter(
             (F("ulid") == self.ulid) & (F("status") == JobStatus.PENDING.value)
@@ -83,6 +85,18 @@ class Job(AsyncSQLerSafeModel):
             finished_at=now,
             updated_at=now,
         )
+        if updated is not None:
+            self._sync_from(updated)
+            return True
+        # If RUNNING, request cooperative cancellation instead
+        return await self.request_cancel()
+
+    async def request_cancel(self) -> bool:
+        """Request cancellation of a RUNNING job. Returns True if request was recorded."""
+        updated = await Job.query().filter(
+            (F("ulid") == self.ulid)
+            & (F("status") == JobStatus.RUNNING.value)
+        ).update_one(cancel_requested=True, updated_at=now_epoch())
         if updated is None:
             return False
         self._sync_from(updated)
