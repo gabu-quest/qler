@@ -54,7 +54,7 @@ Minimal package structure so `import qler` works.
 
 **Exit criteria:** `uv run python -c "import qler"` works.
 
-### M1: Core Library 🔄 ← next
+### M1: Core Library ✅
 
 Models, enqueue, claim, execute, complete/fail, retry. The inner loop.
 
@@ -70,7 +70,7 @@ Models, enqueue, claim, execute, complete/fail, retry. The inner loop.
 
 **Exit criteria:** Can enqueue → claim → execute → complete/fail with attempt history.
 
-### M2: Worker + Lease Management ⬚
+### M2: Worker + Lease Management 🔄 ← current
 
 The production-ready worker loop.
 

@@ -149,6 +149,33 @@ class Job(AsyncSQLerSafeModel):
         self._sync_from(updated)
         return True
 
+    async def renew_lease(self, duration: int | None = None) -> bool:
+        """Extend this job's lease atomically.
+
+        Uses update_one() with ownership guard (ulid + status=RUNNING + worker_id)
+        to ensure only the current owner can renew.
+
+        Args:
+            duration: Lease extension in seconds. Defaults to self.lease_duration.
+
+        Returns:
+            True if renewed, False if ownership was lost.
+        """
+        lease_seconds = duration if duration is not None else self.lease_duration
+        now = now_epoch()
+        updated = await Job.query().filter(
+            (F("ulid") == self.ulid)
+            & (F("status") == JobStatus.RUNNING.value)
+            & (F("worker_id") == self.worker_id)
+        ).update_one(
+            lease_expires_at=now + lease_seconds,
+            updated_at=now,
+        )
+        if updated is None:
+            return False
+        self._sync_from(updated)
+        return True
+
     def _sync_from(self, other: "Job") -> None:
         """Update this instance's fields from another Job instance."""
         for fname in self.__class__.model_fields:
