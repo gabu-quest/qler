@@ -177,20 +177,57 @@ class TestHelpers:
         with pytest.raises(click.BadParameter, match="Invalid duration"):
             _parse_since("invalid")
 
-    def test_echo_table(self, runner):
-        from qler.cli import _echo_table
-
-        result = runner.invoke(cli, ["--version"])  # just to test runner works
-        # Direct call test
-        headers = ["A", "B"]
-        rows = [["x", "yy"], ["zzz", "w"]]
-        from io import StringIO
-
+    def test_parse_since_exceeds_max(self):
         import click
 
-        buf = StringIO()
-        with click.Context(click.Command("test"), info_name="test"):
-            _echo_table(headers, rows)
+        from qler.cli import _parse_since
+
+        with pytest.raises(click.BadParameter, match="exceeds maximum"):
+            _parse_since("99999d")
+
+    def test_validate_module_path_rejects_traversal(self):
+        import click
+
+        from qler.cli import _validate_module_path
+
+        with pytest.raises(click.BadParameter, match="Invalid module path"):
+            _validate_module_path("../evil")
+
+    def test_validate_module_path_rejects_spaces(self):
+        import click
+
+        from qler.cli import _validate_module_path
+
+        with pytest.raises(click.BadParameter, match="Invalid module path"):
+            _validate_module_path("my module")
+
+    def test_validate_module_path_accepts_dotted(self):
+        from qler.cli import _validate_module_path
+
+        # Should not raise
+        _validate_module_path("myapp.tasks.email")
+
+    def test_echo_table_output(self, runner, capsys):
+        from qler.cli import _echo_table
+
+        _echo_table(["Name", "Count"], [["alpha", "10"], ["beta", "5"]])
+        captured = capsys.readouterr()
+        lines = captured.out.strip().splitlines()
+        assert len(lines) == 4  # header + separator + 2 data rows
+        assert "Name" in lines[0]
+        assert "Count" in lines[0]
+        assert "----" in lines[1]
+        assert "alpha" in lines[2]
+        assert "10" in lines[2]
+        assert "beta" in lines[3]
+        assert "5" in lines[3]
+
+    def test_echo_table_empty(self, capsys):
+        from qler.cli import _echo_table
+
+        _echo_table(["A", "B"], [])
+        captured = capsys.readouterr()
+        assert captured.out == ""
 
     def test_import_app_bad_format(self):
         import click
@@ -207,6 +244,14 @@ class TestHelpers:
 
         with pytest.raises(click.BadParameter, match="Cannot import module"):
             _import_app("nonexistent_module_xyz:queue")
+
+    def test_import_app_wrong_type(self):
+        import click
+
+        from qler.cli import _import_app
+
+        with pytest.raises(click.BadParameter, match="is not a Queue instance"):
+            _import_app("os:path")
 
     def test_import_modules_bad(self):
         import click
@@ -264,6 +309,18 @@ class TestInit:
         assert data["db"] == db_path
         assert data["created"] is True
         assert "gitignore_updated" in data
+
+    def test_gitignore_sanitizes_newlines(self, runner, tmp_path):
+        """Newlines in db filename should be stripped from .gitignore entry."""
+        # Create a db file with a normal name, then check the gitignore content
+        db_path = str(tmp_path / "app.db")
+        result = runner.invoke(cli, ["init", "--db", db_path])
+        assert result.exit_code == 0
+        gitignore = tmp_path / ".gitignore"
+        lines = gitignore.read_text().splitlines()
+        # Each line should be a clean entry, no injected patterns
+        assert len(lines) == 1
+        assert lines[0] == "app.db"
 
     def test_idempotent_init(self, runner, db_path):
         """Running init twice should succeed without error."""
@@ -371,12 +428,19 @@ class TestJobs:
         data = json.loads(result.output)
         assert isinstance(data, list)
         assert len(data) == 7
-        # Each job should have expected fields
-        j = data[0]
-        assert "ulid" in j
-        assert "status" in j
-        assert "queue_name" in j
-        assert "task" in j
+        # Verify structure and values using known fixture data
+        by_task = {j["task"]: j for j in data}
+        assert by_task["myapp.tasks.done"]["status"] == "completed"
+        assert by_task["myapp.tasks.done"]["queue_name"] == "default"
+        assert by_task["myapp.tasks.fail"]["status"] == "failed"
+        assert by_task["myapp.tasks.fail"]["last_error"] == "Something went wrong"
+        # Verify all jobs have required fields
+        for j in data:
+            assert "ulid" in j
+            assert "status" in j
+            assert "queue_name" in j
+            assert "task" in j
+            assert "created_at" in j
 
     def test_since_filter(self, runner, db_path):
         """Jobs created now should be within --since 1h."""
@@ -446,10 +510,14 @@ class TestJob:
         ulid = asyncio.run(_setup())
         result = runner.invoke(cli, ["job", ulid, "--db", db_path])
         assert result.exit_code == 0
-        assert ulid in result.output
-        assert "pending" in result.output
-        assert "myapp.tasks.hello" in result.output
-        assert "Payload:" in result.output
+        assert f"ULID:            {ulid}" in result.output
+        assert "Status:          pending" in result.output
+        assert "Task:            myapp.tasks.hello" in result.output
+        # Payload is pretty-printed JSON with indent=2
+        assert '"args"' in result.output
+        assert "1," in result.output  # first arg
+        assert "2" in result.output   # second arg
+        assert '"key": "val"' in result.output
 
     def test_detail_json(self, runner, db_path):
         import asyncio
@@ -579,6 +647,12 @@ class TestAttempts:
         assert "failed" in result.output
         assert "completed" in result.output
         assert "Timeout" in result.output
+        # Verify both attempts are rendered (JSON gives exact count)
+        json_result = runner.invoke(cli, ["attempts", ulid, "--db", db_path, "--json"])
+        data = json.loads(json_result.output)
+        assert len(data) == 2
+        assert data[0]["status"] == "failed"
+        assert data[1]["status"] == "completed"
 
     def test_json_output(self, runner, db_path):
         import asyncio
@@ -649,7 +723,7 @@ class TestRetry:
     def test_single_not_found(self, runner, db_path):
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["retry", "FAKE_ULID", "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 1
         assert "not found" in result.output
 
     def test_single_wrong_status(self, runner, db_path):
@@ -664,7 +738,7 @@ class TestRetry:
 
         ulid = asyncio.run(_setup())
         result = runner.invoke(cli, ["retry", ulid, "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 1
         assert "Cannot retry" in result.output
 
     def test_bulk_all(self, runner, db_path):
@@ -697,7 +771,7 @@ class TestRetry:
     def test_requires_ulid_or_all(self, runner, db_path):
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["retry", "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 2
         assert "Provide a job ULID or use --all" in result.output
 
     def test_json_output(self, runner, db_path):
@@ -779,7 +853,7 @@ class TestCancel:
     def test_single_not_found(self, runner, db_path):
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["cancel", "FAKE_ULID", "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 1
         assert "not found" in result.output
 
     def test_single_wrong_status(self, runner, db_path):
@@ -803,7 +877,7 @@ class TestCancel:
 
         ulid = asyncio.run(_setup())
         result = runner.invoke(cli, ["cancel", ulid, "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 1
         assert "Cannot cancel" in result.output
 
     def test_bulk_all(self, runner, db_path):
@@ -839,10 +913,28 @@ class TestCancel:
         assert result.exit_code == 0
         assert "Cancelled 2 job" in result.output
 
+    def test_bulk_filter_by_task(self, runner, db_path):
+        import asyncio
+
+        async def _setup():
+            q = Queue(db_path)
+            await q.init_db()
+            await q.enqueue("myapp.task_a", queue_name="default")
+            await q.enqueue("myapp.task_a", queue_name="default")
+            await q.enqueue("myapp.task_b", queue_name="default")
+            await q.close()
+
+        asyncio.run(_setup())
+        result = runner.invoke(cli, [
+            "cancel", "--db", db_path, "--all", "--task", "myapp.task_a"
+        ])
+        assert result.exit_code == 0
+        assert "Cancelled 2 job" in result.output
+
     def test_requires_ulid_or_all(self, runner, db_path):
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["cancel", "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 2
         assert "Provide a job ULID or use --all" in result.output
 
     def test_json_output(self, runner, db_path):
@@ -1112,12 +1204,12 @@ class TestDoctor:
 class TestWorkerArgs:
     def test_requires_db_or_app(self, runner):
         result = runner.invoke(cli, ["worker"])
-        assert result.exit_code != 0
+        assert result.exit_code == 2
         assert "Either --db or --app is required" in result.output
 
     def test_bad_app_format(self, runner):
         result = runner.invoke(cli, ["worker", "--app", "no_colon"])
-        assert result.exit_code != 0
+        assert result.exit_code == 2
         assert "Expected 'module:attribute'" in result.output
 
 

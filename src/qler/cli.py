@@ -26,6 +26,8 @@ from qler.queue import Queue
 
 _SINCE_PATTERN = re.compile(r"(\d+)([smhd])")
 _SINCE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_MAX_SINCE_SECONDS = 10 * 365 * 86400  # 10 years
+_MODULE_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*$")
 
 TERMINAL_STATUSES = frozenset({
     JobStatus.COMPLETED.value,
@@ -92,7 +94,17 @@ def _parse_since(since: str) -> int:
         total += int(amount) * _SINCE_UNITS[unit]
     if total == 0:
         raise click.BadParameter(f"Invalid duration: {since}")
+    if total > _MAX_SINCE_SECONDS:
+        raise click.BadParameter(f"Duration exceeds maximum of 10 years: {since}")
     return now_epoch() - total
+
+
+def _validate_module_path(mod_path: str) -> None:
+    """Validate a module path is a valid dotted Python identifier."""
+    if not _MODULE_PATTERN.fullmatch(mod_path):
+        raise click.BadParameter(
+            f"Invalid module path '{mod_path}'. Only dotted Python identifiers are allowed."
+        )
 
 
 def _import_app(app_string: str) -> Queue:
@@ -100,6 +112,7 @@ def _import_app(app_string: str) -> Queue:
     module_path, _, attr = app_string.partition(":")
     if not attr:
         raise click.BadParameter(f"Expected 'module:attribute', got '{app_string}'")
+    _validate_module_path(module_path)
     try:
         mod = importlib.import_module(module_path)
     except ImportError as exc:
@@ -118,6 +131,7 @@ def _import_app(app_string: str) -> Queue:
 def _import_modules(modules: tuple[str, ...]) -> None:
     """Import modules to trigger @task registration."""
     for mod_path in modules:
+        _validate_module_path(mod_path)
         try:
             importlib.import_module(mod_path)
         except ImportError as exc:
@@ -222,7 +236,7 @@ def init(db: str, output_json: bool) -> None:
     gitignore_updated = False
     db_path = Path(db)
     gitignore = db_path.parent / ".gitignore"
-    db_name = db_path.name
+    db_name = db_path.name.replace("\n", "").replace("\r", "").strip()
 
     if gitignore.exists():
         content = gitignore.read_text()
