@@ -70,7 +70,7 @@ Models, enqueue, claim, execute, complete/fail, retry. The inner loop.
 
 **Exit criteria:** Can enqueue → claim → execute → complete/fail with attempt history.
 
-### M2: Worker + Lease Management 🔄 ← current
+### M2: Worker + Lease Management ✅
 
 The production-ready worker loop.
 
@@ -83,7 +83,7 @@ The production-ready worker loop.
 
 **Exit criteria:** Worker runs reliably, recovers from crashes, handles concurrent jobs, shuts down cleanly, logs are correlated.
 
-### M3: CLI ⬚
+### M3: CLI 🔄 ← current
 
 Human-first CLI with `--json` flag.
 
