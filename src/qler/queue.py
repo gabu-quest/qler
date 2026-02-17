@@ -433,6 +433,49 @@ class Queue:
         )
 
     # ------------------------------------------------------------------
+    # Lease Recovery
+    # ------------------------------------------------------------------
+
+    async def recover_expired_leases(self, *, max_per_tick: int = 100) -> int:
+        """Recover jobs with expired leases back to PENDING.
+
+        Atomically finds RUNNING jobs whose lease has expired and resets them.
+        Lease expiry does NOT increment retry_count — it's infrastructure failure,
+        not a task failure.
+
+        Returns:
+            Number of jobs recovered.
+        """
+        await self._lazy_init()
+        now = now_epoch()
+        recovered = 0
+
+        for _ in range(max_per_tick):
+            job = await Job.query().filter(
+                (F("status") == JobStatus.RUNNING.value)
+                & (F("lease_expires_at") <= now)
+            ).order_by("lease_expires_at").update_one(
+                status=JobStatus.PENDING.value,
+                worker_id="",
+                lease_expires_at=None,
+                updated_at=now,
+            )
+            if job is None:
+                break
+
+            # Terminalize the attempt as LEASE_EXPIRED
+            await self._terminalize_attempt(
+                job.last_attempt_id,
+                AttemptStatus.LEASE_EXPIRED.value,
+                now,
+                failure_kind=FailureKind.LEASE_EXPIRED.value,
+                error="Lease expired",
+            )
+            recovered += 1
+
+        return recovered
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
