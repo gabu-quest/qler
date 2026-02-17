@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from sqler import AsyncSQLerDB, F
 
+from qler._context import _current_job
 from qler._time import generate_ulid, now_epoch
 from qler.enums import RETRYABLE_FAILURES, AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
@@ -296,6 +297,7 @@ class Queue:
 
         task_exc: BaseException | None = None
         result: Any = None
+        token = _current_job.set(job)
         try:
             if task_wrapper.sync:
                 result = await asyncio.to_thread(task_wrapper.fn, *args, **kwargs)
@@ -306,6 +308,8 @@ class Queue:
             raise
         except Exception as exc:
             task_exc = exc
+        finally:
+            _current_job.reset(token)
 
         if task_exc is not None:
             try:
