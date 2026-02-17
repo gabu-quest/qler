@@ -426,6 +426,7 @@ logler = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pydantic" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -443,6 +444,7 @@ provides-extras = ["logler"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },

@@ -42,7 +42,7 @@ Give logler the ability to ingest directly from sqler SQLite databases — no ma
 - `with logler.correlation_context("job-123"): logger.info("hello")` → logs with correlation_id → searchable via logler CLI
 - logler can correlate DB records + runtime logs for end-to-end job investigation
 
-### M0: Project Scaffold 🔄 ← next
+### M0: Project Scaffold ✅
 
 Minimal package structure so `import qler` works.
 
@@ -54,7 +54,7 @@ Minimal package structure so `import qler` works.
 
 **Exit criteria:** `uv run python -c "import qler"` works.
 
-### M1: Core Library ⬚
+### M1: Core Library 🔄 ← next
 
 Models, enqueue, claim, execute, complete/fail, retry. The inner loop.
 
