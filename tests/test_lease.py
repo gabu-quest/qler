@@ -55,10 +55,12 @@ class TestRecoverExpiredLeases:
         assert job.lease_expires_at is None
 
     async def test_recover_terminalizes_attempt(self, queue):
-        """Attempt gets LEASE_EXPIRED status."""
+        """Attempt gets LEASE_EXPIRED status with bounded timestamp."""
         job = await _make_running_job(queue, lease_offset=-10)
+        before = now_epoch()
 
         await queue.recover_expired_leases()
+        after = now_epoch()
 
         attempts = await JobAttempt.query().filter(
             F("job_ulid") == job.ulid
@@ -67,7 +69,7 @@ class TestRecoverExpiredLeases:
         assert attempts[0].status == AttemptStatus.LEASE_EXPIRED.value
         assert attempts[0].failure_kind == FailureKind.LEASE_EXPIRED.value
         assert attempts[0].error == "Lease expired"
-        assert attempts[0].finished_at is not None
+        assert before <= attempts[0].finished_at <= after
 
     async def test_recover_does_not_increment_retry_count(self, queue):
         """Lease expiry is infra failure — retry_count stays unchanged."""
@@ -128,24 +130,31 @@ class TestRenewLease:
     """Job.renew_lease() tests."""
 
     async def test_renew_lease_extends(self, queue):
-        """lease_expires_at is updated to now + lease_duration."""
+        """lease_expires_at is updated to now + lease_duration with bounded range."""
         # Use a short lease that's about to expire — renewal should push it out
         job = await _make_running_job(queue, lease_offset=2)
         before = now_epoch()
 
         result = await job.renew_lease()
+        after = now_epoch()
         assert result is True
-        # New expiry should be at least now + lease_duration (2s)
+        # Verify via independent DB read (not trusting _sync_from alone)
+        await job.refresh()
         assert job.lease_expires_at >= before + job.lease_duration
+        assert job.lease_expires_at <= after + job.lease_duration + 1
 
     async def test_renew_lease_custom_duration(self, queue):
-        """Custom duration works."""
+        """Custom duration works with bounded range."""
         job = await _make_running_job(queue, lease_offset=60)
         before = now_epoch()
 
         result = await job.renew_lease(duration=600)
+        after = now_epoch()
         assert result is True
+        # Verify via independent DB read
+        await job.refresh()
         assert job.lease_expires_at >= before + 600
+        assert job.lease_expires_at <= after + 600 + 1
 
     async def test_renew_lease_lost_ownership(self, queue):
         """Wrong worker → False."""
