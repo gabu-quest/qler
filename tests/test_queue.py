@@ -1,6 +1,8 @@
 """Tests for Queue — init, enqueue, claim, complete, fail operations."""
 
 import json
+import re
+from unittest.mock import patch
 
 import pytest
 
@@ -16,6 +18,8 @@ from qler.models.job import Job
 from qler.queue import Queue, _calculate_retry_eta
 from qler.task import task
 from sqler import AsyncSQLerDB, F
+
+_ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
 
 class TestQueueInit:
@@ -65,7 +69,7 @@ class TestEnqueue:
 
     async def test_basic_enqueue(self, queue):
         job = await queue.enqueue("my_module.my_task")
-        assert job.ulid != ""
+        assert _ULID_PATTERN.match(job.ulid), f"Expected ULID format, got {job.ulid!r}"
         assert job.status == "pending"
         assert job.task == "my_module.my_task"
         assert job.queue_name == "default"
@@ -113,8 +117,9 @@ class TestEnqueue:
     async def test_enqueue_sets_created_at(self, queue):
         before = now_epoch()
         job = await queue.enqueue("my_task")
-        assert job.created_at >= before
-        assert job.updated_at >= before
+        after = now_epoch()
+        assert before <= job.created_at <= after
+        assert before <= job.updated_at <= after
 
 
 class TestEnqueueIdempotency:
@@ -200,8 +205,11 @@ class TestClaim:
         before = now_epoch()
         await queue.enqueue("my_task")
         job = await queue.claim_job("worker-1", ["default"])
+        after = now_epoch()
         assert job is not None
-        assert job.lease_expires_at >= before + queue.default_lease_duration
+        expected_min = before + queue.default_lease_duration
+        expected_max = after + queue.default_lease_duration
+        assert expected_min <= job.lease_expires_at <= expected_max
 
     async def test_claim_creates_attempt_record(self, queue):
         await queue.enqueue("my_task")
@@ -224,8 +232,7 @@ class TestClaim:
         await queue.enqueue("my_task")
         job = await queue.claim_job("worker-1", ["default"])
         assert job is not None
-        assert job.last_attempt_id is not None
-        assert job.last_attempt_id != ""
+        assert _ULID_PATTERN.match(job.last_attempt_id), f"Expected ULID, got {job.last_attempt_id!r}"
 
 
 class TestComplete:
@@ -298,6 +305,7 @@ class TestFail:
         assert job.worker_id == ""
 
     async def test_fail_retryable_goes_pending(self, queue):
+        before = now_epoch()
         await queue.enqueue("my_task", max_retries=3, retry_delay=10)
         job = await queue.claim_job("worker-1", ["default"])
         exc = RuntimeError("transient")
@@ -306,7 +314,8 @@ class TestFail:
         await job.refresh()
         assert job.status == "pending"
         assert job.retry_count == 1
-        assert job.eta > now_epoch() - 1  # has a future ETA
+        # ETA should be at least base_delay (10s) in the future
+        assert job.eta >= before + 10
         assert job.finished_at is None
 
     async def test_fail_exhausted_retries_marks_failed(self, queue):
@@ -369,23 +378,65 @@ class TestFail:
 class TestRetryEta:
     """Verify _calculate_retry_eta exponential backoff."""
 
-    def test_first_retry(self):
+    _FIXED_NOW = 1_000_000
+
+    @patch("qler.queue.now_epoch", return_value=_FIXED_NOW)
+    def test_first_retry(self, mock_now):
         job = Job(retry_delay=60, retry_count=0)
         eta = _calculate_retry_eta(job)
-        # base_delay * 2^0 = 60, plus up to 10% jitter
-        assert eta >= now_epoch() + 60
-        assert eta <= now_epoch() + 66 + 1  # 60 + 6 jitter + 1 tolerance
+        # base_delay * 2^0 = 60, plus up to 10% jitter (6)
+        assert self._FIXED_NOW + 60 <= eta <= self._FIXED_NOW + 66
 
-    def test_second_retry(self):
+    @patch("qler.queue.now_epoch", return_value=_FIXED_NOW)
+    def test_second_retry(self, mock_now):
         job = Job(retry_delay=60, retry_count=1)
         eta = _calculate_retry_eta(job)
-        # base_delay * 2^1 = 120, plus up to 10% jitter
-        assert eta >= now_epoch() + 120
-        assert eta <= now_epoch() + 132 + 1
+        # base_delay * 2^1 = 120, plus up to 10% jitter (12)
+        assert self._FIXED_NOW + 120 <= eta <= self._FIXED_NOW + 132
 
-    def test_third_retry(self):
+    @patch("qler.queue.now_epoch", return_value=_FIXED_NOW)
+    def test_third_retry(self, mock_now):
         job = Job(retry_delay=60, retry_count=2)
         eta = _calculate_retry_eta(job)
-        # base_delay * 2^2 = 240, plus up to 10% jitter
-        assert eta >= now_epoch() + 240
-        assert eta <= now_epoch() + 264 + 1
+        # base_delay * 2^2 = 240, plus up to 10% jitter (24)
+        assert self._FIXED_NOW + 240 <= eta <= self._FIXED_NOW + 264
+
+    @patch("qler.queue.now_epoch", return_value=_FIXED_NOW)
+    def test_capped_at_max_delay(self, mock_now):
+        """Verify retry delay cannot exceed 24 hours."""
+        job = Job(retry_delay=3600, retry_count=10)
+        eta = _calculate_retry_eta(job)
+        max_delay = 86_400  # _MAX_RETRY_DELAY
+        max_jitter = int(max_delay * 0.1)
+        assert self._FIXED_NOW + max_delay <= eta <= self._FIXED_NOW + max_delay + max_jitter
+
+
+class TestPoisonPill:
+    """Verify claim_job handles corrupt payload_json gracefully."""
+
+    async def test_poison_pill_marks_failed(self, queue):
+        """A job with invalid JSON payload is marked FAILED on claim."""
+        # Enqueue a valid job, then corrupt its payload_json directly
+        job = await queue.enqueue("my_task")
+        await Job.query().filter(F("ulid") == job.ulid).update_one(
+            payload_json="NOT VALID JSON {{{"
+        )
+
+        # Claim should return None (skips the poison pill)
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed is None
+
+        # Verify the job is marked FAILED
+        await job.refresh()
+        assert job.status == "failed"
+        assert job.last_error == "Payload is not valid JSON"
+        assert job.last_failure_kind == "payload_invalid"
+        assert job.finished_at is not None
+
+        # Verify a failed attempt was recorded
+        attempts = await JobAttempt.query().filter(
+            F("job_ulid") == job.ulid
+        ).all()
+        assert len(attempts) == 1
+        assert attempts[0].status == "failed"
+        assert attempts[0].failure_kind == "payload_invalid"

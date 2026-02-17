@@ -1,9 +1,13 @@
 """Tests for @task decorator and TaskWrapper."""
 
+import re
+
 import pytest
 
 from qler.exceptions import ConfigurationError, PayloadNotSerializableError
 from qler.task import TaskWrapper, task
+
+_ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
 
 # Module-level task functions (required by @task's qualname validation)
@@ -112,7 +116,7 @@ class TestTaskEnqueue:
         wrapped = task(queue)(add_task)
 
         job = await wrapped.enqueue(1, 2)
-        assert job.ulid != ""
+        assert _ULID_PATTERN.match(job.ulid), f"Expected ULID format, got {job.ulid!r}"
         assert job.status == "pending"
         assert job.task == wrapped.task_path
         assert job.payload == {"args": [1, 2], "kwargs": {}}
