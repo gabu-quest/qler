@@ -135,4 +135,4 @@ tests/
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — M0–M4 complete (v0.1.0 MVP)
+- [ROADMAP.md](./ROADMAP.md) — M0–M5 complete (v0.1.0 tagged, cooperative cancellation)

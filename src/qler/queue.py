@@ -294,18 +294,29 @@ class Queue:
         args = payload.get("args", [])
         kwargs = payload.get("kwargs", {})
 
+        task_exc: BaseException | None = None
+        result: Any = None
         try:
             if task_wrapper.sync:
                 result = await asyncio.to_thread(task_wrapper.fn, *args, **kwargs)
             else:
                 result = await task_wrapper.fn(*args, **kwargs)
         except Exception as exc:
-            await self.fail_job(job, worker_id, exc, failure_kind=FailureKind.EXCEPTION)
-            updated = await Job.query().filter(F("ulid") == job.ulid).first()
-            return updated if updated is not None else job
+            task_exc = exc
 
-        # Complete
-        await self.complete_job(job, worker_id, result=result)
+        if task_exc is not None:
+            try:
+                await self.fail_job(
+                    job, worker_id, task_exc, failure_kind=FailureKind.EXCEPTION
+                )
+            except Exception:
+                # Best-effort: terminalize attempt directly if fail_job raises
+                await self._terminalize_attempt(
+                    attempt_id, AttemptStatus.FAILED.value, now_epoch(), error="Internal error"
+                )
+        else:
+            await self.complete_job(job, worker_id, result=result)
+
         updated = await Job.query().filter(F("ulid") == job.ulid).first()
         return updated if updated is not None else job
 

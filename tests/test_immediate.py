@@ -320,3 +320,70 @@ class TestImmediateIdempotency:
         assert job1.ulid == job2.ulid
         assert _call_count == 1
         assert job1.status == JobStatus.COMPLETED.value
+
+
+class TestImmediateRetryExhaustion:
+    """Verify retry boundary: retry_count == max_retries → FAILED."""
+
+    async def test_retry_exhaustion(self, imm_db):
+        """Enqueue max_retries=1 always-fail task. First exec → PENDING (retry).
+        Second exec → FAILED (exhausted). Boundary: retry_count == max_retries."""
+        q = Queue(imm_db, immediate=True)
+        await q.init_db()
+        task(q, max_retries=1)(boom_task)
+        wrapper = q._tasks[f"{__name__}.boom_task"]
+
+        # First execution: fails but retry available → PENDING
+        job = await wrapper.enqueue()
+        assert job.status == JobStatus.PENDING.value
+        assert job.retry_count == 1
+        assert job.max_retries == 1
+        assert "kaboom" in job.last_error
+
+        # Second execution: retries exhausted → FAILED
+        job = await q._execute_immediate(job)
+        assert job.status == JobStatus.FAILED.value
+        assert job.retry_count == 1
+        assert job.last_failure_kind == FailureKind.EXCEPTION.value
+        assert job.finished_at is not None
+        assert job.finished_at > 0
+
+
+class TestImmediateIdempotencyAfterCancellation:
+    """Verify idempotency key is reusable after cancellation."""
+
+    async def test_idempotency_after_cancellation(self, imm_queue):
+        global _call_count
+        _call_count = 0
+
+        wrapper = imm_queue._tasks[f"{__name__}.counted_task"]
+
+        # First enqueue → completes
+        job1 = await wrapper.enqueue(_idempotency_key="cancel-test")
+        assert job1.status == JobStatus.COMPLETED.value
+        assert _call_count == 1
+
+        # Idempotency dedup: same key returns existing (COMPLETED)
+        job_dup = await wrapper.enqueue(_idempotency_key="cancel-test")
+        assert job_dup.ulid == job1.ulid
+        assert _call_count == 1
+
+        # Now: enqueue a new job, cancel it while PENDING, re-enqueue same key
+        q2 = Queue(imm_queue.db, immediate=False)
+        await q2.init_db()
+        task(q2)(counted_task)
+        wrapper2 = q2._tasks[f"{__name__}.counted_task"]
+
+        job_pending = await wrapper2.enqueue(_idempotency_key="cancel-reuse")
+        assert job_pending.status == JobStatus.PENDING.value
+        assert _call_count == 1  # not executed (non-immediate)
+
+        # Cancel the pending job
+        ok = await job_pending.cancel()
+        assert ok is True
+
+        # Re-enqueue same idempotency key → should create new job
+        # (cancelled jobs are excluded from idempotency check)
+        job_new = await wrapper2.enqueue(_idempotency_key="cancel-reuse")
+        assert job_new.ulid != job_pending.ulid
+        assert job_new.status == JobStatus.PENDING.value

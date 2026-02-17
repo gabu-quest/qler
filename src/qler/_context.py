@@ -24,3 +24,20 @@ def current_job() -> "Job":
             "This function can only be used inside a @task-decorated function."
         )
     return job
+
+
+async def is_cancellation_requested() -> bool:
+    """Check if the current job has cancellation requested. Queries the DB.
+
+    Returns False (not raises) when called outside a task context.
+    """
+    from qler.models.job import Job
+    from sqler import F
+
+    job = _current_job.get()
+    if job is None:
+        return False
+    refreshed = await Job.query().filter(F("ulid") == job.ulid).first()
+    if refreshed is None:
+        return False
+    return refreshed.cancel_requested

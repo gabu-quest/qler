@@ -145,16 +145,17 @@ class TestCancel:
         assert job.status == "cancelled"
         assert before <= job.finished_at <= after
 
-    async def test_cancel_running_fails(self, queue):
+    async def test_cancel_running_requests_cooperative(self, queue):
         await queue.enqueue("my_task")
         job = await queue.claim_job("worker-1", ["default"])
         assert job is not None
         assert job.status == "running"
 
+        # cancel() on RUNNING now delegates to request_cancel()
         result = await job.cancel()
-        assert result is False
-        await job.refresh()
-        assert job.status == "running"  # unchanged
+        assert result is True
+        assert job.cancel_requested is True
+        assert job.status == "running"  # stays RUNNING (cooperative)
 
 
 class TestRetryMethod:

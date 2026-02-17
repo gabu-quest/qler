@@ -1,6 +1,6 @@
 """qler — Async-first background job queue for Python, built on SQLite via sqler."""
 
-from qler._context import current_job
+from qler._context import current_job, is_cancellation_requested
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
     ClaimConflictError,
@@ -29,6 +29,7 @@ __all__ = [
     "Worker",
     "task",
     "current_job",
+    "is_cancellation_requested",
     "Job",
     "JobAttempt",
     # Enums
