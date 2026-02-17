@@ -4,6 +4,7 @@ import re
 
 import pytest
 
+from qler._time import now_epoch
 from qler.exceptions import ConfigurationError, PayloadNotSerializableError
 from qler.task import TaskWrapper, task
 
@@ -138,6 +139,30 @@ class TestTaskEnqueue:
 
         job = await wrapped.enqueue(_priority=10)
         assert job.priority == 10
+
+    async def test_enqueue_with_delay(self, queue):
+        wrapped = task(queue)(noop_task)
+        before = now_epoch()
+        job = await wrapped.enqueue(_delay=60)
+        after = now_epoch()
+        assert before + 60 <= job.eta <= after + 60
+
+    async def test_enqueue_with_eta(self, queue):
+        wrapped = task(queue)(noop_task)
+        fixed_eta = now_epoch() + 3600
+        job = await wrapped.enqueue(_eta=fixed_eta)
+        assert job.eta == fixed_eta
+
+    async def test_enqueue_with_idempotency_key(self, queue):
+        wrapped = task(queue)(noop_task)
+        job1 = await wrapped.enqueue(_idempotency_key="dedup-1")
+        job2 = await wrapped.enqueue(_idempotency_key="dedup-1")
+        assert job1.ulid == job2.ulid
+
+    async def test_enqueue_with_correlation_id(self, queue):
+        wrapped = task(queue)(noop_task)
+        job = await wrapped.enqueue(_correlation_id="req-abc")
+        assert job.correlation_id == "req-abc"
 
 
 class TestTaskRunNow:

@@ -82,7 +82,8 @@ class TestEnqueue:
     async def test_enqueue_with_delay(self, queue):
         before = now_epoch()
         job = await queue.enqueue("my_task", delay=60)
-        assert job.eta >= before + 60
+        after = now_epoch()
+        assert before + 60 <= job.eta <= after + 60
 
     async def test_enqueue_with_eta(self, queue):
         eta = now_epoch() + 3600
@@ -251,16 +252,18 @@ class TestComplete:
         assert job.lease_expires_at is None
 
     async def test_complete_terminalizes_attempt(self, queue):
+        before = now_epoch()
         await queue.enqueue("my_task")
         job = await queue.claim_job("worker-1", ["default"])
         await queue.complete_job(job, "worker-1")
+        after = now_epoch()
 
         attempts = await JobAttempt.query().filter(
             F("job_ulid") == job.ulid
         ).all()
         assert len(attempts) == 1
         assert attempts[0].status == "completed"
-        assert attempts[0].finished_at is not None
+        assert before <= attempts[0].finished_at <= after
 
     async def test_complete_no_result(self, queue):
         await queue.enqueue("my_task")
@@ -277,7 +280,11 @@ class TestComplete:
         await queue.complete_job(job, "worker-WRONG")
 
         await job.refresh()
-        assert job.status == "running"  # unchanged
+        assert job.status == "running"
+        assert job.worker_id == "worker-1"
+        assert job.lease_expires_at is not None
+        assert job.finished_at is None
+        assert job.result_json is None
 
     async def test_complete_non_serializable_result_fails(self, queue):
         await queue.enqueue("my_task", max_retries=0)
@@ -286,6 +293,10 @@ class TestComplete:
 
         await job.refresh()
         assert job.status == "failed"
+        assert job.last_failure_kind == "exception"
+        assert job.finished_at is not None
+        assert job.worker_id == ""
+        assert job.lease_expires_at is None
 
 
 class TestFail:
@@ -312,10 +323,12 @@ class TestFail:
         await queue.fail_job(job, "worker-1", exc)
 
         await job.refresh()
+        after = now_epoch()
         assert job.status == "pending"
         assert job.retry_count == 1
-        # ETA should be at least base_delay (10s) in the future
-        assert job.eta >= before + 10
+        assert job.attempts == 1
+        # ETA: base_delay(10) * 2^0 = 10, plus up to 10% jitter (1)
+        assert before + 10 <= job.eta <= after + 11
         assert job.finished_at is None
 
     async def test_fail_exhausted_retries_marks_failed(self, queue):
@@ -353,10 +366,12 @@ class TestFail:
         assert job.status == "failed"  # non-retryable → immediate fail
 
     async def test_fail_terminalizes_attempt(self, queue):
+        before = now_epoch()
         await queue.enqueue("my_task", max_retries=0)
         job = await queue.claim_job("worker-1", ["default"])
         exc = ValueError("boom")
         await queue.fail_job(job, "worker-1", exc)
+        after = now_epoch()
 
         attempts = await JobAttempt.query().filter(
             F("job_ulid") == job.ulid
@@ -365,6 +380,9 @@ class TestFail:
         assert attempts[0].status == "failed"
         assert attempts[0].error == "boom"
         assert attempts[0].failure_kind == "exception"
+        assert attempts[0].traceback is not None
+        assert "ValueError" in attempts[0].traceback
+        assert before <= attempts[0].finished_at <= after
 
     async def test_fail_wrong_worker_ignored(self, queue):
         await queue.enqueue("my_task")
@@ -372,7 +390,10 @@ class TestFail:
         await queue.fail_job(job, "worker-WRONG", RuntimeError("x"))
 
         await job.refresh()
-        assert job.status == "running"  # unchanged
+        assert job.status == "running"
+        assert job.worker_id == "worker-1"
+        assert job.lease_expires_at is not None
+        assert job.finished_at is None
 
 
 class TestRetryEta:
@@ -440,3 +461,66 @@ class TestPoisonPill:
         assert len(attempts) == 1
         assert attempts[0].status == "failed"
         assert attempts[0].failure_kind == "payload_invalid"
+
+
+class TestQueueClose:
+    """Verify Queue.close() resource cleanup."""
+
+    async def test_close_owned_db(self, tmp_path):
+        db_path = str(tmp_path / "test_close.db")
+        q = Queue(db_path)
+        await q.init_db()
+        assert q._db is not None
+        assert q._initialized is True
+
+        await q.close()
+        assert q._db is None
+        assert q._initialized is False
+
+    async def test_close_unowned_db_noop(self, db):
+        q = Queue(db)
+        await q.init_db()
+
+        await q.close()
+        # External DB should NOT be closed
+        assert q._db is not None or not q._owns_db
+
+    async def test_close_idempotent(self, tmp_path):
+        db_path = str(tmp_path / "test_close2.db")
+        q = Queue(db_path)
+        await q.init_db()
+
+        await q.close()
+        await q.close()  # Should not raise
+
+    def test_db_property_raises_before_init(self):
+        q = Queue("/tmp/nonexistent.db")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            q.db
+
+
+class TestErrorTruncation:
+    """Verify error and traceback are capped at storage limits."""
+
+    async def test_long_error_truncated(self, queue):
+        await queue.enqueue("my_task", max_retries=0)
+        job = await queue.claim_job("worker-1", ["default"])
+        long_error = "x" * 2000
+        await queue.fail_job(job, "worker-1", ValueError(long_error))
+
+        await job.refresh()
+        assert job.status == "failed"
+        assert len(job.last_error) <= 1024
+
+    async def test_traceback_stored_in_attempt(self, queue):
+        await queue.enqueue("my_task", max_retries=0)
+        job = await queue.claim_job("worker-1", ["default"])
+        await queue.fail_job(job, "worker-1", ValueError("traceback test"))
+
+        attempts = await JobAttempt.query().filter(
+            F("job_ulid") == job.ulid
+        ).all()
+        assert len(attempts) == 1
+        assert attempts[0].traceback is not None
+        assert "ValueError" in attempts[0].traceback
+        assert "traceback test" in attempts[0].traceback
