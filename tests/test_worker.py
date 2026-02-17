@@ -8,6 +8,7 @@ import pytest_asyncio
 from sqler import AsyncSQLerDB
 
 from qler._context import current_job
+from qler._time import generate_ulid, now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import ConfigurationError, JobFailedError
 from qler.models.attempt import JobAttempt
@@ -469,3 +470,219 @@ class TestCorrelation:
 
         # correlation_id defaults to "" for jobs enqueued without one
         assert _captured_correlation == ""
+
+
+# ---------------------------------------------------------------------------
+# TestLeaseRenewalLoop
+# ---------------------------------------------------------------------------
+
+class TestLeaseRenewalLoop:
+    """Verify the background lease renewal loop extends leases mid-execution."""
+
+    async def test_renewal_extends_lease_for_long_running_job(self, worker_db):
+        """Job taking longer than lease_duration completes because renewal extends the lease."""
+        q = Queue(worker_db, default_lease_duration=2, default_max_retries=0)
+        await q.init_db()
+        wrapped = task(q)(slow_task)
+        job = await wrapped.enqueue(duration=3.0)
+
+        w = _make_worker(q, lease_recovery_interval=60.0)
+        worker_task = asyncio.create_task(w.run())
+
+        try:
+            # Wait for the job to be claimed
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if w._active_jobs:
+                    break
+            assert len(w._active_jobs) == 1
+
+            # Record the original lease expiry
+            await job.refresh()
+            original_expiry = job.lease_expires_at
+
+            # Wait long enough for the renewal loop to fire (~2s)
+            await asyncio.sleep(2.5)
+
+            # Lease should have been extended beyond the original
+            await job.refresh()
+            assert job.lease_expires_at > original_expiry, (
+                f"Lease was not renewed: original={original_expiry}, "
+                f"current={job.lease_expires_at}"
+            )
+
+            # Job should still complete successfully despite taking 3s > 2s lease
+            await job.wait(timeout=5.0, poll_interval=0.02)
+            assert job.status == "completed"
+            assert job.result == "done"
+        finally:
+            w._running = False
+            await asyncio.sleep(0.05)
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# TestShutdownTimeout
+# ---------------------------------------------------------------------------
+
+class TestShutdownTimeout:
+    """Verify forced cancellation when jobs exceed shutdown_timeout."""
+
+    async def test_timeout_cancels_long_running_job(self, worker_db):
+        """Job exceeding shutdown_timeout gets cancelled and marked FAILED."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=0)
+        await q.init_db()
+        wrapped = task(q)(slow_task)
+        job = await wrapped.enqueue(duration=30.0)
+
+        w = _make_worker(q, shutdown_timeout=0.1)
+        worker_task = asyncio.create_task(w.run())
+
+        try:
+            # Wait for job to start executing
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if w._active_jobs:
+                    break
+            assert len(w._active_jobs) == 1
+
+            # Signal shutdown — worker has 0.1s to drain
+            w._running = False
+
+            # Wait for the worker to fully shut down
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                if worker_task.done():
+                    break
+            assert worker_task.done(), "Worker did not shut down"
+        finally:
+            if not worker_task.done():
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
+
+        # The CancelledError handler should have marked the job FAILED
+        await job.refresh()
+        assert job.status == "failed"
+        assert job.last_failure_kind == FailureKind.CANCELLED.value
+
+
+# ---------------------------------------------------------------------------
+# TestMalformedPayload
+# ---------------------------------------------------------------------------
+
+class TestMalformedPayload:
+    """Verify worker handles payloads with valid JSON but wrong structure."""
+
+    async def test_non_dict_payload_fails_as_payload_invalid(self, worker_db):
+        """Valid JSON but non-dict payload (e.g., '123') → PAYLOAD_INVALID."""
+        q = Queue(worker_db, default_lease_duration=5, default_max_retries=0)
+        await q.init_db()
+        # Register a task so it's found (we want to hit the payload parse path, not TASK_NOT_FOUND)
+        wrapped = task(q)(succeeding_task)
+
+        # Manually insert a job with a non-dict payload that passes the poison pill
+        # check (json.loads("123") succeeds) but fails .get() in _execute_job
+        now = now_epoch()
+        job = Job(
+            ulid=generate_ulid(),
+            status=JobStatus.PENDING.value,
+            queue_name="default",
+            task=wrapped.task_path,
+            payload_json="123",
+            max_retries=0,
+            retry_delay=60,
+            lease_duration=5,
+            created_at=now,
+            updated_at=now,
+            eta=now,
+        )
+        await job.save()
+
+        w = _make_worker(q)
+        with pytest.raises(JobFailedError) as exc_info:
+            await _run_worker_until_job_done(w, job)
+        assert exc_info.value.failure_kind == FailureKind.PAYLOAD_INVALID.value
+
+        await job.refresh()
+        assert job.status == "failed"
+        assert job.last_failure_kind == FailureKind.PAYLOAD_INVALID.value
+
+    async def test_null_payload_fails_as_payload_invalid(self, worker_db):
+        """JSON null payload → PAYLOAD_INVALID."""
+        q = Queue(worker_db, default_lease_duration=5, default_max_retries=0)
+        await q.init_db()
+        wrapped = task(q)(succeeding_task)
+
+        now = now_epoch()
+        job = Job(
+            ulid=generate_ulid(),
+            status=JobStatus.PENDING.value,
+            queue_name="default",
+            task=wrapped.task_path,
+            payload_json="null",
+            max_retries=0,
+            retry_delay=60,
+            lease_duration=5,
+            created_at=now,
+            updated_at=now,
+            eta=now,
+        )
+        await job.save()
+
+        w = _make_worker(q)
+        with pytest.raises(JobFailedError) as exc_info:
+            await _run_worker_until_job_done(w, job)
+        assert exc_info.value.failure_kind == FailureKind.PAYLOAD_INVALID.value
+
+        await job.refresh()
+        assert job.status == "failed"
+        assert job.last_failure_kind == FailureKind.PAYLOAD_INVALID.value
+
+
+# ---------------------------------------------------------------------------
+# TestRetryExhaustion
+# ---------------------------------------------------------------------------
+
+class TestRetryExhaustion:
+    """Verify the full retry exhaustion cycle through the worker."""
+
+    async def test_retry_then_permanent_failure(self, worker_db):
+        """max_retries=1: attempt 1 fails → retry → attempt 2 fails → permanent FAILED."""
+        q = Queue(
+            worker_db,
+            default_lease_duration=5,
+            default_max_retries=1,
+            default_retry_delay=1,
+        )
+        await q.init_db()
+        wrapped = task(q)(failing_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(q)
+        # job.wait() will raise JobFailedError once retries are exhausted
+        with pytest.raises(JobFailedError):
+            await _run_worker_until_job_done(w, job, timeout=10.0)
+
+        await job.refresh()
+        assert job.status == "failed"
+        assert job.retry_count == 1
+        assert job.attempts == 2
+        assert job.last_failure_kind == FailureKind.EXCEPTION.value
+        assert job.last_error == "boom"
+
+        # Verify both attempt records
+        attempts = await JobAttempt.query().filter(
+            F("job_ulid") == job.ulid
+        ).order_by("ulid").all()
+        assert len(attempts) == 2
+        assert attempts[0].status == AttemptStatus.FAILED.value
+        assert attempts[0].attempt_number == 1
+        assert attempts[1].status == AttemptStatus.FAILED.value
+        assert attempts[1].attempt_number == 2

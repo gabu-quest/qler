@@ -115,7 +115,14 @@ class Worker:
     async def _claim_loop(self) -> None:
         """Main loop: acquire semaphore → claim job → dispatch execution."""
         while self._running:
-            await self._semaphore.acquire()
+            # Use timeout on acquire so _running=False can exit the loop
+            # even when all concurrency slots are occupied by active jobs.
+            try:
+                await asyncio.wait_for(
+                    self._semaphore.acquire(), timeout=self.poll_interval
+                )
+            except asyncio.TimeoutError:
+                continue
 
             if not self._running:
                 self._semaphore.release()
@@ -160,7 +167,7 @@ class Worker:
                 payload = json.loads(job.payload_json)
                 args = payload.get("args", [])
                 kwargs = payload.get("kwargs", {})
-            except (json.JSONDecodeError, TypeError, KeyError) as exc:
+            except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as exc:
                 logger.error("Invalid payload for job %s: %s", job.ulid, exc)
                 await self.queue.fail_job(
                     job,
