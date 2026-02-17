@@ -128,6 +128,9 @@ These are explicitly NOT in v0.1. Ordered by likely priority.
 | Prometheus metrics | Export queue depths, throughput, failure rates |
 | Payload encryption | Optional encryption for sensitive fields |
 | Per-task idempotency key generators | `idempotency_key=lambda order_id: f"charge:{order_id}"` |
+| Test: retry exhaustion in immediate mode | Drive max_retries=N job through all retries → assert FAILED |
+| Test: idempotency after cancellation | Cancel job, re-enqueue same key → new execution occurs |
+| Harden `_execute_immediate` attempt finalization | try/finally to terminalize attempt if fail_job/complete_job raise |
 | `qler backup` command | Safe backup via SQLite backup API |
 | `qler tasks` command | List registered tasks with config |
 | logler db_source input validation | Sanitize user-supplied table names beyond SQL quoting; allowlist approach |
