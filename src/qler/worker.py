@@ -52,6 +52,10 @@ class Worker:
             raise ConfigurationError(
                 f"concurrency must be >= 1, got {concurrency}"
             )
+        if shutdown_timeout <= 0:
+            raise ConfigurationError(
+                f"shutdown_timeout must be > 0, got {shutdown_timeout}"
+            )
 
         self.queue = queue
         self.queues = queues or ["default"]
@@ -191,6 +195,17 @@ class Worker:
                         result = await asyncio.to_thread(fn, *args, **kwargs)
                     else:
                         result = await fn(*args, **kwargs)
+            except asyncio.CancelledError:
+                logger.warning(
+                    "Task %s cancelled (job %s), marking failed",
+                    job.task, job.ulid,
+                )
+                await self.queue.fail_job(
+                    job,
+                    self.worker_id,
+                    failure_kind=FailureKind.CANCELLED,
+                )
+                raise
             except Exception as exc:
                 logger.error(
                     "Task %s failed (job %s): %s",
