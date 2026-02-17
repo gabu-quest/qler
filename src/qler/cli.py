@@ -161,6 +161,7 @@ def _job_to_dict(job: Job) -> dict[str, Any]:
         "last_attempt_id": job.last_attempt_id,
         "correlation_id": job.correlation_id,
         "idempotency_key": job.idempotency_key,
+        "cancel_requested": job.cancel_requested,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "finished_at": job.finished_at,
@@ -489,6 +490,8 @@ def job(ulid: str, db: str, output_json: bool) -> None:
         click.echo(f"Worker:          {result.worker_id or '-'}")
         click.echo(f"Correlation ID:  {result.correlation_id or '-'}")
         click.echo(f"Idempotency key: {result.idempotency_key or '-'}")
+        if result.cancel_requested:
+            click.echo(f"Cancel req:      Yes")
         payload = _safe_json(result.payload_json)
         click.echo(f"Payload:         {json.dumps(payload, indent=2)}")
         if result.result_json:
@@ -684,7 +687,12 @@ def cancel_cmd(
                 for j in matching:
                     ok = await j.cancel()
                     if ok:
-                        cancelled.append(j.ulid)
+                        # cancel() may have delegated to request_cancel() if
+                        # the job was claimed between the query and the cancel
+                        if j.status == JobStatus.RUNNING.value:
+                            requested.append(j.ulid)
+                        else:
+                            cancelled.append(j.ulid)
 
                 # Request cancellation for RUNNING jobs if --running
                 if include_running:
