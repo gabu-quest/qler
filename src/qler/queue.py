@@ -22,6 +22,10 @@ from qler.models.job import Job
 if TYPE_CHECKING:
     from qler.task import TaskWrapper
 
+_MAX_TRACEBACK_LENGTH = 8_192
+_MAX_ERROR_LENGTH = 1_024
+_MAX_RETRY_DELAY = 86_400  # 24 hours
+
 
 class Queue:
     """Async job queue backed by SQLite via sqler.
@@ -333,6 +337,19 @@ class Queue:
                 )
                 return
 
+            if len(result_json) > self.max_payload_size:
+                await self.fail_job(
+                    job,
+                    worker_id,
+                    PayloadTooLargeError(
+                        f"Result size {len(result_json)} exceeds max {self.max_payload_size}",
+                        size=len(result_json),
+                        max_size=self.max_payload_size,
+                    ),
+                    failure_kind=FailureKind.EXCEPTION,
+                )
+                return
+
         now = now_epoch()
         updated = await Job.query().filter(
             (F("ulid") == job.ulid)
@@ -376,9 +393,9 @@ class Queue:
             and job.retry_count < job.max_retries
         )
 
-        error_msg = str(exc) if exc else None
+        error_msg = str(exc)[:_MAX_ERROR_LENGTH] if exc else None
         error_tb = tb_module.format_exception(exc) if exc else None
-        error_tb_str = "".join(error_tb) if error_tb else None
+        error_tb_str = "".join(error_tb)[-_MAX_TRACEBACK_LENGTH:] if error_tb else None
 
         update_fields: dict[str, Any] = {
             "last_error": error_msg,
@@ -464,7 +481,7 @@ class Queue:
 def _calculate_retry_eta(job: Job) -> int:
     """Calculate the next retry ETA with exponential backoff + jitter."""
     base_delay = job.retry_delay
-    delay = base_delay * (2 ** job.retry_count)
-    # Add 10% jitter
+    delay = min(base_delay * (2 ** job.retry_count), _MAX_RETRY_DELAY)
+    # Add 10% jitter (non-cryptographic, intentional)
     jitter = delay * 0.1 * random.random()
     return now_epoch() + int(delay + jitter)
