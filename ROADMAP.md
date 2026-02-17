@@ -83,7 +83,7 @@ The production-ready worker loop.
 
 **Exit criteria:** Worker runs reliably, recovers from crashes, handles concurrent jobs, shuts down cleanly, logs are correlated.
 
-### M3: CLI 🔄 ← current
+### M3: CLI ✅
 
 Human-first CLI with `--json` flag.
 
@@ -97,7 +97,7 @@ Human-first CLI with `--json` flag.
 
 **Exit criteria:** All commands work, human output readable, --json parseable.
 
-### M4: Testing + Polish ⬚
+### M4: Testing + Polish ✅
 
 Test suite and pre-release polish.
 

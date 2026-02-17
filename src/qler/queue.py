@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import traceback as tb_module
@@ -15,6 +16,7 @@ from qler.exceptions import (
     ConfigurationError,
     PayloadNotSerializableError,
     PayloadTooLargeError,
+    TaskNotRegisteredError,
 )
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
@@ -38,6 +40,7 @@ class Queue:
         self,
         db: str | AsyncSQLerDB,
         *,
+        immediate: bool = False,
         default_lease_duration: int = 300,
         default_max_retries: int = 0,
         default_retry_delay: int = 60,
@@ -57,6 +60,7 @@ class Queue:
                 f"default_retry_delay must be >= 1, got {default_retry_delay}"
             )
 
+        self.immediate = immediate
         self.default_lease_duration = default_lease_duration
         self.default_max_retries = default_max_retries
         self.default_retry_delay = default_retry_delay
@@ -219,7 +223,91 @@ class Queue:
             updated_at=now,
         )
         await job.save()
+
+        if self.immediate:
+            return await self._execute_immediate(job)
+
         return job
+
+    # ------------------------------------------------------------------
+    # Immediate execution
+    # ------------------------------------------------------------------
+
+    async def _execute_immediate(self, job: Job) -> Job:
+        """Execute a job synchronously within enqueue(). Used by immediate mode.
+
+        Transitions the job PENDING → RUNNING → COMPLETED/FAILED, creates an
+        attempt record, and returns the updated Job.
+        """
+        worker_id = "__immediate__"
+        now = now_epoch()
+        attempt_id = generate_ulid()
+
+        # Transition PENDING → RUNNING
+        claimed = await Job.query().filter(
+            (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
+        ).update_one(
+            status=JobStatus.RUNNING.value,
+            worker_id=worker_id,
+            attempts=F("attempts") + 1,
+            last_attempt_id=attempt_id,
+            updated_at=now,
+        )
+        if claimed is None:
+            # Job was already claimed (e.g. idempotency returned existing)
+            return job
+        job = claimed
+
+        # Create attempt record
+        attempt = JobAttempt(
+            ulid=attempt_id,
+            job_ulid=job.ulid,
+            status=AttemptStatus.RUNNING.value,
+            attempt_number=job.attempts,
+            worker_id=worker_id,
+            started_at=now,
+        )
+        await attempt.save()
+
+        # Resolve task
+        task_wrapper = self._tasks.get(job.task)
+        if task_wrapper is None:
+            # Fail the job cleanly instead of leaving it RUNNING
+            await self.fail_job(
+                job,
+                worker_id,
+                RuntimeError(
+                    f"Task '{job.task}' is not registered on this queue. "
+                    "Register it with @task(queue) before enqueuing."
+                ),
+                failure_kind=FailureKind.TASK_NOT_FOUND,
+            )
+            updated = await Job.query().filter(F("ulid") == job.ulid).first()
+            raise TaskNotRegisteredError(
+                f"Task '{job.task}' is not registered on this queue. "
+                "Register it with @task(queue) before enqueuing.",
+                task_path=job.task,
+            )
+
+        # Parse payload and execute
+        payload = json.loads(job.payload_json)
+        args = payload.get("args", [])
+        kwargs = payload.get("kwargs", {})
+
+        try:
+            if task_wrapper.sync:
+                result = await asyncio.to_thread(task_wrapper.fn, *args, **kwargs)
+            else:
+                result = await task_wrapper.fn(*args, **kwargs)
+        except Exception as exc:
+            await self.fail_job(job, worker_id, exc, failure_kind=FailureKind.EXCEPTION)
+            updated = await Job.query().filter(F("ulid") == job.ulid).first()
+            return updated if updated is not None else job
+
+        # Complete
+        await self.complete_job(job, worker_id, result=result)
+        updated = await Job.query().filter(F("ulid") == job.ulid).first()
+        return updated if updated is not None else job
 
     # ------------------------------------------------------------------
     # Claim
