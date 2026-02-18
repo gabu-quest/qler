@@ -158,30 +158,18 @@ Token bucket rate limiting for tasks and queues.
 
 ## Next Up (v0.3)
 
-### M8: Fix sqler `.count()` bug ⬚
+### M8: Fix sqler `.count()` bug ✅
 
-**Where:** `/home/gabu/projects/pypi/sqler/`
+**Where:** `/home/gabu/projects/pypi/sqler/` — branch `fix/aggregate-promoted-rewrite`
 
-**Bug:** `AsyncQuerySet.count()` returns 0 when combining promoted column filters with JSON field filters via `&`. Individual filters work; combined filter breaks.
+**Root cause:** `_build_aggregate_query()` was not calling `_rewrite_promoted_refs()`, so WHERE clauses with promoted column filters used `json_extract(data, '$.status')` instead of the real `status` column. Promoted fields are stripped from the JSON blob on save, so json_extract returns NULL → zero matches.
 
-**Reproduction:**
-```python
-# Works: returns 1
-await Job.query().filter(F("task") == "mymod.my_task").all()  # len = 1
-await Job.query().filter(F("status").in_list(["pending", "running"])).all()  # len = 1
-
-# Broken: returns 0
-await Job.query().filter(
-    (F("task") == "mymod.my_task") & F("status").in_list(["pending", "running"])
-).count()  # returns 0, should return 1
-```
-
-**Impact:** qler works around this with `len(await ...all())` in 3 places (worker cron scheduler, CLI cron command, rate limit tests). The workaround is functional but wasteful — it fetches all rows instead of doing a COUNT.
+**Fix:** Added `_rewrite_promoted_refs()` call to `_build_aggregate_query()` in both `async_query.py` and `query.py`. Affects all aggregate functions: `count()`, `sum()`, `avg()`, `min()`, `max()`.
 
 **Deliverables:**
-- Fix `count()` SQL generation for mixed promoted + JSON field filters
-- Regression test in sqler
-- Remove `len(await ...all())` workarounds in qler
+- ✅ Fix `count()` SQL generation for mixed promoted + JSON field filters
+- ✅ 4 regression tests in sqler (`test_async_promoted.py::TestAsyncPromotedAggregates`)
+- ✅ Removed `len(await ...all())` workarounds in qler (3 places)
 
 ### M9: Job Dependencies/Chaining ⬚
 
