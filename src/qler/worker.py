@@ -298,14 +298,14 @@ class Worker:
 
                     # max_running guard: check pending/running count
                     if cw.schedule.max_running > 0:
-                        active = await Job.query().filter(
+                        running_count = await Job.query().filter(
                             (F("task") == path)
                             & F("status").in_list([
                                 JobStatus.PENDING.value,
                                 JobStatus.RUNNING.value,
                             ])
-                        ).all()
-                        if len(active) >= cw.schedule.max_running:
+                        ).count()
+                        if running_count >= cw.schedule.max_running:
                             continue
 
                     # Enqueue with idempotency key to prevent duplicates
