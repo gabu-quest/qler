@@ -156,16 +156,68 @@ Token bucket rate limiting for tasks and queues.
 
 ---
 
-## Post-MVP (v0.3+)
+## Next Up (v0.3)
 
-These are explicitly NOT in v0.2. Ordered by likely priority.
+### M8: Fix sqler `.count()` bug ⬚
+
+**Where:** `/home/gabu/projects/pypi/sqler/`
+
+**Bug:** `AsyncQuerySet.count()` returns 0 when combining promoted column filters with JSON field filters via `&`. Individual filters work; combined filter breaks.
+
+**Reproduction:**
+```python
+# Works: returns 1
+await Job.query().filter(F("task") == "mymod.my_task").all()  # len = 1
+await Job.query().filter(F("status").in_list(["pending", "running"])).all()  # len = 1
+
+# Broken: returns 0
+await Job.query().filter(
+    (F("task") == "mymod.my_task") & F("status").in_list(["pending", "running"])
+).count()  # returns 0, should return 1
+```
+
+**Impact:** qler works around this with `len(await ...all())` in 3 places (worker cron scheduler, CLI cron command, rate limit tests). The workaround is functional but wasteful — it fetches all rows instead of doing a COUNT.
+
+**Deliverables:**
+- Fix `count()` SQL generation for mixed promoted + JSON field filters
+- Regression test in sqler
+- Remove `len(await ...all())` workarounds in qler
+
+### M9: Job Dependencies/Chaining ⬚
+
+Job A depends on Job B completing before it can be claimed.
+
+- `depends_on` parameter on `enqueue()` — list of job ULIDs
+- `Job.dependencies` field (JSON list of ULIDs)
+- Claim query filters out jobs with unfinished dependencies
+- `job.wait_for_dependencies()` helper
+- CLI: `qler job <id>` shows dependency status
+
+### M10: Dead Letter Queue ⬚
+
+Configurable DLQ for permanently failed jobs.
+
+- `Queue(db, dlq="dead_letters")` — auto-move failed jobs to named queue
+- `max_retries` exhaustion triggers DLQ move instead of terminal FAILED
+- `qler dlq` CLI command — list, inspect, replay from DLQ
+- DLQ jobs preserve full attempt history
+
+### M11: procler Integration ⬚
+
+Health endpoint, worker process definitions.
+
+- procler process definition for `qler worker`
+- Health check endpoint (HTTP or Unix socket)
+- Worker heartbeat reporting
+- `procler` manages worker lifecycle (start, stop, restart)
+
+---
+
+## Future (v0.4+)
 
 | Feature | Notes |
 |---------|-------|
-| procler integration | Health endpoint, worker process definitions |
 | Web dashboard | Vue 3 + Naive UI (read-only + operational) |
-| Job dependencies/chaining | Job A depends on Job B |
-| Dead letter queue | Configurable DLQ for permanently failed jobs |
 | Prometheus metrics | Export queue depths, throughput, failure rates |
 | Payload encryption | Optional encryption for sensitive fields |
 | Per-task idempotency key generators | `idempotency_key=lambda order_id: f"charge:{order_id}"` |
