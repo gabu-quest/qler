@@ -20,7 +20,9 @@ from qler.exceptions import (
     TaskNotRegisteredError,
 )
 from qler.models.attempt import JobAttempt
+from qler.models.bucket import RateLimitBucket
 from qler.models.job import Job
+from qler.rate_limit import RateSpec, parse_rate, try_acquire
 
 if TYPE_CHECKING:
     from qler.cron import CronWrapper
@@ -47,6 +49,7 @@ class Queue:
         default_max_retries: int = 0,
         default_retry_delay: int = 60,
         max_payload_size: int = 1_000_000,
+        rate_limits: Optional[dict[str, str]] = None,
     ) -> None:
         if isinstance(db, str):
             self._db_path: Optional[str] = db
@@ -69,6 +72,10 @@ class Queue:
         self.max_payload_size = max_payload_size
         self._tasks: dict[str, TaskWrapper] = {}
         self._cron_tasks: dict[str, CronWrapper] = {}
+        self._rate_limits: dict[str, RateSpec] = {}
+        if rate_limits:
+            for queue_name, spec in rate_limits.items():
+                self._rate_limits[queue_name] = parse_rate(spec)
         self._initialized = False
 
     @property
@@ -98,6 +105,7 @@ class Queue:
 
         Job.set_db(self._db, "qler_jobs")
         JobAttempt.set_db(self._db, "qler_job_attempts")
+        RateLimitBucket.set_db(self._db, "qler_rate_limit_buckets")
 
         # Create tables with promoted columns + CHECK constraints.
         # We call the db methods directly instead of Model._ensure_schema()
@@ -109,9 +117,15 @@ class Queue:
         await self._db._ensure_table_with_promoted(
             "qler_job_attempts", JobAttempt.__promoted__, JobAttempt.__checks__
         )
+        await self._db._ensure_table_with_promoted(
+            "qler_rate_limit_buckets",
+            RateLimitBucket.__promoted__,
+            RateLimitBucket.__checks__,
+        )
 
         await self._db._ensure_versioned_table("qler_jobs")
         await self._db._ensure_versioned_table("qler_job_attempts")
+        await self._db._ensure_versioned_table("qler_rate_limit_buckets")
 
         await self._create_indexes()
         self._initialized = True
@@ -372,6 +386,12 @@ class Queue:
             await self._poison_pill(job, worker_id, attempt_id, now_ts)
             return None
 
+        # Rate limit checks (queue-level, then task-level)
+        if not self.immediate:
+            rate_limited = await self._check_rate_limits(job, worker_id, now_ts)
+            if rate_limited:
+                return None
+
         # Create the running attempt record
         attempt = JobAttempt(
             ulid=attempt_id,
@@ -586,6 +606,53 @@ class Queue:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _check_rate_limits(
+        self, job: Job, worker_id: str, now_ts: int
+    ) -> bool:
+        """Check rate limits for a claimed job. Returns True if rate-limited.
+
+        Checks queue-level rate limit first, then task-level. If either limit
+        is exceeded, requeues the job with a delayed ETA.
+        """
+        # Queue-level rate limit
+        queue_rate = self._rate_limits.get(job.queue_name)
+        if queue_rate is not None:
+            allowed = await try_acquire(f"queue:{job.queue_name}", queue_rate)
+            if not allowed:
+                await self._requeue_rate_limited(job, worker_id, queue_rate, now_ts)
+                return True
+
+        # Task-level rate limit
+        task_wrapper = self._tasks.get(job.task)
+        if task_wrapper is not None and task_wrapper.rate_spec is not None:
+            allowed = await try_acquire(f"task:{job.task}", task_wrapper.rate_spec)
+            if not allowed:
+                await self._requeue_rate_limited(
+                    job, worker_id, task_wrapper.rate_spec, now_ts
+                )
+                return True
+
+        return False
+
+    async def _requeue_rate_limited(
+        self, job: Job, worker_id: str, rate: RateSpec, now_ts: int
+    ) -> None:
+        """Requeue a rate-limited job back to PENDING with a delayed ETA."""
+        delay = max(1, int(1.0 / rate.refill_rate)) if rate.refill_rate > 0 else 1
+        await Job.query().filter(
+            (F("ulid") == job.ulid)
+            & (F("status") == JobStatus.RUNNING.value)
+            & (F("worker_id") == worker_id)
+        ).update_one(
+            status=JobStatus.PENDING.value,
+            eta=now_ts + delay,
+            worker_id="",
+            lease_expires_at=None,
+            # Don't increment retry_count — rate limiting is not a failure
+            attempts=F("attempts") - 1,  # Undo the increment from claim
+            updated_at=now_ts,
+        )
 
     async def _terminalize_attempt(
         self,

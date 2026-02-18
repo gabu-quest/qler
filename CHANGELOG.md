@@ -2,6 +2,22 @@
 
 All notable changes to qler will be documented in this file.
 
+## [0.2.0] — 2026-02-18
+
+### Added
+
+- **`@cron` decorator** — declarative periodic tasks with cron expressions (via `croniter`)
+- **`CronWrapper`** — wraps `TaskWrapper` with scheduling metadata, delegates enqueue/run/call
+- **Worker cron scheduler loop** — background task enqueues cron jobs at scheduled times
+- **Cron idempotency keys** — `cron:{task_path}:{timestamp}` prevents duplicate scheduling
+- **`max_running` guard** — prevents cron job pile-up when previous runs are still active
+- **`qler cron` CLI command** — lists registered cron tasks with schedules and active counts
+- **Token bucket rate limiting** — `@task(q, rate_limit="10/m")` for per-task rate limits
+- **Queue-level rate limits** — `Queue(db, rate_limits={"emails": "100/h"})`
+- **`RateLimitBucket` model** — persistent token state with refill-on-access
+- **Rate-limited requeue** — exceeded limits requeue jobs with delayed ETA instead of failing
+- **Immediate mode bypass** — rate limits are skipped in immediate mode for testing
+
 ## [0.1.0] — 2026-02-18
 
 Initial MVP release. Background jobs without Redis, built on SQLite via sqler.

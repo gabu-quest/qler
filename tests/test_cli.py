@@ -1222,7 +1222,7 @@ class TestVersionHelp:
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
-        assert "0.1.0" in result.output
+        assert "0.2.0" in result.output
 
     def test_help(self, runner):
         result = runner.invoke(cli, ["--help"])
