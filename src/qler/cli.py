@@ -163,6 +163,8 @@ def _job_to_dict(job: Job) -> dict[str, Any]:
         "correlation_id": job.correlation_id,
         "idempotency_key": job.idempotency_key,
         "cancel_requested": job.cancel_requested,
+        "dependencies": job.dependencies,
+        "pending_dep_count": job.pending_dep_count,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "finished_at": job.finished_at,
@@ -493,6 +495,11 @@ def job(ulid: str, db: str, output_json: bool) -> None:
         click.echo(f"Idempotency key: {result.idempotency_key or '-'}")
         if result.cancel_requested:
             click.echo(f"Cancel req:      Yes")
+        if result.dependencies:
+            click.echo(f"Dependencies:    {len(result.dependencies)} job(s)")
+            click.echo(f"  Pending deps:  {result.pending_dep_count}")
+            for dep_ulid in result.dependencies:
+                click.echo(f"  - {dep_ulid}")
         payload = _safe_json(result.payload_json)
         click.echo(f"Payload:         {json.dumps(payload, indent=2)}")
         if result.result_json:
@@ -667,7 +674,7 @@ def cancel_cmd(
                             f"Cannot request cancellation for job {ulid}"
                         )
                 else:
-                    ok = await j.cancel()
+                    ok = await q.cancel_job(j)
                     if ok:
                         cancelled.append(j.ulid)
                     else:
@@ -686,9 +693,9 @@ def cancel_cmd(
                     combined = combined & f
                 matching = await Job.query().filter(combined).all()
                 for j in matching:
-                    ok = await j.cancel()
+                    ok = await q.cancel_job(j)
                     if ok:
-                        # cancel() may have delegated to request_cancel() if
+                        # cancel_job() may have delegated to request_cancel() if
                         # the job was claimed between the query and the cancel
                         if j.status == JobStatus.RUNNING.value:
                             requested.append(j.ulid)

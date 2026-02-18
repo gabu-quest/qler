@@ -9,7 +9,7 @@ class TestJobDefaults:
     """Verify Job model field defaults and promoted column definitions."""
 
     def test_promoted_columns(self):
-        expected = {"ulid", "status", "queue_name", "priority", "eta", "lease_expires_at"}
+        expected = {"ulid", "status", "queue_name", "priority", "eta", "lease_expires_at", "pending_dep_count"}
         assert set(Job.__promoted__.keys()) == expected
 
     def test_check_constraints(self):
