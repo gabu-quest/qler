@@ -138,12 +138,12 @@ async def test_cron_max_running_blocks(queue):
     await wrapped.enqueue()
 
     # Check running count matches expectation
-    active = await Job.query().filter(
+    count = await Job.query().filter(
         (F("task") == wrapped.task_path)
         & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
-    ).all()
-    assert len(active) == 1
-    assert len(active) >= wrapped.schedule.max_running
+    ).count()
+    assert count == 1
+    assert count >= wrapped.schedule.max_running
 
 
 async def test_cron_max_running_allows(queue):
@@ -152,12 +152,12 @@ async def test_cron_max_running_allows(queue):
 
     # Enqueue one — still below max_running of 2
     await wrapped.enqueue()
-    active = await Job.query().filter(
+    count = await Job.query().filter(
         (F("task") == wrapped.task_path)
         & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
-    ).all()
-    assert len(active) == 1
-    assert len(active) < wrapped.schedule.max_running
+    ).count()
+    assert count == 1
+    assert count < wrapped.schedule.max_running
 
 
 async def test_cron_immediate_mode(db):

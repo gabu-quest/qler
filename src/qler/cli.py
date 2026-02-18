@@ -971,11 +971,10 @@ def cron_cmd(
             tasks = []
             for path, cw in q._cron_tasks.items():
                 # Count active jobs for this cron task
-                active = await Job.query().filter(
+                active_count = await Job.query().filter(
                     (F("task") == path)
                     & F("status").in_list(["pending", "running"])
-                ).all()
-                active_count = len(active)
+                ).count()
 
                 next_run = cw.next_run()
                 tasks.append({
