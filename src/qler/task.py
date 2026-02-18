@@ -8,6 +8,7 @@ import json
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from qler.exceptions import ConfigurationError, PayloadNotSerializableError
+from qler.rate_limit import RateSpec, parse_rate
 
 if TYPE_CHECKING:
     from qler.models.job import Job
@@ -28,6 +29,7 @@ class TaskWrapper:
         priority: Optional[int] = None,
         lease_duration: Optional[int] = None,
         sync: bool = False,
+        rate_limit: Optional[str] = None,
     ) -> None:
         self.fn = fn
         self.queue = queue
@@ -38,6 +40,7 @@ class TaskWrapper:
         self._lease_duration = lease_duration
         self.sync = sync
         self.task_path = f"{fn.__module__}.{fn.__qualname__}"
+        self.rate_spec: Optional[RateSpec] = parse_rate(rate_limit) if rate_limit else None
 
         # Register on queue
         queue._tasks[self.task_path] = self
@@ -126,6 +129,7 @@ def task(
     priority: Optional[int] = None,
     lease_duration: Optional[int] = None,
     sync: bool = False,
+    rate_limit: Optional[str] = None,
 ) -> Callable[[Callable], TaskWrapper]:
     """Decorator to register a function as a qler task.
 
@@ -137,7 +141,11 @@ def task(
         priority: Default priority override.
         lease_duration: Default lease duration override.
         sync: If True, the function is synchronous and will be run via asyncio.to_thread.
+        rate_limit: Rate limit spec (e.g., "10/m", "100/h"). None = unlimited.
     """
+    # Validate rate_limit early (fail at import time, not at enqueue time)
+    if rate_limit is not None:
+        parse_rate(rate_limit)
 
     def decorator(fn: Callable) -> TaskWrapper:
         # Reject nested functions (methods, closures, inner functions)
@@ -174,6 +182,7 @@ def task(
             priority=priority,
             lease_duration=lease_duration,
             sync=sync,
+            rate_limit=rate_limit,
         )
 
     return decorator

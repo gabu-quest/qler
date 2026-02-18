@@ -124,18 +124,46 @@ Tag MVP, harden edge cases, implement first post-MVP feature.
 
 **Exit criteria:** All tests pass, cooperative cancellation works end-to-end.
 
+### M6: Periodic/Cron Tasks ✅
+
+Declarative cron scheduling without external schedulers.
+
+- `@cron` decorator wraps `@task` with cron scheduling metadata
+- `CronSchedule` dataclass (expression, max_running, timezone)
+- `CronWrapper` delegates to inner `TaskWrapper` (enqueue, run_now, __call__)
+- Worker `_cron_scheduler_loop()` background task with idempotency keys
+- `max_running` guard prevents job pile-up
+- `qler cron` CLI command lists registered cron tasks
+- `croniter` dependency for cron expression parsing
+- 16 tests
+
+**Exit criteria:** `@cron(q, "*/5 * * * *")` enqueues jobs on schedule, dedup prevents duplicates.
+
+### M7: Rate Limiting ✅
+
+Token bucket rate limiting for tasks and queues.
+
+- `RateSpec` dataclass with `parse_rate()` ("10/m", "100/h", "5/s", "1000/d")
+- `RateLimitBucket` sqler model for token state persistence
+- `try_acquire()` token bucket with refill-on-access
+- Task-level: `@task(q, rate_limit="10/m")`
+- Queue-level: `Queue(db, rate_limits={"emails": "100/h"})`
+- Rate-limited jobs requeued with delayed ETA (not failed)
+- Immediate mode bypasses rate limiting
+- 17 tests
+
+**Exit criteria:** Rate-limited claims requeue jobs; tokens refill over time.
+
 ---
 
-## Post-MVP (v0.2+)
+## Post-MVP (v0.3+)
 
-These are explicitly NOT in v0.1. Ordered by likely priority.
+These are explicitly NOT in v0.2. Ordered by likely priority.
 
 | Feature | Notes |
 |---------|-------|
 | procler integration | Health endpoint, worker process definitions |
-| Periodic/cron tasks | `@cron` decorator |
 | Web dashboard | Vue 3 + Naive UI (read-only + operational) |
-| Rate limiting | Per-queue or per-task |
 | Job dependencies/chaining | Job A depends on Job B |
 | Dead letter queue | Configurable DLQ for permanently failed jobs |
 | Prometheus metrics | Export queue depths, throughput, failure rates |
