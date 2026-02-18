@@ -1,6 +1,6 @@
 [project]
 name = "qler"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async-first background job queue for Python, built on SQLite via sqler"
 readme = "README.md"
 requires-python = ">=3.12"
