@@ -6,6 +6,7 @@ from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
     ClaimConflictError,
     ConfigurationError,
+    DependencyError,
     JobCancelledError,
     JobFailedError,
     JobNotFoundError,
@@ -41,6 +42,7 @@ __all__ = [
     "JobStatus",
     # Exceptions
     "QlerError",
+    "DependencyError",
     "JobNotFoundError",
     "JobFailedError",
     "JobCancelledError",

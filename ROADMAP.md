@@ -175,15 +175,22 @@ Token bucket rate limiting for tasks and queues.
 - ✅ Removed raw SQL `DELETE` workaround in qler purge command
 - ✅ Replaced raw SQL `SELECT COUNT(*)` in doctor command with ORM `.count()`
 
-### M9: Job Dependencies/Chaining ⬚
+### M9: Job Dependencies/Chaining ✅
 
 Job A depends on Job B completing before it can be claimed.
 
-- `depends_on` parameter on `enqueue()` — list of job ULIDs
-- `Job.dependencies` field (JSON list of ULIDs)
-- Claim query filters out jobs with unfinished dependencies
-- `job.wait_for_dependencies()` helper
-- CLI: `qler job <id>` shows dependency status
+- ✅ `depends_on` parameter on `enqueue()` — list of job ULIDs
+- ✅ `Job.dependencies` field (JSON list of ULIDs)
+- ✅ `pending_dep_count` promoted column — claim query filters `pending_dep_count = 0`
+- ✅ `_resolve_dependencies()` — atomic decrement on completion
+- ✅ `_cascade_cancel_dependents()` — recursive cancellation on terminal failure
+- ✅ `Queue.cancel_job()` — cancel with cascade
+- ✅ `DependencyError` exception for invalid deps (missing, failed, cancelled)
+- ✅ `job.wait_for_dependencies()` polling helper
+- ✅ `TaskWrapper.enqueue(_depends_on=...)` forwarding
+- ✅ CLI: `qler job <id>` shows dependency status, `qler cancel` uses cascade
+- ✅ Schema migration for existing databases (idempotent ALTER TABLE)
+- ✅ 31 tests
 
 ### M10: Dead Letter Queue ⬚
 

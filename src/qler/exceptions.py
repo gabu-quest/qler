@@ -152,6 +152,23 @@ class ClaimConflictError(QlerError):
         self.ulid = ulid
 
 
+# Dependency errors
+
+
+class DependencyError(QlerError):
+    """Raised when a job dependency is invalid (missing, failed, or cancelled)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        dependency_ulid: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+    ):
+        super().__init__(message, details=details)
+        self.dependency_ulid = dependency_ulid
+
+
 # Configuration errors
 
 

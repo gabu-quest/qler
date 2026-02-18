@@ -81,6 +81,7 @@ class TaskWrapper:
         _priority: Optional[int] = None,
         _idempotency_key: Optional[str] = None,
         _correlation_id: Optional[str] = None,
+        _depends_on: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> "Job":
         """Enqueue this task for background execution."""
@@ -97,6 +98,7 @@ class TaskWrapper:
             lease_duration=self.lease_duration,
             idempotency_key=_idempotency_key,
             correlation_id=_correlation_id,
+            depends_on=_depends_on,
         )
 
     async def run_now(self, *args: Any, **kwargs: Any) -> Any:

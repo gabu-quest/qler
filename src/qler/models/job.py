@@ -24,6 +24,7 @@ class Job(AsyncSQLerSafeModel):
         "priority": "INTEGER NOT NULL DEFAULT 0",
         "eta": "INTEGER NOT NULL DEFAULT 0",
         "lease_expires_at": "INTEGER",
+        "pending_dep_count": "INTEGER NOT NULL DEFAULT 0",
     }
     __checks__: ClassVar[dict[str, str]] = {
         "status": "status IN ('pending','running','completed','failed','cancelled')",
@@ -37,6 +38,7 @@ class Job(AsyncSQLerSafeModel):
     priority: int = 0
     eta: int = 0
     lease_expires_at: Optional[int] = None
+    pending_dep_count: int = 0
 
     # JSON fields
     task: str = ""
@@ -54,6 +56,7 @@ class Job(AsyncSQLerSafeModel):
     correlation_id: str = ""
     idempotency_key: Optional[str] = None
     cancel_requested: bool = False
+    dependencies: list[str] = []
     created_at: int = 0
     updated_at: int = 0
     finished_at: Optional[int] = None
@@ -139,6 +142,67 @@ class Job(AsyncSQLerSafeModel):
             if timeout is not None and time.monotonic() - start >= timeout:
                 raise TimeoutError(
                     f"Job {self.ulid} did not complete within {timeout}s"
+                )
+            await asyncio.sleep(min(interval, max_interval))
+            interval *= backoff
+
+    async def wait_for_dependencies(
+        self,
+        timeout: Optional[float] = None,
+        poll_interval: float = 0.5,
+        max_interval: float = 5.0,
+        backoff: float = 1.5,
+    ) -> None:
+        """Poll until all dependencies reach a terminal state.
+
+        Returns immediately if there are no dependencies.
+
+        Raises:
+            JobFailedError: If any dependency enters FAILED state.
+            JobCancelledError: If any dependency enters CANCELLED state.
+            TimeoutError: If timeout is reached before all deps complete.
+        """
+        if not self.dependencies:
+            return
+
+        start = time.monotonic()
+        interval = poll_interval
+        while True:
+            deps = await Job.query().filter(
+                F("ulid").in_list(self.dependencies)
+            ).all()
+
+            # Check for missing deps (deleted)
+            found_ulids = {d.ulid for d in deps}
+            for dep_ulid in self.dependencies:
+                if dep_ulid not in found_ulids:
+                    raise JobFailedError(
+                        f"Dependency {dep_ulid} not found",
+                        ulid=dep_ulid,
+                    )
+
+            all_complete = True
+            for dep in deps:
+                if dep.status == JobStatus.FAILED.value:
+                    raise JobFailedError(
+                        f"Dependency {dep.ulid} failed: {dep.last_error}",
+                        ulid=dep.ulid,
+                        failure_kind=dep.last_failure_kind,
+                    )
+                if dep.status == JobStatus.CANCELLED.value:
+                    raise JobCancelledError(
+                        f"Dependency {dep.ulid} was cancelled",
+                        ulid=dep.ulid,
+                    )
+                if dep.status != JobStatus.COMPLETED.value:
+                    all_complete = False
+
+            if all_complete:
+                return
+
+            if timeout is not None and time.monotonic() - start >= timeout:
+                raise TimeoutError(
+                    f"Dependencies did not complete within {timeout}s"
                 )
             await asyncio.sleep(min(interval, max_interval))
             interval *= backoff

@@ -135,4 +135,4 @@ tests/
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — M0–M7 complete (v0.2.0: cron tasks, rate limiting)
+- [ROADMAP.md](./ROADMAP.md) — M0–M9 complete (v0.2.0: cron, rate limiting, dependencies)
