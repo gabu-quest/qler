@@ -170,6 +170,10 @@ Token bucket rate limiting for tasks and queues.
 - ✅ Fix `count()` SQL generation for mixed promoted + JSON field filters
 - ✅ 4 regression tests in sqler (`test_async_promoted.py::TestAsyncPromotedAggregates`)
 - ✅ Removed `len(await ...all())` workarounds in qler (3 places)
+- ✅ Fix `delete()` SQL generation (same missing `_rewrite_promoted_refs()` bug)
+- ✅ 2 regression tests in sqler (`test_async_promoted.py::TestAsyncPromotedDelete`)
+- ✅ Removed raw SQL `DELETE` workaround in qler purge command
+- ✅ Replaced raw SQL `SELECT COUNT(*)` in doctor command with ORM `.count()`
 
 ### M9: Job Dependencies/Chaining ⬚
 
