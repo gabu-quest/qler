@@ -10,12 +10,14 @@ import os
 import signal
 import socket
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from qler._context import _current_job
 from qler._time import generate_ulid, now_epoch
-from qler.enums import FailureKind
+from qler.enums import FailureKind, JobStatus
 from qler.exceptions import ConfigurationError
+from qler.models.job import Job
 
 try:
     from logler.context import correlation_context
@@ -101,6 +103,10 @@ class Worker:
                 asyncio.create_task(self._lease_renewal_loop()),
                 asyncio.create_task(self._lease_recovery_loop()),
             ]
+            if self.queue._cron_tasks:
+                self._background_tasks.append(
+                    asyncio.create_task(self._cron_scheduler_loop())
+                )
 
             # Main claim loop
             await self._claim_loop()
@@ -268,6 +274,48 @@ class Worker:
                     logger.info("Recovered %d expired leases", recovered)
             except Exception:
                 logger.exception("Error in lease recovery loop")
+
+    async def _cron_scheduler_loop(self) -> None:
+        """Background task: enqueue cron jobs at their scheduled times.
+
+        For each registered cron task, checks if the next scheduled run is due.
+        Uses idempotency keys to prevent duplicate scheduling and max_running
+        guards to prevent pile-up.
+        """
+        from sqler import F
+
+        while self._running:
+            now = datetime.now(timezone.utc)
+            for path, cw in self.queue._cron_tasks.items():
+                if not self._running:
+                    break
+                try:
+                    # Check if the next run is due (look back 60s to catch missed ticks)
+                    next_run = cw.next_run(after=now - timedelta(seconds=60))
+                    next_ts = int(next_run.timestamp())
+                    if next_ts > int(now.timestamp()):
+                        continue
+
+                    # max_running guard: check pending/running count
+                    if cw.schedule.max_running > 0:
+                        active = await Job.query().filter(
+                            (F("task") == path)
+                            & F("status").in_list([
+                                JobStatus.PENDING.value,
+                                JobStatus.RUNNING.value,
+                            ])
+                        ).all()
+                        if len(active) >= cw.schedule.max_running:
+                            continue
+
+                    # Enqueue with idempotency key to prevent duplicates
+                    await cw.task_wrapper.enqueue(
+                        _idempotency_key=cw.idempotency_key(next_ts),
+                    )
+                except Exception:
+                    logger.exception("Error scheduling cron task %s", path)
+
+            await asyncio.sleep(self.poll_interval)
 
     async def _shutdown(self) -> None:
         """Graceful shutdown: cancel background tasks, wait for active jobs."""
