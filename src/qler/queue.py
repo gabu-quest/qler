@@ -15,6 +15,7 @@ from qler._time import generate_ulid, now_epoch
 from qler.enums import RETRYABLE_FAILURES, AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
     ConfigurationError,
+    DependencyError,
     PayloadNotSerializableError,
     PayloadTooLargeError,
     TaskNotRegisteredError,
@@ -127,6 +128,16 @@ class Queue:
         await self._db._ensure_versioned_table("qler_job_attempts")
         await self._db._ensure_versioned_table("qler_rate_limit_buckets")
 
+        # Schema migration: add pending_dep_count column (idempotent)
+        try:
+            cur = await self._db.adapter.execute(
+                "ALTER TABLE qler_jobs ADD COLUMN pending_dep_count INTEGER NOT NULL DEFAULT 0"
+            )
+            await cur.close()
+            await self._db.adapter.auto_commit()
+        except Exception:
+            pass  # Column already exists
+
         await self._create_indexes()
         self._initialized = True
 
@@ -134,11 +145,12 @@ class Queue:
         """Create all required indexes (idempotent)."""
         adapter = self._db.adapter
         indexes = [
-            # 1. Claim: pick highest-priority pending job with earliest ETA
+            # 1. Claim: pick highest-priority pending job with earliest ETA and no pending deps
+            "DROP INDEX IF EXISTS idx_qler_jobs_claim",
             (
                 "CREATE INDEX IF NOT EXISTS idx_qler_jobs_claim "
                 "ON qler_jobs (queue_name, priority DESC, eta, ulid) "
-                "WHERE status = 'pending'"
+                "WHERE status = 'pending' AND pending_dep_count = 0"
             ),
             # 2. Lease expiry: find running jobs with expired leases
             (
@@ -185,6 +197,7 @@ class Queue:
         lease_duration: Optional[int] = None,
         idempotency_key: Optional[str] = None,
         correlation_id: Optional[str] = None,
+        depends_on: Optional[list[str]] = None,
     ) -> Job:
         """Enqueue a new job. Returns the created Job instance."""
         await self._lazy_init()
@@ -214,6 +227,36 @@ class Queue:
             if existing is not None:
                 return existing
 
+        # Validate dependencies
+        dep_list: list[str] = []
+        pending_dep_count = 0
+        if depends_on:
+            dep_list = list(dict.fromkeys(depends_on))  # deduplicate, preserve order
+            dep_jobs = await Job.query().filter(
+                F("ulid").in_list(dep_list)
+            ).all()
+            found_ulids = {j.ulid for j in dep_jobs}
+            for dep_ulid in dep_list:
+                if dep_ulid not in found_ulids:
+                    raise DependencyError(
+                        f"Dependency job {dep_ulid} not found",
+                        dependency_ulid=dep_ulid,
+                    )
+            for dep_job in dep_jobs:
+                if dep_job.status == JobStatus.FAILED.value:
+                    raise DependencyError(
+                        f"Dependency job {dep_job.ulid} is failed",
+                        dependency_ulid=dep_job.ulid,
+                    )
+                if dep_job.status == JobStatus.CANCELLED.value:
+                    raise DependencyError(
+                        f"Dependency job {dep_job.ulid} is cancelled",
+                        dependency_ulid=dep_job.ulid,
+                    )
+            pending_dep_count = sum(
+                1 for j in dep_jobs if j.status != JobStatus.COMPLETED.value
+            )
+
         # Calculate ETA
         now = now_epoch()
         if eta is not None:
@@ -236,6 +279,8 @@ class Queue:
             lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
             correlation_id=correlation_id or "",
             idempotency_key=idempotency_key,
+            dependencies=dep_list,
+            pending_dep_count=pending_dep_count,
             created_at=now,
             updated_at=now,
         )
@@ -366,6 +411,7 @@ class Queue:
             (F("status") == JobStatus.PENDING.value)
             & F("queue_name").in_list(queues)
             & (F("eta") <= now_ts)
+            & (F("pending_dep_count") == 0)
         ).order_by("-priority", "eta", "ulid").update_one(
             status=JobStatus.RUNNING.value,
             worker_id=worker_id,
@@ -495,6 +541,9 @@ class Queue:
         if updated is None:
             return  # Lost ownership
 
+        # Resolve dependencies: unblock dependent jobs
+        await self._resolve_dependencies(job.ulid)
+
         # Terminalize attempt (best effort)
         await self._terminalize_attempt(
             job.last_attempt_id, AttemptStatus.COMPLETED.value, now
@@ -550,6 +599,10 @@ class Queue:
         if updated is None:
             return  # Lost ownership
 
+        # Cascade-cancel dependents on terminal failure
+        if not can_retry:
+            await self._cascade_cancel_dependents(job.ulid)
+
         # Terminalize attempt (best effort)
         await self._terminalize_attempt(
             job.last_attempt_id,
@@ -602,6 +655,62 @@ class Queue:
             recovered += 1
 
         return recovered
+
+    # ------------------------------------------------------------------
+    # Dependencies
+    # ------------------------------------------------------------------
+
+    async def _resolve_dependencies(self, completed_ulid: str) -> None:
+        """Decrement pending_dep_count for jobs depending on the completed job."""
+        # Find PENDING jobs that still have pending deps
+        candidates = await Job.query().filter(
+            (F("status") == JobStatus.PENDING.value)
+            & (F("pending_dep_count") > 0)
+        ).all()
+
+        for candidate in candidates:
+            if completed_ulid in candidate.dependencies:
+                await Job.query().filter(
+                    (F("ulid") == candidate.ulid)
+                    & (F("status") == JobStatus.PENDING.value)
+                    & (F("pending_dep_count") > 0)
+                ).update_one(
+                    pending_dep_count=F("pending_dep_count") - 1,
+                    updated_at=now_epoch(),
+                )
+
+    async def _cascade_cancel_dependents(self, failed_ulid: str) -> None:
+        """Cancel PENDING jobs that depend on a failed/cancelled job, recursively."""
+        candidates = await Job.query().filter(
+            F("status") == JobStatus.PENDING.value
+        ).all()
+
+        now = now_epoch()
+        cancelled_ulids: list[str] = []
+        for candidate in candidates:
+            if failed_ulid in candidate.dependencies:
+                updated = await Job.query().filter(
+                    (F("ulid") == candidate.ulid)
+                    & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.CANCELLED.value,
+                    last_error=f"Dependency {failed_ulid} failed/cancelled",
+                    finished_at=now,
+                    updated_at=now,
+                )
+                if updated is not None:
+                    cancelled_ulids.append(candidate.ulid)
+
+        # Recurse for transitive dependents
+        for ulid in cancelled_ulids:
+            await self._cascade_cancel_dependents(ulid)
+
+    async def cancel_job(self, job: Job) -> bool:
+        """Cancel a job and cascade-cancel its dependents."""
+        ok = await job.cancel()
+        if ok and job.status == JobStatus.CANCELLED.value:
+            await self._cascade_cancel_dependents(job.ulid)
+        return ok
 
     # ------------------------------------------------------------------
     # Helpers
