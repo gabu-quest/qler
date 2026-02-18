@@ -762,33 +762,21 @@ def purge(db: str, older_than: str, filter_status: str | None, output_json: bool
             else:
                 statuses = list(TERMINAL_STATUSES)
 
-            # Find matching jobs (promoted columns are used by queryset filter)
             job_filter = F("status").in_list(statuses) & (F("created_at") <= threshold)
             matching_jobs = await Job.query().filter(job_filter).all()
 
             if not matching_jobs:
                 return 0
 
-            # Use raw SQL for deletion because promoted columns (status) are
-            # stored in real columns but cleared from the JSON blob after
-            # update_one(), so queryset.delete_all() (which uses JSON_EXTRACT)
-            # won't match them.
-            ulids = [j.ulid for j in matching_jobs]
-            adapter = q.db.adapter
-            placeholders = ",".join("?" for _ in ulids)
-
             # Delete attempts first (cascade)
-            sql = f"DELETE FROM qler_job_attempts WHERE job_ulid IN ({placeholders})"
-            cur = await adapter.execute(sql, ulids)
-            await cur.close()
+            ulids = [j.ulid for j in matching_jobs]
+            await JobAttempt.query().filter(
+                F("job_ulid").in_list(ulids)
+            ).delete_all()
 
             # Delete jobs
-            sql = f"DELETE FROM qler_jobs WHERE ulid IN ({placeholders})"
-            cur = await adapter.execute(sql, ulids)
-            await adapter.auto_commit()
-            await cur.close()
-
-            return len(matching_jobs)
+            deleted = await Job.query().filter(job_filter).delete_all()
+            return deleted
         finally:
             await q.close()
 
@@ -899,12 +887,8 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
 
             # 6. Database size
             try:
-                cur = await q.db.adapter.execute("SELECT COUNT(*) FROM qler_jobs")
-                job_count = (await cur.fetchone())[0]
-                await cur.close()
-                cur = await q.db.adapter.execute("SELECT COUNT(*) FROM qler_job_attempts")
-                attempt_count = (await cur.fetchone())[0]
-                await cur.close()
+                job_count = await Job.query().count()
+                attempt_count = await JobAttempt.query().count()
                 db_size = os.path.getsize(db) if os.path.exists(db) else 0
                 checks.append({
                     "check": "database_size",
