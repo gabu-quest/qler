@@ -21,6 +21,7 @@ dependencies = [
     "sqler>=1.2026.2.1",
     "python-ulid>=3.0.0",
     "click>=8.0.0",
+    "croniter>=6.0.0",
 ]
 
 [project.urls]

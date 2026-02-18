@@ -23,6 +23,7 @@ from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 
 if TYPE_CHECKING:
+    from qler.cron import CronWrapper
     from qler.task import TaskWrapper
 
 _MAX_TRACEBACK_LENGTH = 8_192
@@ -67,6 +68,7 @@ class Queue:
         self.default_retry_delay = default_retry_delay
         self.max_payload_size = max_payload_size
         self._tasks: dict[str, TaskWrapper] = {}
+        self._cron_tasks: dict[str, CronWrapper] = {}
         self._initialized = False
 
     @property
