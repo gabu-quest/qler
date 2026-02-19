@@ -212,6 +212,51 @@ Health endpoint, worker process definitions.
 
 ---
 
+## Integration Status (2026-02-20)
+
+All implementation is complete through M9. Everything is pushed to origin on feature branches but **nothing is merged to main** in any repo. Below is the full picture for cross-repo integration testing.
+
+### qler (this repo)
+
+| Branch | Contains | Pushed |
+|--------|----------|--------|
+| `feat/m4-polish` | M0–M4, v0.1.0 tag | ✅ |
+| `feat/m5-cancellation` | M5 cooperative cancellation | ✅ |
+| `feat/m6-cron` | M6 cron, M7 rate limiting, M8 sqler fix, M9 dependencies | ✅ |
+| `main` | Only initial spec/docs (4 commits) | ✅ |
+
+**Latest code:** `feat/m6-cron` (`0c3aed9`) — includes everything.
+
+### sqler (sibling repo)
+
+| Branch | Contains | Pushed |
+|--------|----------|--------|
+| `feat/qler-prerequisites` | M-2 gaps: order_by, promoted cols, F-exprs, update_one | ✅ |
+| `fix/aggregate-promoted-rewrite` | M8 fix: count()/delete() promoted column rewrite | ✅ |
+| `main` | v1.2026.2.1 (no qler features) | ✅ |
+
+### logler (sibling repo)
+
+| Branch | Contains | Pushed |
+|--------|----------|--------|
+| `feat/sqler-bridge` | M-1: db bridge, correlation context | ✅ |
+| `main` | v1.3.1 (no bridge) | ✅ |
+
+### To test the full stack together
+
+1. **sqler:** checkout `fix/aggregate-promoted-rewrite` (includes qler-prerequisites), `uv pip install -e .`
+2. **logler:** checkout `feat/sqler-bridge`, install
+3. **qler:** checkout `feat/m6-cron`, `uv sync`, run `uv run pytest`
+
+### Merge order (when ready)
+
+1. sqler `feat/qler-prerequisites` → main
+2. sqler `fix/aggregate-promoted-rewrite` → main (or rebase onto 1)
+3. logler `feat/sqler-bridge` → main
+4. qler `feat/m6-cron` → main (or sequential: m4-polish → m5 → m6-cron)
+
+---
+
 ## Future (v0.4+)
 
 | Feature | Notes |
