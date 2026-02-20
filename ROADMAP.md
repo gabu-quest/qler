@@ -172,7 +172,21 @@ Token bucket rate limiting for tasks and queues.
 - ✅ qler's `.count()` calls (cli.py, worker.py cron scheduler) now work correctly
 - ✅ All 313 qler tests pass, all 636 sqler tests pass
 
-### M9: Job Dependencies/Chaining ⬚
+### M9: Cron Catchup 🔄
+
+Recover missed cron runs when the worker restarts after downtime.
+
+- `catchup` parameter on `@cron` decorator (`False`, `"latest"`, or `int 1-100`)
+- `CronWrapper._find_last_enqueued_ts()` — query DB for most recent cron job timestamp
+- `CronWrapper.missed_runs()` — walk croniter forward from anchor to now
+- Scheduler loop startup catchup pass — enqueue missed runs before normal scheduling
+- Idempotency keys prevent duplicate catchup jobs
+- `max_running` guard applies to catchup jobs (no pile-up)
+- `catchup=True` rejected (unbounded catchup is always a bug)
+
+**Exit criteria:** Worker offline for hours → restarts → missed cron runs enqueued up to catchup limit.
+
+### M10: Job Dependencies/Chaining ⬚
 
 Job A depends on Job B completing before it can be claimed.
 
@@ -182,7 +196,7 @@ Job A depends on Job B completing before it can be claimed.
 - `job.wait_for_dependencies()` helper
 - CLI: `qler job <id>` shows dependency status
 
-### M10: Dead Letter Queue ⬚
+### M11: Dead Letter Queue ⬚
 
 Configurable DLQ for permanently failed jobs.
 
@@ -191,7 +205,7 @@ Configurable DLQ for permanently failed jobs.
 - `qler dlq` CLI command — list, inspect, replay from DLQ
 - DLQ jobs preserve full attempt history
 
-### M11: procler Integration ⬚
+### M12: procler Integration ⬚
 
 Health endpoint, worker process definitions.
 
