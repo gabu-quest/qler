@@ -172,29 +172,35 @@ Token bucket rate limiting for tasks and queues.
 - ✅ qler's `.count()` calls (cli.py, worker.py cron scheduler) now work correctly
 - ✅ All 313 qler tests pass, all 636 sqler tests pass
 
-### M9: Cron Catchup 🔄
+### M9: Cron Catchup ✅
 
 Recover missed cron runs when the worker restarts after downtime.
 
-- `catchup` parameter on `@cron` decorator (`False`, `"latest"`, or `int 1-100`)
-- `CronWrapper._find_last_enqueued_ts()` — query DB for most recent cron job timestamp
-- `CronWrapper.missed_runs()` — walk croniter forward from anchor to now
-- Scheduler loop startup catchup pass — enqueue missed runs before normal scheduling
-- Idempotency keys prevent duplicate catchup jobs
-- `max_running` guard applies to catchup jobs (no pile-up)
-- `catchup=True` rejected (unbounded catchup is always a bug)
+- ✅ `catchup` parameter on `@cron` decorator (`False`, `"latest"`, or `int 1-100`)
+- ✅ `CronWrapper._find_last_enqueued_ts()` — query DB for most recent cron job timestamp
+- ✅ `CronWrapper.missed_runs()` — walk croniter forward from anchor to now
+- ✅ Scheduler loop startup catchup pass — enqueue missed runs before normal scheduling
+- ✅ Idempotency keys prevent duplicate catchup jobs
+- ✅ `max_running` guard applies to catchup jobs (no pile-up)
+- ✅ `catchup=True` rejected (unbounded catchup is always a bug)
 
 **Exit criteria:** Worker offline for hours → restarts → missed cron runs enqueued up to catchup limit.
 
-### M10: Job Dependencies/Chaining ⬚
+### M10: Job Dependencies/Chaining ✅
 
 Job A depends on Job B completing before it can be claimed.
 
-- `depends_on` parameter on `enqueue()` — list of job ULIDs
-- `Job.dependencies` field (JSON list of ULIDs)
-- Claim query filters out jobs with unfinished dependencies
-- `job.wait_for_dependencies()` helper
-- CLI: `qler job <id>` shows dependency status
+- ✅ `depends_on` parameter on `enqueue()` — list of job ULIDs
+- ✅ `Job.dependencies` field (JSON list of ULIDs) + `pending_dep_count` promoted column
+- ✅ Claim query filters out jobs with `pending_dep_count > 0` via partial index
+- ✅ `_resolve_dependencies()` decrements count on completion (idempotent)
+- ✅ `_cascade_cancel_dependents()` on terminal failure (retryable failures skip)
+- ✅ `job.wait_for_dependencies()` with timeout, backoff, error differentiation
+- ✅ Enqueue-time validation: rejects missing/failed/cancelled deps
+- ✅ CLI: `qler job <id>` shows dependency status
+- ✅ 32 tests
+
+**Also fixed:** sqler `delete()` missing `_rewrite_promoted_refs` (same class of bug as M8 `.count()` fix). 6 regression tests added in sqler.
 
 ### M11: Dead Letter Queue ⬚
 
