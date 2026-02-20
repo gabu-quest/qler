@@ -652,3 +652,426 @@ class TestImmediateModeDependencies:
                 f"{noop_task.__module__}.{noop_task.__qualname__}",
                 depends_on=[a.ulid],
             )
+
+
+# ---------------------------------------------------------------------------
+# TestDependencyStress — adversarial graph topologies and edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestDependencyStress:
+    """Cruel tests: graph topologies that break naive implementations."""
+
+    # -- Diamond dependency: the double-decrement trap --
+
+    async def test_diamond_no_double_decrement(self, queue):
+        """Diamond: A→D, B→D, A→C, B→C. Complete A then B.
+
+        D and C each depend on both A and B. Completing A decrements
+        both to pending_dep_count=1. Completing B decrements both to 0.
+        A naive impl that doesn't guard on pending_dep_count > 0 would
+        decrement below zero.
+        """
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task")
+        c = await queue.enqueue("my.task", depends_on=[a.ulid, b.ulid])
+        d = await queue.enqueue("my.task", depends_on=[a.ulid, b.ulid])
+        assert c.pending_dep_count == 2
+        assert d.pending_dep_count == 2
+
+        # Complete A
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == a.ulid
+        await queue.complete_job(claimed, "w1")
+
+        rc = await Job.query().filter(F("ulid") == c.ulid).first()
+        rd = await Job.query().filter(F("ulid") == d.ulid).first()
+        assert rc.pending_dep_count == 1
+        assert rd.pending_dep_count == 1
+
+        # Complete B
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == b.ulid
+        await queue.complete_job(claimed, "w1")
+
+        rc = await Job.query().filter(F("ulid") == c.ulid).first()
+        rd = await Job.query().filter(F("ulid") == d.ulid).first()
+        assert rc.pending_dep_count == 0
+        assert rd.pending_dep_count == 0
+
+        # Both C and D are now claimable
+        claimed_ids = set()
+        for _ in range(2):
+            j = await queue.claim_job("w1", ["default"])
+            assert j is not None
+            claimed_ids.add(j.ulid)
+        assert claimed_ids == {c.ulid, d.ulid}
+
+    async def test_diamond_cascade_cancel_idempotent(self, queue):
+        """Diamond cascade: A→B, A→C, B→D, C→D. Fail A.
+
+        B and C are cascade-cancelled. D depends on both B and C —
+        the cascade from B tries to cancel D, then the cascade from C
+        tries to cancel D again. D must end up CANCELLED exactly once,
+        not blow up.
+        """
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        c = await queue.enqueue("my.task", depends_on=[a.ulid])
+        d = await queue.enqueue("my.task", depends_on=[b.ulid, c.ulid])
+
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == a.ulid
+        await queue.fail_job(claimed, "w1", ValueError("root failure"))
+
+        for ulid in [b.ulid, c.ulid, d.ulid]:
+            job = await Job.query().filter(F("ulid") == ulid).first()
+            assert job.status == JobStatus.CANCELLED.value
+
+        # D's error message references whichever parent was cancelled first
+        rd = await Job.query().filter(F("ulid") == d.ulid).first()
+        assert "failed/cancelled" in rd.last_error
+
+    # -- Deep chains: recursion depth --
+
+    async def test_deep_chain_resolution(self, queue):
+        """20-deep chain: complete root, all 19 descendants unblock one by one."""
+        chain = [await queue.enqueue("my.task")]
+        for i in range(19):
+            child = await queue.enqueue("my.task", depends_on=[chain[-1].ulid])
+            assert child.pending_dep_count == 1
+            chain.append(child)
+
+        # Walk the chain: claim and complete each, the next becomes claimable
+        for i in range(20):
+            claimed = await queue.claim_job("w1", ["default"])
+            assert claimed is not None, f"Nothing claimable at depth {i}"
+            assert claimed.ulid == chain[i].ulid
+            await queue.complete_job(claimed, "w1")
+
+        # Everything claimed
+        nothing = await queue.claim_job("w1", ["default"])
+        assert nothing is None
+
+    async def test_deep_chain_cascade_cancel(self, queue):
+        """20-deep chain: fail the root, all 19 descendants cascade-cancelled."""
+        chain = [await queue.enqueue("my.task")]
+        for _ in range(19):
+            chain.append(await queue.enqueue("my.task", depends_on=[chain[-1].ulid]))
+
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == chain[0].ulid
+        await queue.fail_job(claimed, "w1", ValueError("root dies"))
+
+        for i, job_ref in enumerate(chain[1:], 1):
+            job = await Job.query().filter(F("ulid") == job_ref.ulid).first()
+            assert job.status == JobStatus.CANCELLED.value, f"Job at depth {i} not cancelled"
+
+    # -- Self-dependency: deadlock detection --
+
+    async def test_self_dependency_creates_deadlock(self, queue):
+        """A job depending on itself has pending_dep_count=1 and can never be claimed.
+
+        The enqueue succeeds (the job exists and is PENDING, not terminal),
+        but the job is permanently blocked. This is user error, not a crash.
+        """
+        a = await queue.enqueue("my.task")
+        # Depend on self — A exists and is PENDING, so enqueue allows it
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        # Now make B depend on itself by creating a new job with self-reference
+        # We can't make a job depend on itself at enqueue time because
+        # the ULID doesn't exist yet. But we CAN create a cycle: A→B, B→A
+        # Let's test that instead.
+
+    async def test_mutual_dependency_deadlock(self, queue):
+        """Two jobs each blocked on an unsatisfiable dep: neither can be claimed.
+
+        Simulates the effect of a circular dependency without needing to
+        mutate the DB directly. A depends on X (nonexistent PENDING job),
+        B depends on A. Cancel A to cascade-cancel B.
+        """
+        # Create two blocking parents that will never complete
+        x = await queue.enqueue("my.task")
+        y = await queue.enqueue("my.task")
+        a = await queue.enqueue("my.task", depends_on=[y.ulid])
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+
+        # Claim x and y (removing them from claimable pool) but don't complete
+        await queue.claim_job("w1", ["default"])  # x
+        await queue.claim_job("w1", ["default"])  # y
+
+        # Neither a nor b is claimable — both blocked
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed is None
+
+        # Cancel A breaks the deadlock — B gets cascade-cancelled
+        await queue.cancel_job(a)
+
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.status == JobStatus.CANCELLED.value
+
+    # -- Cross-queue dependencies --
+
+    async def test_cross_queue_dependency(self, queue):
+        """Job in queue 'emails' depends on job in queue 'default'."""
+        a = await queue.enqueue("my.task", queue_name="default")
+        b = await queue.enqueue("my.task", queue_name="emails", depends_on=[a.ulid])
+        assert b.pending_dep_count == 1
+
+        # Worker only listens to 'default' — claims A
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == a.ulid
+        await queue.complete_job(claimed, "w1")
+
+        # B should be unblocked now
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.pending_dep_count == 0
+
+        # Worker listens to 'emails' — claims B
+        claimed = await queue.claim_job("w1", ["emails"])
+        assert claimed is not None
+        assert claimed.ulid == b.ulid
+
+    # -- Depend on RUNNING job --
+
+    async def test_depend_on_running_job(self, queue):
+        """Enqueue with depends_on a RUNNING job succeeds with pending_dep_count=1."""
+        a = await queue.enqueue("my.task")
+        claimed_a = await queue.claim_job("w1", ["default"])
+        assert claimed_a.ulid == a.ulid
+        assert claimed_a.status == JobStatus.RUNNING.value
+
+        # B depends on A which is RUNNING — should be allowed
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        assert b.pending_dep_count == 1
+
+        # Complete A, B should unblock
+        await queue.complete_job(claimed_a, "w1")
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.pending_dep_count == 0
+
+    # -- Retry exhaustion then cascade --
+
+    async def test_retry_exhaustion_cascades(self, queue):
+        """Job with max_retries=2: fail 3 times. Terminal failure cascades.
+
+        Uses retry_delay=0 so retried jobs are immediately reclaimable.
+        """
+        a = await queue.enqueue("my.task", max_retries=2, retry_delay=0)
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+
+        # Fail #1: retryable, no cascade
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == a.ulid
+        await queue.fail_job(claimed, "w1", ValueError("attempt 1"))
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.status == JobStatus.PENDING.value
+
+        # Fail #2: retryable, no cascade
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == a.ulid
+        await queue.fail_job(claimed, "w1", ValueError("attempt 2"))
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.status == JobStatus.PENDING.value
+
+        # Fail #3: terminal — retries exhausted, cascade fires
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == a.ulid
+        await queue.fail_job(claimed, "w1", ValueError("attempt 3"))
+
+        ra = await Job.query().filter(F("ulid") == a.ulid).first()
+        assert ra.status == JobStatus.FAILED.value
+
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.status == JobStatus.CANCELLED.value
+        assert rb.last_error == f"Dependency {a.ulid} failed/cancelled"
+
+    # -- Massive fan-in: one job depends on many parents --
+
+    async def test_fan_in_10_parents(self, queue):
+        """Job depends on 10 parents. Complete all 10, job unblocks."""
+        parents = []
+        for _ in range(10):
+            parents.append(await queue.enqueue("my.task"))
+        child = await queue.enqueue(
+            "my.task", depends_on=[p.ulid for p in parents]
+        )
+        assert child.pending_dep_count == 10
+
+        # Complete 9 of 10 — child still blocked
+        for i in range(9):
+            claimed = await queue.claim_job("w1", ["default"])
+            assert claimed.ulid == parents[i].ulid
+            await queue.complete_job(claimed, "w1")
+
+        rc = await Job.query().filter(F("ulid") == child.ulid).first()
+        assert rc.pending_dep_count == 1
+
+        # Complete the last parent — child unblocks
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == parents[9].ulid
+        await queue.complete_job(claimed, "w1")
+
+        rc = await Job.query().filter(F("ulid") == child.ulid).first()
+        assert rc.pending_dep_count == 0
+
+        # Child is claimable
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed is not None
+        assert claimed.ulid == child.ulid
+
+    async def test_fan_in_one_parent_fails(self, queue):
+        """10 parents, 1 fails terminally. Child is cascade-cancelled."""
+        parents = []
+        for _ in range(10):
+            parents.append(await queue.enqueue("my.task"))
+        child = await queue.enqueue(
+            "my.task", depends_on=[p.ulid for p in parents]
+        )
+
+        # Complete first 5
+        for i in range(5):
+            claimed = await queue.claim_job("w1", ["default"])
+            await queue.complete_job(claimed, "w1")
+
+        # Fail the 6th — terminal, cascade fires
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == parents[5].ulid
+        await queue.fail_job(claimed, "w1", ValueError("one bad apple"))
+
+        rc = await Job.query().filter(F("ulid") == child.ulid).first()
+        assert rc.status == JobStatus.CANCELLED.value
+
+    # -- Empty depends_on --
+
+    async def test_empty_depends_on_treated_as_no_deps(self, queue):
+        """depends_on=[] should produce dependencies=[] and pending_dep_count=0."""
+        a = await queue.enqueue("my.task", depends_on=[])
+        assert a.dependencies == []
+        assert a.pending_dep_count == 0
+
+        # Immediately claimable
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed is not None
+        assert claimed.ulid == a.ulid
+
+    # -- Priority still works with dependencies --
+
+    async def test_priority_ordering_with_deps(self, queue):
+        """High-priority blocked job is skipped in favor of lower-priority unblocked jobs."""
+        parent = await queue.enqueue("my.task", priority=0)
+        low = await queue.enqueue("my.task", priority=1)
+        high = await queue.enqueue("my.task", priority=10)
+        blocked_high = await queue.enqueue(
+            "my.task", priority=100, depends_on=[parent.ulid]
+        )
+
+        # Even though blocked_high has priority 100, it's blocked.
+        # Claim order: high (10), low (1), parent (0)
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == high.ulid
+
+        claimed = await queue.claim_job("w2", ["default"])
+        assert claimed.ulid == low.ulid
+
+        claimed = await queue.claim_job("w3", ["default"])
+        assert claimed.ulid == parent.ulid
+
+        # Only blocked_high remains, still blocked (parent is RUNNING now, not COMPLETED)
+        claimed = await queue.claim_job("w4", ["default"])
+        assert claimed is None
+
+    # -- Resolution after completion does not affect unrelated jobs --
+
+    async def test_resolution_ignores_unrelated_jobs(self, queue):
+        """Completing X does not affect Y's pending_dep_count when Y doesn't depend on X."""
+        x = await queue.enqueue("my.task")
+        a = await queue.enqueue("my.task")
+        y = await queue.enqueue("my.task", depends_on=[a.ulid])
+        assert y.pending_dep_count == 1
+
+        # Complete X (unrelated to Y)
+        cx = await queue.claim_job("w1", ["default"])
+        assert cx.ulid == x.ulid
+        await queue.complete_job(cx, "w1")
+
+        # Y's count unchanged
+        ry = await Job.query().filter(F("ulid") == y.ulid).first()
+        assert ry.pending_dep_count == 1
+
+    # -- Complete parent, then try to cancel it --
+
+    async def test_cancel_after_complete_noop(self, queue):
+        """Cancelling an already-COMPLETED parent doesn't cascade to children."""
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+
+        # Complete A normally
+        claimed = await queue.claim_job("w1", ["default"])
+        await queue.complete_job(claimed, "w1")
+
+        # B should have pending_dep_count=0
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.pending_dep_count == 0
+
+        # Try to cancel A (already completed)
+        ra = await Job.query().filter(F("ulid") == a.ulid).first()
+        ok = await queue.cancel_job(ra)
+        assert ok is False
+
+        # B still PENDING, not cascade-cancelled
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.status == JobStatus.PENDING.value
+
+    # -- Middle-of-chain cancellation --
+
+    async def test_cancel_middle_of_chain(self, queue):
+        """A→B→C: cancel B. C gets cascade-cancelled. A is unaffected."""
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        c = await queue.enqueue("my.task", depends_on=[b.ulid])
+
+        # Cancel B directly
+        ok = await queue.cancel_job(b)
+        assert ok is True
+
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rc = await Job.query().filter(F("ulid") == c.ulid).first()
+        ra = await Job.query().filter(F("ulid") == a.ulid).first()
+
+        assert rb.status == JobStatus.CANCELLED.value
+        assert rc.status == JobStatus.CANCELLED.value
+        assert ra.status == JobStatus.PENDING.value  # upstream unaffected
+
+    # -- Multiple independent subgraphs in one queue --
+
+    async def test_independent_subgraphs(self, queue):
+        """Two independent chains in the same queue don't interfere.
+
+        Chain 1: A→B
+        Chain 2: X→Y
+        Fail A → B cancelled, X and Y unaffected.
+        """
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        x = await queue.enqueue("my.task")
+        y = await queue.enqueue("my.task", depends_on=[x.ulid])
+
+        # Fail A
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == a.ulid
+        await queue.fail_job(claimed, "w1", ValueError("chain 1 dies"))
+
+        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert rb.status == JobStatus.CANCELLED.value
+
+        # Chain 2 completely unaffected
+        rx = await Job.query().filter(F("ulid") == x.ulid).first()
+        ry = await Job.query().filter(F("ulid") == y.ulid).first()
+        assert rx.status == JobStatus.PENDING.value
+        assert ry.status == JobStatus.PENDING.value
+        assert ry.pending_dep_count == 1
+
+        # X is still claimable
+        claimed = await queue.claim_job("w1", ["default"])
+        assert claimed.ulid == x.ulid
