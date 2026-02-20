@@ -1,6 +1,6 @@
 # Claude Context: qler
 
-**Version:** 0.1.0 (pre-implementation)
+**Version:** 0.2.0
 **Type:** Python library — background job queue on SQLite
 
 ---
@@ -20,17 +20,16 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 
 ## Project Status
 
-**Pre-implementation.** The spec is build-ready. sqler gaps resolved (M-2 complete).
+**Fully implemented.** v0.2.0 with cron scheduling, rate limiting, cooperative cancellation. 313 passing tests.
 
 | File | Purpose |
 |------|---------|
-| `SPEC.md` | **MVP build spec** — what to build, how it works |
-| `ROADMAP.md` | **Phased milestones** — M-2 (sqler gaps) through v0.2+ |
+| `ROADMAP.md` | **Milestone tracker** — M-2 through M8 complete, M9+ planned |
+| `CHANGELOG.md` | Release history (v0.1.0, v0.2.0) |
 | `NORTH_STAR.md` | Vision, philosophy, non-negotiable principles |
-| `SQLER_GAPS.md` | Blocking sqler features (prerequisite) |
-| `BRAINSTORM.md` | Design exploration, competitive analysis |
-
-**No source code exists yet.** When implementation begins, the package will live in `src/qler/`.
+| `SPEC.md` | v0.1.0 MVP build spec (historical reference) |
+| `SQLER_GAPS.md` | sqler prerequisites (historical — all resolved) |
+| `BRAINSTORM.md` | Early design exploration (historical reference) |
 
 ---
 
@@ -86,19 +85,6 @@ All -ler libraries MUST integrate through their public APIs.
 
 ---
 
-## sqler Gaps (Resolved)
-
-All sqler prerequisites have been implemented on branch `feat/qler-prerequisites`. See `SQLER_GAPS.md`.
-
-| Gap | Status | Impact |
-|-----|--------|--------|
-| Multi-field ordering | **Resolved** | Deterministic claim query |
-| Promoted columns | **Resolved** | CHECK constraints, indexes |
-| F-expressions in update | **Resolved** | Atomic counters |
-| Atomic update-and-return | **Resolved** | Race-free claiming via `update_one()` |
-
----
-
 ## Tech Stack
 
 | Tool | Version | Purpose |
@@ -109,30 +95,50 @@ All sqler prerequisites have been implemented on branch `feat/qler-prerequisites
 | uv | latest | Package management |
 | sqler | latest | Database operations |
 | click | latest | CLI |
+| croniter | latest | Cron expression parsing |
+| python-ulid | latest | ULID generation |
 
 ---
 
-## File Structure (when implementation begins)
+## File Structure
 
 ```
 src/qler/
-├── __init__.py          # Public API: Queue, task, current_job
-├── queue.py             # Queue class
-├── task.py              # @task decorator
+├── __init__.py          # Public API: Queue, Worker, task, cron, current_job
+├── queue.py             # Queue class — enqueue, claim, complete, fail, retry
+├── task.py              # @task decorator, TaskWrapper
+├── cron.py              # @cron decorator, CronSchedule, CronWrapper
+├── worker.py            # Worker loop, lease renewal, recovery, cron scheduler
+├── rate_limit.py        # RateSpec, token bucket rate limiting
+├── cli.py               # Click CLI (init, worker, status, jobs, cron, etc.)
 ├── models/
-│   ├── job.py           # Job model
-│   └── attempt.py       # JobAttempt model
-├── worker.py            # Worker loop + lease renewal
-├── cli.py               # Click CLI
-├── exceptions.py        # Error types
+│   ├── job.py           # Job model (sqler AsyncSQLerSafeModel)
+│   ├── attempt.py       # JobAttempt model
+│   └── bucket.py        # RateLimitBucket model
+├── enums.py             # JobStatus, AttemptStatus, FailureKind
+├── exceptions.py        # Error types (QlerError hierarchy)
+├── _context.py          # current_job() context variable
+├── _time.py             # Timestamp utilities
 └── py.typed             # PEP 561 marker
 tests/
-├── unit/                # Immediate mode, fast
-└── integration/         # Real worker, slow
+├── conftest.py          # Shared fixtures
+├── test_scaffold.py     # Imports, public API surface
+├── test_models.py       # Job, JobAttempt, RateLimitBucket
+├── test_queue.py        # Enqueue, claim, payload validation
+├── test_task.py         # @task decorator, run_now()
+├── test_lifecycle.py    # Complete/fail/retry/cancel/wait
+├── test_worker.py       # Worker loop, concurrency, shutdown
+├── test_lease.py        # Lease renewal, recovery, expiry
+├── test_immediate.py    # Immediate mode
+├── test_cancellation.py # Cooperative cancellation
+├── test_cron.py         # @cron scheduler, dedup
+├── test_rate_limit.py   # Token bucket, requeue
+├── test_cli.py          # All CLI commands
+└── test_context.py      # current_job context
 ```
 
 ---
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — M0–M9 complete (v0.2.0: cron, rate limiting, dependencies)
+- [ROADMAP.md](./ROADMAP.md) — M0–M8 complete. M9–M11 planned for v0.3+.
