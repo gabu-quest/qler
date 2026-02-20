@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from croniter import croniter
@@ -23,6 +23,7 @@ class CronSchedule:
     expression: str
     max_running: int = 1
     timezone: str = "UTC"
+    catchup: int = 0  # 0 = disabled, N = max missed runs to catch up
 
 
 class CronWrapper:
@@ -64,6 +65,51 @@ class CronWrapper:
         """
         return f"cron:{self.task_path}:{run_ts}"
 
+    async def _find_last_enqueued_ts(self) -> int | None:
+        """Query DB for the most recent cron job's scheduled timestamp.
+
+        Parses the timestamp from the idempotency key (cron:{path}:{ts}).
+        Returns None if no previous cron jobs exist for this task.
+        """
+        from sqler import F
+
+        from qler.models.job import Job
+
+        last_job = await Job.query().filter(
+            F("task") == self.task_path
+        ).order_by("-ulid").first()
+
+        if last_job is None:
+            return None
+
+        key = last_job.idempotency_key
+        prefix = f"cron:{self.task_path}:"
+        if key and key.startswith(prefix):
+            try:
+                return int(key.rsplit(":", 1)[1])
+            except (ValueError, IndexError):
+                return None
+        return None
+
+    def missed_runs(self, since_ts: int, now_ts: int) -> list[int]:
+        """Walk croniter forward from since_ts, return timestamps <= now_ts.
+
+        Returns up to (catchup + safety margin) timestamps. Caller is
+        responsible for trimming to the actual catchup limit.
+        """
+        base = datetime.fromtimestamp(since_ts, tz=timezone.utc)
+        it = croniter(self.schedule.expression, base)
+        runs: list[int] = []
+        while True:
+            nxt = it.get_next(datetime)
+            ts = int(nxt.timestamp())
+            if ts > now_ts:
+                break
+            runs.append(ts)
+            if len(runs) > 200:  # safety cap
+                break
+        return runs
+
     async def enqueue(
         self,
         *args: Any,
@@ -94,11 +140,41 @@ class CronWrapper:
         return await self.task_wrapper(*args, **kwargs)
 
 
+def _normalize_catchup(catchup: int | str | bool) -> int:
+    """Normalize catchup parameter to an int (0 = disabled, N = max missed).
+
+    Raises ConfigurationError for invalid values.
+    """
+    if catchup is True:
+        raise ConfigurationError(
+            "catchup=True is not supported (unbounded catchup is almost always a bug). "
+            "Use catchup='latest' for 1, or catchup=N for a specific limit."
+        )
+    if catchup is False:
+        return 0
+    if catchup == "latest":
+        return 1
+    if isinstance(catchup, int):
+        if catchup < 1:
+            raise ConfigurationError(
+                f"catchup must be >= 1, got {catchup}"
+            )
+        if catchup > 100:
+            raise ConfigurationError(
+                f"catchup must be <= 100, got {catchup}"
+            )
+        return catchup
+    raise ConfigurationError(
+        f"catchup must be False, 'latest', or int 1-100, got {catchup!r}"
+    )
+
+
 def cron(
     queue: Queue,
     expression: str,
     *,
     max_running: int = 1,
+    catchup: int | str | bool = False,
     timezone_name: str = "UTC",
     queue_name: Optional[str] = None,
     max_retries: Optional[int] = None,
@@ -113,6 +189,10 @@ def cron(
         queue: The Queue instance to register on.
         expression: Cron expression (e.g., "*/5 * * * *").
         max_running: Maximum concurrent pending/running instances (default: 1).
+        catchup: How many missed runs to enqueue on startup.
+            False (default): skip missed runs.
+            "latest": enqueue only the most recent missed run.
+            int (1-100): enqueue up to N missed runs, oldest first.
         timezone_name: Timezone for cron evaluation (default: "UTC").
         queue_name: Queue name override (default: "default").
         max_retries: Max retry count override.
@@ -131,6 +211,8 @@ def cron(
         raise ConfigurationError(
             f"max_running must be >= 1, got {max_running}"
         )
+
+    catchup_int = _normalize_catchup(catchup)
 
     def decorator(fn: Callable) -> CronWrapper:
         # Reject nested functions
@@ -174,6 +256,7 @@ def cron(
             expression=expression,
             max_running=max_running,
             timezone=timezone_name,
+            catchup=catchup_int,
         )
 
         cron_wrapper = CronWrapper(task_wrapper, schedule)
