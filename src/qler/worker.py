@@ -309,8 +309,11 @@ class Worker:
                         anchor = catchup_anchors.pop(path)
                         if anchor is not None:
                             missed = cw.missed_runs(anchor, now_ts)
-                            # Trim to catchup limit
-                            missed = missed[:cw.schedule.catchup]
+                            # Trim: "latest" takes most recent, int takes oldest N
+                            if cw.schedule.catchup_latest:
+                                missed = missed[-1:]
+                            else:
+                                missed = missed[:cw.schedule.catchup]
                             for ts in missed:
                                 # max_running guard
                                 if cw.schedule.max_running > 0:

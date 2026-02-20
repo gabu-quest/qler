@@ -24,6 +24,7 @@ class CronSchedule:
     max_running: int = 1
     timezone: str = "UTC"
     catchup: int = 0  # 0 = disabled, N = max missed runs to catch up
+    catchup_latest: bool = False  # True = most recent run only (not oldest)
 
 
 class CronWrapper:
@@ -140,8 +141,13 @@ class CronWrapper:
         return await self.task_wrapper(*args, **kwargs)
 
 
-def _normalize_catchup(catchup: int | str | bool) -> int:
-    """Normalize catchup parameter to an int (0 = disabled, N = max missed).
+def _normalize_catchup(catchup: int | str | bool) -> tuple[int, bool]:
+    """Normalize catchup parameter to (int, is_latest).
+
+    Returns:
+        (0, False) for disabled.
+        (1, True) for "latest" (most recent missed run only).
+        (N, False) for integer N (oldest N missed runs).
 
     Raises ConfigurationError for invalid values.
     """
@@ -151,9 +157,9 @@ def _normalize_catchup(catchup: int | str | bool) -> int:
             "Use catchup='latest' for 1, or catchup=N for a specific limit."
         )
     if catchup is False:
-        return 0
+        return 0, False
     if catchup == "latest":
-        return 1
+        return 1, True
     if isinstance(catchup, int):
         if catchup < 1:
             raise ConfigurationError(
@@ -163,7 +169,7 @@ def _normalize_catchup(catchup: int | str | bool) -> int:
             raise ConfigurationError(
                 f"catchup must be <= 100, got {catchup}"
             )
-        return catchup
+        return catchup, False
     raise ConfigurationError(
         f"catchup must be False, 'latest', or int 1-100, got {catchup!r}"
     )
@@ -212,7 +218,7 @@ def cron(
             f"max_running must be >= 1, got {max_running}"
         )
 
-    catchup_int = _normalize_catchup(catchup)
+    catchup_int, is_latest = _normalize_catchup(catchup)
 
     def decorator(fn: Callable) -> CronWrapper:
         # Reject nested functions
@@ -257,6 +263,7 @@ def cron(
             max_running=max_running,
             timezone=timezone_name,
             catchup=catchup_int,
+            catchup_latest=is_latest,
         )
 
         cron_wrapper = CronWrapper(task_wrapper, schedule)
