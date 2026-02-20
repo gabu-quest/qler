@@ -66,6 +66,9 @@ class CronWrapper:
         """
         return f"cron:{self.task_path}:{run_ts}"
 
+    # Reject timestamps before 2020-01-01 as corrupt/invalid
+    _MINIMUM_VALID_CRON_TS = 1_577_836_800
+
     async def _find_last_enqueued_ts(self) -> int | None:
         """Query DB for the most recent cron job's scheduled timestamp.
 
@@ -87,16 +90,19 @@ class CronWrapper:
         prefix = f"cron:{self.task_path}:"
         if key and key.startswith(prefix):
             try:
-                return int(key.rsplit(":", 1)[1])
+                parsed_ts = int(key.rsplit(":", 1)[1])
             except (ValueError, IndexError):
                 return None
+            if parsed_ts < self._MINIMUM_VALID_CRON_TS:
+                return None
+            return parsed_ts
         return None
 
-    def missed_runs(self, since_ts: int, now_ts: int) -> list[int]:
+    def missed_runs(self, since_ts: int, now_ts: int, *, limit: int = 200) -> list[int]:
         """Walk croniter forward from since_ts, return timestamps <= now_ts.
 
-        Returns up to (catchup + safety margin) timestamps. Caller is
-        responsible for trimming to the actual catchup limit.
+        Args:
+            limit: Maximum number of runs to collect (prevents unbounded walks).
         """
         base = datetime.fromtimestamp(since_ts, tz=timezone.utc)
         it = croniter(self.schedule.expression, base)
@@ -107,7 +113,7 @@ class CronWrapper:
             if ts > now_ts:
                 break
             runs.append(ts)
-            if len(runs) > 200:  # safety cap
+            if len(runs) >= limit:
                 break
         return runs
 
