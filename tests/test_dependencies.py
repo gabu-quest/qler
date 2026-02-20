@@ -1,4 +1,6 @@
-"""Tests for M9 — Job Dependencies/Chaining."""
+"""Tests for M10 — Job Dependencies/Chaining."""
+
+import time
 
 import pytest
 import pytest_asyncio
@@ -108,8 +110,10 @@ class TestEnqueueWithDependencies:
 
     async def test_rejects_missing_dependency(self, queue):
         """Enqueue raises DependencyError for a nonexistent dep ULID."""
-        with pytest.raises(DependencyError, match="not found"):
-            await queue.enqueue("my.task", depends_on=["01NONEXISTENT00000000000000"])
+        bad_ulid = "01NONEXISTENT00000000000000"
+        with pytest.raises(DependencyError, match="not found") as exc_info:
+            await queue.enqueue("my.task", depends_on=[bad_ulid])
+        assert exc_info.value.dependency_ulid == bad_ulid
 
     async def test_rejects_failed_dependency(self, queue):
         """Enqueue raises DependencyError if dep is FAILED."""
@@ -119,8 +123,9 @@ class TestEnqueueWithDependencies:
             finished_at=now_epoch(),
             updated_at=now_epoch(),
         )
-        with pytest.raises(DependencyError, match="is failed"):
+        with pytest.raises(DependencyError, match="is failed") as exc_info:
             await queue.enqueue("my.task", depends_on=[a.ulid])
+        assert exc_info.value.dependency_ulid == a.ulid
 
     async def test_rejects_cancelled_dependency(self, queue):
         """Enqueue raises DependencyError if dep is CANCELLED."""
@@ -130,8 +135,9 @@ class TestEnqueueWithDependencies:
             finished_at=now_epoch(),
             updated_at=now_epoch(),
         )
-        with pytest.raises(DependencyError, match="is cancelled"):
+        with pytest.raises(DependencyError, match="is cancelled") as exc_info:
             await queue.enqueue("my.task", depends_on=[a.ulid])
+        assert exc_info.value.dependency_ulid == a.ulid
 
     async def test_deduplicates_dependency_ulids(self, queue):
         """Duplicate ULIDs in depends_on are deduplicated."""
@@ -336,7 +342,7 @@ class TestCascadeCancel:
 
         refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
         assert refreshed_b.status == JobStatus.CANCELLED.value
-        assert "failed/cancelled" in refreshed_b.last_error
+        assert refreshed_b.last_error == f"Dependency {a.ulid} failed/cancelled"
 
     async def test_recursive_cascade(self, queue):
         """A→B→C: fail A, both B and C are cascade-cancelled."""
@@ -379,7 +385,7 @@ class TestCascadeCancel:
         assert refreshed_b.status == JobStatus.COMPLETED.value
 
     async def test_sets_error_message(self, queue):
-        """Cascade-cancelled jobs have a descriptive last_error."""
+        """Cascade-cancelled jobs have a descriptive last_error with parent ULID."""
         a = await queue.enqueue("my.task")
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
@@ -387,7 +393,7 @@ class TestCascadeCancel:
         await queue.fail_job(claimed_a, "worker-1", ValueError("boom"))
 
         refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
-        assert a.ulid in refreshed_b.last_error
+        assert refreshed_b.last_error == f"Dependency {a.ulid} failed/cancelled"
 
     async def test_cancel_via_queue_cascades(self, queue):
         """Queue.cancel_job() cascades to dependents."""
@@ -416,6 +422,69 @@ class TestCascadeCancel:
         assert refreshed_a.status == JobStatus.PENDING.value
         assert refreshed_b.status == JobStatus.PENDING.value
 
+    async def test_cascade_skips_running_dependents(self, queue):
+        """Cascade cancel only cancels PENDING, not RUNNING dependents."""
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task")
+        c = await queue.enqueue("my.task", depends_on=[a.ulid, b.ulid])
+
+        # Complete B so C becomes claimable (pending_dep_count=1 from A only)
+        await Job.query().filter(F("ulid") == b.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
+        )
+        # Manually set C to RUNNING (simulating it was already claimed)
+        await Job.query().filter(F("ulid") == c.ulid).update_one(
+            status=JobStatus.RUNNING.value,
+            updated_at=now_epoch(),
+        )
+
+        # Fail A — cascade should skip C since it's RUNNING
+        claimed_a = await queue.claim_job("worker-1", ["default"])
+        assert claimed_a.ulid == a.ulid
+        await queue.fail_job(claimed_a, "worker-1", ValueError("boom"))
+
+        refreshed_c = await Job.query().filter(F("ulid") == c.ulid).first()
+        assert refreshed_c.status == JobStatus.RUNNING.value
+
+    async def test_cancel_completed_returns_false(self, queue):
+        """cancel_job on a COMPLETED job returns False and does not cascade."""
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+
+        # Complete A
+        await Job.query().filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
+        )
+        refreshed_a = await Job.query().filter(F("ulid") == a.ulid).first()
+
+        ok = await queue.cancel_job(refreshed_a)
+        assert ok is False
+
+        # B should remain PENDING (not cascade-cancelled)
+        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert refreshed_b.status == JobStatus.PENDING.value
+
+    async def test_wide_fan_out_resolution(self, queue):
+        """Completing parent resolves all 5 dependents."""
+        parent = await queue.enqueue("my.task")
+        children = []
+        for _ in range(5):
+            child = await queue.enqueue("my.task", depends_on=[parent.ulid])
+            assert child.pending_dep_count == 1
+            children.append(child)
+
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed.ulid == parent.ulid
+        await queue.complete_job(claimed, "worker-1")
+
+        for child in children:
+            refreshed = await Job.query().filter(F("ulid") == child.ulid).first()
+            assert refreshed.pending_dep_count == 0
+
 
 # ---------------------------------------------------------------------------
 # TestWaitForDependencies
@@ -428,13 +497,16 @@ class TestWaitForDependencies:
     async def test_no_deps_returns_immediately(self, queue):
         """wait_for_dependencies returns immediately when no deps."""
         a = await queue.enqueue("my.task")
+        assert a.dependencies == []
+        start = time.monotonic()
         await a.wait_for_dependencies(timeout=1.0)
-        # No error = success
+        assert time.monotonic() - start < 0.1
 
     async def test_waits_for_completion(self, queue):
         """wait_for_dependencies returns when all deps complete."""
         a = await queue.enqueue("my.task")
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        assert b.dependencies == [a.ulid]
 
         # Complete A
         await Job.query().filter(F("ulid") == a.ulid).update_one(
@@ -444,7 +516,8 @@ class TestWaitForDependencies:
         )
 
         await b.wait_for_dependencies(timeout=2.0)
-        # No error = success
+        refreshed_a = await Job.query().filter(F("ulid") == a.ulid).first()
+        assert refreshed_a.status == JobStatus.COMPLETED.value
 
     async def test_raises_on_failed_dep(self, queue):
         """wait_for_dependencies raises JobFailedError if a dep fails."""
@@ -495,6 +568,46 @@ class TestWaitForDependencies:
 
         with pytest.raises(JobFailedError, match="not found"):
             await b.wait_for_dependencies(timeout=2.0)
+
+    async def test_multi_dep_one_failed(self, queue):
+        """wait_for_dependencies raises on first failed dep even if others are fine."""
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task")
+        c = await queue.enqueue("my.task", depends_on=[a.ulid, b.ulid])
+
+        # Complete A, fail B
+        await Job.query().filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
+        )
+        await Job.query().filter(F("ulid") == b.ulid).update_one(
+            status=JobStatus.FAILED.value,
+            last_error="something broke",
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
+        )
+
+        with pytest.raises(JobFailedError, match="failed"):
+            await c.wait_for_dependencies(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# TestTaskWrapperDependencies
+# ---------------------------------------------------------------------------
+
+
+class TestTaskWrapperDependencies:
+    """TaskWrapper.enqueue() forwards _depends_on to Queue.enqueue()."""
+
+    async def test_task_wrapper_forwards_depends_on(self, queue):
+        """_depends_on is forwarded and stored on the created job."""
+        wrapped = task(queue)(noop_task)
+        a = await queue.enqueue("my.task")
+
+        b = await wrapped.enqueue(_depends_on=[a.ulid])
+        assert b.dependencies == [a.ulid]
+        assert b.pending_dep_count == 1
 
 
 # ---------------------------------------------------------------------------
