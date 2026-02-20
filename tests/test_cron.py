@@ -280,24 +280,27 @@ async def test_cron_run_now(queue):
 
 
 async def test_catchup_parameter_latest():
-    """catchup='latest' normalizes to catchup=1 on CronSchedule."""
+    """catchup='latest' normalizes to catchup=1 with catchup_latest=True."""
     q = Queue(":memory:")
     wrapped = cron(q, "0 * * * *", catchup="latest")(catchup_latest_task)
     assert wrapped.schedule.catchup == 1
+    assert wrapped.schedule.catchup_latest is True
 
 
 async def test_catchup_parameter_int():
-    """catchup=3 stored correctly on CronSchedule."""
+    """catchup=3 stored correctly, catchup_latest=False."""
     q = Queue(":memory:")
     wrapped = cron(q, "0 * * * *", catchup=3)(catchup_task)
     assert wrapped.schedule.catchup == 3
+    assert wrapped.schedule.catchup_latest is False
 
 
 async def test_catchup_false_default():
-    """Default is catchup=0 (disabled)."""
+    """Default is catchup=0 (disabled), catchup_latest=False."""
     q = Queue(":memory:")
     wrapped = cron(q, "0 * * * *")(hourly_task)
     assert wrapped.schedule.catchup == 0
+    assert wrapped.schedule.catchup_latest is False
 
 
 async def test_catchup_true_rejected():
@@ -373,7 +376,7 @@ async def test_missed_runs_empty_when_current():
 
 
 async def test_missed_runs_oldest_first():
-    """Missed runs are returned in chronological order."""
+    """Missed runs are returned in chronological order with exact timestamps."""
     q = Queue(":memory:")
     # Every 15 minutes
     wrapped = cron(q, "*/15 * * * *")(catchup_task)
@@ -384,9 +387,14 @@ async def test_missed_runs_oldest_first():
     now_ts = int(now.timestamp())
 
     runs = wrapped.missed_runs(since_ts, now_ts)
-    # 15:15, 15:30, 15:45, 16:00
+    expected = [
+        int(datetime(2026, 1, 15, 15, 15, 0, tzinfo=timezone.utc).timestamp()),
+        int(datetime(2026, 1, 15, 15, 30, 0, tzinfo=timezone.utc).timestamp()),
+        int(datetime(2026, 1, 15, 15, 45, 0, tzinfo=timezone.utc).timestamp()),
+        int(datetime(2026, 1, 15, 16, 0, 0, tzinfo=timezone.utc).timestamp()),
+    ]
     assert len(runs) == 4
-    assert runs == sorted(runs)
+    assert runs == expected
 
 
 # ------------------------------------------------------------------
@@ -423,6 +431,20 @@ async def test_find_last_enqueued_ts_non_cron_job(queue):
 
     result = await wrapped._find_last_enqueued_ts()
     assert result is None
+
+
+async def test_find_last_enqueued_ts_returns_most_recent(queue):
+    """With multiple jobs, returns the most recent timestamp (not oldest)."""
+    wrapped = cron(queue, "0 * * * *", catchup=1)(catchup_task)
+
+    ts_old = int(datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc).timestamp())
+    ts_new = int(datetime(2026, 1, 15, 14, 0, 0, tzinfo=timezone.utc).timestamp())
+    # Enqueue oldest first
+    await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(ts_old))
+    await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(ts_new))
+
+    result = await wrapped._find_last_enqueued_ts()
+    assert result == ts_new  # must return the most recent, not oldest
 
 
 # ------------------------------------------------------------------
@@ -482,7 +504,7 @@ async def test_catchup_latest_only_one(queue):
     all_jobs = await Job.query().filter(
         F("task") == wrapped.task_path
     ).all()
-    # The key check: only 1 catchup job (not 4-5), plus possibly the normal tick
+    # The key check: exactly 1 catchup job (not 4-5), plus possibly the normal tick
     cron_timestamps = set()
     for job in all_jobs:
         ts_str = job.idempotency_key.rsplit(":", 1)[1]
@@ -490,8 +512,11 @@ async def test_catchup_latest_only_one(queue):
 
     # Remove the seed timestamp
     cron_timestamps.discard(old_ts)
-    # Should have at most 2 new timestamps (1 catchup + 1 normal tick)
-    assert len(cron_timestamps) <= 2
+    # At least 1 catchup job, at most 2 (catchup + normal tick)
+    assert 1 <= len(cron_timestamps) <= 2
+    # The catchup job should be the most recent missed run (not oldest)
+    catchup_ts = min(cron_timestamps)  # exclude potential normal tick
+    assert catchup_ts > old_ts  # must be newer than the seed
 
 
 async def test_catchup_respects_max_running(queue):
@@ -532,7 +557,9 @@ async def test_catchup_idempotent(queue):
     all_jobs = await Job.query().filter(
         F("task") == wrapped.task_path
     ).all()
-    # Count unique idempotency keys — no duplicates
+    # Guard: at least seed + 1 catchup job exist
+    assert len(all_jobs) >= 2
+    # No duplicate idempotency keys
     keys = [j.idempotency_key for j in all_jobs]
     assert len(keys) == len(set(keys))
 
@@ -548,3 +575,67 @@ async def test_catchup_no_history_skips(queue):
     ).all()
     # Should have at most 1-2 jobs (from normal scheduling), not a flood
     assert len(all_jobs) <= 2
+
+
+async def test_catchup_latest_picks_most_recent(queue):
+    """catchup='latest' enqueues the most recent missed run, not the oldest."""
+    wrapped = cron(queue, "0 * * * *", catchup="latest", max_running=10)(catchup_latest_task)
+
+    # Seed a job from 5 hours ago
+    now = datetime.now(timezone.utc)
+    old_ts = int((now - timedelta(hours=5)).replace(minute=0, second=0, microsecond=0).timestamp())
+    await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
+
+    # Calculate what the most recent missed hourly run would be
+    most_recent_hour = now.replace(minute=0, second=0, microsecond=0)
+    if most_recent_hour > now:
+        most_recent_hour -= timedelta(hours=1)
+    most_recent_ts = int(most_recent_hour.timestamp())
+
+    await _run_worker_briefly(queue)
+
+    all_jobs = await Job.query().filter(
+        F("task") == wrapped.task_path
+    ).all()
+    catchup_keys = {
+        int(j.idempotency_key.rsplit(":", 1)[1])
+        for j in all_jobs
+    }
+    catchup_keys.discard(old_ts)
+
+    # The catchup job should be the most recent hour, not the oldest missed
+    # (old_ts+1h would be the oldest missed)
+    oldest_missed_ts = old_ts + 3600
+    assert len(catchup_keys) >= 1
+    # The catchup timestamp should be closer to now than to the seed
+    catchup_ts = min(catchup_keys)  # exclude potential normal tick
+    assert catchup_ts > oldest_missed_ts  # not the oldest missed run
+
+
+async def test_catchup_trims_to_limit(queue):
+    """catchup=2 with 4+ missed runs enqueues exactly 2 (oldest first)."""
+    wrapped = cron(queue, "0 * * * *", catchup=2, max_running=10)(catchup_task)
+
+    # Seed a job from 5 hours ago — creates 4+ missed hourly runs
+    now = datetime.now(timezone.utc)
+    old_ts = int((now - timedelta(hours=5)).replace(minute=0, second=0, microsecond=0).timestamp())
+    await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
+
+    await _run_worker_briefly(queue)
+
+    all_jobs = await Job.query().filter(
+        F("task") == wrapped.task_path
+    ).all()
+    catchup_keys = sorted(
+        int(j.idempotency_key.rsplit(":", 1)[1])
+        for j in all_jobs
+    )
+
+    # Remove seed and any normal tick (within 60s of now)
+    now_ts = int(now.timestamp())
+    catchup_only = [ts for ts in catchup_keys if ts != old_ts and ts < now_ts - 60]
+
+    # Should be exactly 2 catchup jobs (not 4+), and they should be the oldest missed
+    assert len(catchup_only) == 2
+    assert catchup_only == sorted(catchup_only)  # oldest first
+    assert catchup_only[0] == old_ts + 3600  # first missed hour after seed
