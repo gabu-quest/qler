@@ -160,37 +160,27 @@ Token bucket rate limiting for tasks and queues.
 
 ### M8: Fix sqler `.count()` bug ✅
 
-**Where:** `/home/gabu/projects/pypi/sqler/` — branch `fix/aggregate-promoted-rewrite`
+**Where:** `../sqler` — branch `feat/qler-prerequisites`
 
 **Root cause:** `_build_aggregate_query()` was not calling `_rewrite_promoted_refs()`, so WHERE clauses with promoted column filters used `json_extract(data, '$.status')` instead of the real `status` column. Promoted fields are stripped from the JSON blob on save, so json_extract returns NULL → zero matches.
 
-**Fix:** Added `_rewrite_promoted_refs()` call to `_build_aggregate_query()` in both `async_query.py` and `query.py`. Affects all aggregate functions: `count()`, `sum()`, `avg()`, `min()`, `max()`.
+**Fix:** Added `_rewrite_promoted_refs()` call and promoted field detection in SELECT clause to `_build_aggregate_query()` in both `async_query.py` and `query.py`. Affects all aggregate functions: `count()`, `sum()`, `avg()`, `min()`, `max()`.
 
 **Deliverables:**
-- ✅ Fix `count()` SQL generation for mixed promoted + JSON field filters
-- ✅ 4 regression tests in sqler (`test_async_promoted.py::TestAsyncPromotedAggregates`)
-- ✅ Removed `len(await ...all())` workarounds in qler (3 places)
-- ✅ Fix `delete()` SQL generation (same missing `_rewrite_promoted_refs()` bug)
-- ✅ 2 regression tests in sqler (`test_async_promoted.py::TestAsyncPromotedDelete`)
-- ✅ Removed raw SQL `DELETE` workaround in qler purge command
-- ✅ Replaced raw SQL `SELECT COUNT(*)` in doctor command with ORM `.count()`
+- ✅ Fix aggregate SQL generation for promoted column filters (both sync + async)
+- ✅ 10 regression tests in sqler (`TestAsyncPromotedAggregates` + `TestPromotedAggregates`)
+- ✅ qler's `.count()` calls (cli.py, worker.py cron scheduler) now work correctly
+- ✅ All 313 qler tests pass, all 636 sqler tests pass
 
-### M9: Job Dependencies/Chaining ✅
+### M9: Job Dependencies/Chaining ⬚
 
 Job A depends on Job B completing before it can be claimed.
 
-- ✅ `depends_on` parameter on `enqueue()` — list of job ULIDs
-- ✅ `Job.dependencies` field (JSON list of ULIDs)
-- ✅ `pending_dep_count` promoted column — claim query filters `pending_dep_count = 0`
-- ✅ `_resolve_dependencies()` — atomic decrement on completion
-- ✅ `_cascade_cancel_dependents()` — recursive cancellation on terminal failure
-- ✅ `Queue.cancel_job()` — cancel with cascade
-- ✅ `DependencyError` exception for invalid deps (missing, failed, cancelled)
-- ✅ `job.wait_for_dependencies()` polling helper
-- ✅ `TaskWrapper.enqueue(_depends_on=...)` forwarding
-- ✅ CLI: `qler job <id>` shows dependency status, `qler cancel` uses cascade
-- ✅ Schema migration for existing databases (idempotent ALTER TABLE)
-- ✅ 31 tests
+- `depends_on` parameter on `enqueue()` — list of job ULIDs
+- `Job.dependencies` field (JSON list of ULIDs)
+- Claim query filters out jobs with unfinished dependencies
+- `job.wait_for_dependencies()` helper
+- CLI: `qler job <id>` shows dependency status
 
 ### M10: Dead Letter Queue ⬚
 
@@ -209,51 +199,6 @@ Health endpoint, worker process definitions.
 - Health check endpoint (HTTP or Unix socket)
 - Worker heartbeat reporting
 - `procler` manages worker lifecycle (start, stop, restart)
-
----
-
-## Integration Status (2026-02-20)
-
-All implementation is complete through M9. Everything is pushed to origin on feature branches but **nothing is merged to main** in any repo. Below is the full picture for cross-repo integration testing.
-
-### qler (this repo)
-
-| Branch | Contains | Pushed |
-|--------|----------|--------|
-| `feat/m4-polish` | M0–M4, v0.1.0 tag | ✅ |
-| `feat/m5-cancellation` | M5 cooperative cancellation | ✅ |
-| `feat/m6-cron` | M6 cron, M7 rate limiting, M8 sqler fix, M9 dependencies | ✅ |
-| `main` | Only initial spec/docs (4 commits) | ✅ |
-
-**Latest code:** `feat/m6-cron` (`0c3aed9`) — includes everything.
-
-### sqler (sibling repo)
-
-| Branch | Contains | Pushed |
-|--------|----------|--------|
-| `feat/qler-prerequisites` | M-2 gaps: order_by, promoted cols, F-exprs, update_one | ✅ |
-| `fix/aggregate-promoted-rewrite` | M8 fix: count()/delete() promoted column rewrite | ✅ |
-| `main` | v1.2026.2.1 (no qler features) | ✅ |
-
-### logler (sibling repo)
-
-| Branch | Contains | Pushed |
-|--------|----------|--------|
-| `feat/sqler-bridge` | M-1: db bridge, correlation context | ✅ |
-| `main` | v1.3.1 (no bridge) | ✅ |
-
-### To test the full stack together
-
-1. **sqler:** checkout `fix/aggregate-promoted-rewrite` (includes qler-prerequisites), `uv pip install -e .`
-2. **logler:** checkout `feat/sqler-bridge`, install
-3. **qler:** checkout `feat/m6-cron`, `uv sync`, run `uv run pytest`
-
-### Merge order (when ready)
-
-1. sqler `feat/qler-prerequisites` → main
-2. sqler `fix/aggregate-promoted-rewrite` → main (or rebase onto 1)
-3. logler `feat/sqler-bridge` → main
-4. qler `feat/m6-cron` → main (or sequential: m4-polish → m5 → m6-cron)
 
 ---
 

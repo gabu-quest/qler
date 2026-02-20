@@ -35,6 +35,9 @@ htmlcov/
 # Local Claude context (personal; do not share)
 CLAUDE.local.md
 
+# Cross-stack integration test (requires sibling projects)
+tests/integration_ler_stack.py
+
 # OS
 .DS_Store
 Thumbs.db

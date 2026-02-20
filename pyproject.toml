@@ -44,6 +44,9 @@ dev = [
     "ruff==0.12.10",
 ]
 
+[tool.uv.sources]
+sqler = { path = "../sqler", editable = true }
+
 [build-system]
 requires = ["uv_build>=0.7.19,<0.8.0"]
 build-backend = "uv_build"
