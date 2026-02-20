@@ -281,19 +281,57 @@ class Worker:
         For each registered cron task, checks if the next scheduled run is due.
         Uses idempotency keys to prevent duplicate scheduling and max_running
         guards to prevent pile-up.
+
+        On startup, catchup-enabled tasks query their last enqueued timestamp
+        and walk forward to enqueue missed runs (up to their catchup limit).
         """
         from sqler import F
 
+        # One-time startup: query last enqueued timestamp for catchup tasks
+        catchup_anchors: dict[str, int | None] = {}
+        for path, cw in self.queue._cron_tasks.items():
+            if cw.schedule.catchup > 0:
+                try:
+                    catchup_anchors[path] = await cw._find_last_enqueued_ts()
+                except Exception:
+                    logger.exception("Error querying catchup anchor for %s", path)
+
         while self._running:
             now = datetime.now(timezone.utc)
+            now_ts = int(now.timestamp())
+
             for path, cw in self.queue._cron_tasks.items():
                 if not self._running:
                     break
                 try:
-                    # Check if the next run is due (look back 60s to catch missed ticks)
+                    # --- Catchup pass (first tick only for catchup-enabled tasks) ---
+                    if path in catchup_anchors:
+                        anchor = catchup_anchors.pop(path)
+                        if anchor is not None:
+                            missed = cw.missed_runs(anchor, now_ts)
+                            # Trim to catchup limit
+                            missed = missed[:cw.schedule.catchup]
+                            for ts in missed:
+                                # max_running guard
+                                if cw.schedule.max_running > 0:
+                                    running_count = await Job.query().filter(
+                                        (F("task") == path)
+                                        & F("status").in_list([
+                                            JobStatus.PENDING.value,
+                                            JobStatus.RUNNING.value,
+                                        ])
+                                    ).count()
+                                    if running_count >= cw.schedule.max_running:
+                                        break
+                                await cw.task_wrapper.enqueue(
+                                    _idempotency_key=cw.idempotency_key(ts),
+                                )
+                        # After catchup (or no history), fall through to normal scheduling
+
+                    # --- Normal scheduling (60s lookback) ---
                     next_run = cw.next_run(after=now - timedelta(seconds=60))
                     next_ts = int(next_run.timestamp())
-                    if next_ts > int(now.timestamp()):
+                    if next_ts > now_ts:
                         continue
 
                     # max_running guard: check pending/running count
