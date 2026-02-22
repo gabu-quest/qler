@@ -1234,7 +1234,10 @@ def dlq_replay(
                 for j in jobs:
                     updated = await q.replay_job(j, queue_name=target_queue)
                     if updated:
-                        replayed.append({"ulid": updated.ulid})
+                        replayed.append({
+                            "ulid": updated.ulid,
+                            "queue_name": updated.queue_name,
+                        })
             return replayed
         finally:
             await q.close()
