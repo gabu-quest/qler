@@ -51,6 +51,7 @@ class Queue:
         default_retry_delay: int = 60,
         max_payload_size: int = 1_000_000,
         rate_limits: Optional[dict[str, str]] = None,
+        dlq: Optional[str] = None,
     ) -> None:
         if isinstance(db, str):
             self._db_path: Optional[str] = db
@@ -73,6 +74,7 @@ class Queue:
         self.max_payload_size = max_payload_size
         self._tasks: dict[str, TaskWrapper] = {}
         self._cron_tasks: dict[str, CronWrapper] = {}
+        self._dlq: Optional[str] = dlq
         self._rate_limits: dict[str, RateSpec] = {}
         if rate_limits:
             for queue_name, spec in rate_limits.items():
@@ -171,6 +173,12 @@ class Queue:
                 "CREATE INDEX IF NOT EXISTS idx_qler_jobs_idempotency "
                 "ON qler_jobs (json_extract(data, '$.idempotency_key')) "
                 "WHERE json_extract(data, '$.idempotency_key') IS NOT NULL"
+            ),
+            # 6. DLQ: find failed jobs in a specific queue
+            (
+                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_dlq "
+                "ON qler_jobs (queue_name, status) "
+                "WHERE status = 'failed'"
             ),
         ]
         for ddl in indexes:
@@ -589,6 +597,9 @@ class Queue:
         else:
             update_fields["status"] = JobStatus.FAILED.value
             update_fields["finished_at"] = now
+            if self._dlq:
+                update_fields["original_queue"] = job.queue_name
+                update_fields["queue_name"] = self._dlq
 
         updated = await Job.query().filter(
             (F("ulid") == job.ulid)
@@ -711,6 +722,36 @@ class Queue:
         if ok and job.status == JobStatus.CANCELLED.value:
             await self._cascade_cancel_dependents(job.ulid)
         return ok
+
+    async def replay_job(
+        self, job: Job, *, queue_name: Optional[str] = None
+    ) -> Optional[Job]:
+        """Replay a FAILED DLQ job back to its original queue.
+
+        Resets the job to PENDING with retry_count=0 and clears the DLQ fields.
+        Returns the updated Job, or None if the job wasn't FAILED.
+
+        Args:
+            job: The failed job to replay.
+            queue_name: Override queue to replay into. Defaults to job.original_queue.
+        """
+        target_queue = queue_name or job.original_queue
+        if not target_queue:
+            target_queue = "default"
+
+        now = now_epoch()
+        updated = await Job.query().filter(
+            (F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value)
+        ).update_one(
+            status=JobStatus.PENDING.value,
+            queue_name=target_queue,
+            original_queue="",
+            retry_count=0,
+            finished_at=None,
+            eta=now,
+            updated_at=now,
+        )
+        return updated
 
     # ------------------------------------------------------------------
     # Helpers
