@@ -56,6 +56,7 @@ class Job(AsyncSQLerSafeModel):
     correlation_id: str = ""
     idempotency_key: Optional[str] = None
     cancel_requested: bool = False
+    original_queue: str = ""
     dependencies: list[str] = []
     created_at: int = 0
     updated_at: int = 0
