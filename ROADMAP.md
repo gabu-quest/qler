@@ -202,14 +202,24 @@ Job A depends on Job B completing before it can be claimed.
 
 **Also fixed:** sqler `delete()` missing `_rewrite_promoted_refs` (same class of bug as M8 `.count()` fix). 6 regression tests added in sqler.
 
-### M11: Dead Letter Queue ⬚
+### M11: Dead Letter Queue ✅
 
 Configurable DLQ for permanently failed jobs.
 
-- `Queue(db, dlq="dead_letters")` — auto-move failed jobs to named queue
-- `max_retries` exhaustion triggers DLQ move instead of terminal FAILED
-- `qler dlq` CLI command — list, inspect, replay from DLQ
-- DLQ jobs preserve full attempt history
+- ✅ `Queue(db, dlq="dead_letters")` — auto-move failed jobs to named queue
+- ✅ `original_queue` field on Job — tracks source queue for replay
+- ✅ Terminal failure (retry exhaustion) moves job to DLQ queue with `status=FAILED`
+- ✅ `Queue.replay_job()` — reset FAILED→PENDING, restore to original queue
+- ✅ DLQ partial index for efficient lookups
+- ✅ `qler dlq` CLI command group (JSON-first, `--human` opt-in):
+  - `list` — list DLQ jobs with `--limit`, `--since`, `--task` filters
+  - `count` — count DLQ jobs
+  - `job <id>` — full job detail
+  - `replay <id>` / `replay --all` — replay back to original queue (or `--queue` override)
+  - `purge --confirm` / `purge --older-than` — permanently delete DLQ jobs
+- ✅ Cascade cancel still fires when job moves to DLQ
+- ✅ Immediate mode respects DLQ configuration
+- ✅ 49 tests (26 core + 23 CLI)
 
 ### M12: procler Integration ⬚
 

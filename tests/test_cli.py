@@ -1233,7 +1233,298 @@ class TestVersionHelp:
         commands = [
             "init", "worker", "status", "jobs", "job",
             "attempts", "retry", "cancel", "purge", "doctor",
+            "dlq",
         ]
         for cmd in commands:
             result = runner.invoke(cli, [cmd, "--help"])
             assert result.exit_code == 0, f"{cmd} --help failed: {result.output}"
+
+    def test_dlq_subcommands_have_help(self, runner):
+        subcommands = ["list", "count", "job", "replay", "purge"]
+        for sub in subcommands:
+            result = runner.invoke(cli, ["dlq", "--db", "dummy.db", sub, "--help"])
+            assert result.exit_code == 0, f"dlq {sub} --help failed: {result.output}"
+
+
+# -----------------------------------------------------------------------
+# qler dlq (Dead Letter Queue CLI)
+# -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def dlq_populated_db(db_path):
+    """Create a DB with failed jobs in the DLQ for CLI testing."""
+    import asyncio
+
+    async def _setup():
+        q = Queue(db_path, dlq="dead_letters")
+        await q.init_db()
+
+        # 3 jobs that fail terminally → go to DLQ
+        for i in range(3):
+            j = await q.enqueue(f"myapp.tasks.fail_{i}", queue_name="default", max_retries=0)
+            claimed = await q.claim_job("w1", ["default"])
+            await q.fail_job(claimed, "w1", ValueError(f"error_{i}"),
+                             failure_kind=FailureKind.EXCEPTION)
+
+        # 1 job still pending (not in DLQ)
+        await q.enqueue("myapp.tasks.pending", queue_name="default")
+
+        await q.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+class TestDLQCli:
+    """Tests for `qler dlq` CLI command group."""
+
+    def test_dlq_list_json(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "list"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["count"] == 3
+        assert len(data["data"]) == 3
+        for item in data["data"]:
+            assert "ulid" in item
+            assert "task" in item
+            assert "error" in item
+            assert item["original_queue"] == "default"
+
+    def test_dlq_list_human(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "--human", "list"])
+        assert result.exit_code == 0
+        assert "ULID" in result.output
+        assert "Task" in result.output
+        assert "3 item(s)" in result.output
+
+    def test_dlq_list_empty(self, runner, db_path):
+        """DLQ list on a DB with no DLQ jobs returns empty."""
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "list"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["count"] == 0
+        assert data["data"] == []
+
+    def test_dlq_list_filter_task(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, [
+            "dlq", "--db", dlq_populated_db, "list", "--task", "myapp.tasks.fail_0"
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["count"] == 1
+        assert data["data"][0]["task"] == "myapp.tasks.fail_0"
+
+    def test_dlq_list_limit(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, [
+            "dlq", "--db", dlq_populated_db, "list", "--limit", "2"
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["count"] == 2
+        assert len(data["data"]) == 2
+
+    def test_dlq_count_json(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "count"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["count"] == 3
+
+    def test_dlq_count_human(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, [
+            "dlq", "--db", dlq_populated_db, "--human", "count"
+        ])
+        assert result.exit_code == 0
+        assert "Count: 3" in result.output
+
+    def test_dlq_count_empty(self, runner, db_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "count"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["count"] == 0
+
+    def test_dlq_job_detail(self, runner, dlq_populated_db):
+        """DLQ job detail returns full job dict."""
+        # First get a ULID from the list
+        list_result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "list"])
+        list_data = json.loads(list_result.output)
+        ulid = list_data["data"][0]["ulid"]
+
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "job", ulid])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["data"]["ulid"] == ulid
+        assert data["data"]["status"] == "failed"
+        assert data["data"]["queue_name"] == "dead_letters"
+        assert data["data"]["original_queue"] == "default"
+
+    def test_dlq_job_not_found(self, runner, db_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "job", "NONEXISTENT"])
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["ok"] is False
+        assert "not found" in data["error"]
+
+    def test_dlq_replay_single(self, runner, dlq_populated_db):
+        # Get a ULID
+        list_result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "list"])
+        ulid = json.loads(list_result.output)["data"][0]["ulid"]
+
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "replay", ulid])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["count"] == 1
+        assert data["data"][0]["ulid"] == ulid
+        assert data["data"][0]["status"] == "pending"
+        assert data["data"][0]["queue_name"] == "default"
+
+    def test_dlq_replay_to_different_queue(self, runner, dlq_populated_db):
+        list_result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "list"])
+        ulid = json.loads(list_result.output)["data"][0]["ulid"]
+
+        result = runner.invoke(cli, [
+            "dlq", "--db", dlq_populated_db, "replay", ulid, "--queue", "retry_queue"
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["data"][0]["queue_name"] == "retry_queue"
+
+    def test_dlq_replay_all(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "replay", "--all"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["count"] == 3
+
+        # Verify DLQ is now empty
+        count_result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "count"])
+        assert json.loads(count_result.output)["count"] == 0
+
+    def test_dlq_replay_not_found(self, runner, db_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, [
+            "dlq", "--db", db_path, "replay", "NONEXISTENT"
+        ])
+        assert result.exit_code == 1
+
+    def test_dlq_replay_requires_ulid_or_all(self, runner, db_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "replay"])
+        assert result.exit_code == 2
+        assert "Provide a job ULID or use --all" in result.output
+
+    def test_dlq_replay_human(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, [
+            "dlq", "--db", dlq_populated_db, "--human", "replay", "--all"
+        ])
+        assert result.exit_code == 0
+        assert "Replayed 3 job(s)" in result.output
+
+    def test_dlq_purge_with_confirm(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, [
+            "dlq", "--db", dlq_populated_db, "purge", "--confirm"
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["ok"] is True
+        assert data["count"] == 3
+
+        # Verify DLQ is now empty
+        count_result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "count"])
+        assert json.loads(count_result.output)["count"] == 0
+
+    def test_dlq_purge_requires_confirm_or_older_than(self, runner, db_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "purge"])
+        assert result.exit_code == 1
+
+    def test_dlq_purge_with_older_than(self, runner, db_path):
+        """Purge with --older-than only deletes old DLQ jobs."""
+        import asyncio
+
+        async def _setup():
+            q = Queue(db_path, dlq="dead_letters")
+            await q.init_db()
+
+            # 2 old DLQ jobs
+            old_ts = now_epoch() - 86400 * 10  # 10 days ago
+            for i in range(2):
+                j = await q.enqueue(f"tasks.old_{i}", max_retries=0)
+                claimed = await q.claim_job("w1", ["default"])
+                await q.fail_job(claimed, "w1", ValueError("old"),
+                                 failure_kind=FailureKind.EXCEPTION)
+                # Backdate created_at
+                await Job.query().filter(F("ulid") == j.ulid).update_one(
+                    created_at=old_ts,
+                )
+
+            # 1 recent DLQ job
+            j = await q.enqueue("tasks.recent", max_retries=0)
+            claimed = await q.claim_job("w1", ["default"])
+            await q.fail_job(claimed, "w1", ValueError("recent"),
+                             failure_kind=FailureKind.EXCEPTION)
+
+            await q.close()
+
+        asyncio.run(_setup())
+
+        result = runner.invoke(cli, [
+            "dlq", "--db", db_path, "purge", "--older-than", "7d"
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["count"] == 2
+
+        # Verify 1 recent job remains
+        count_result = runner.invoke(cli, ["dlq", "--db", db_path, "count"])
+        assert json.loads(count_result.output)["count"] == 1
+
+    def test_dlq_purge_human(self, runner, dlq_populated_db):
+        result = runner.invoke(cli, [
+            "dlq", "--db", dlq_populated_db, "--human", "purge", "--confirm"
+        ])
+        assert result.exit_code == 0
+        assert "Count: 3" in result.output
+
+    def test_dlq_custom_name(self, runner, db_path):
+        """Using --dlq with a custom name queries the right queue."""
+        import asyncio
+
+        async def _setup():
+            q = Queue(db_path, dlq="my_failures")
+            await q.init_db()
+            j = await q.enqueue("tasks.fail", max_retries=0)
+            claimed = await q.claim_job("w1", ["default"])
+            await q.fail_job(claimed, "w1", ValueError("oops"),
+                             failure_kind=FailureKind.EXCEPTION)
+            await q.close()
+
+        asyncio.run(_setup())
+
+        # Default DLQ name misses the job
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "count"])
+        assert json.loads(result.output)["count"] == 0
+
+        # Custom DLQ name finds it
+        result = runner.invoke(cli, [
+            "dlq", "--db", db_path, "--dlq", "my_failures", "count"
+        ])
+        assert json.loads(result.output)["count"] == 1
+
+    def test_dlq_json_envelope_error(self, runner, db_path):
+        """Error envelope has ok=false and error key."""
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "job", "FAKE"])
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["ok"] is False
+        assert "error" in data
+        assert "data" not in data
