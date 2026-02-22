@@ -1286,10 +1286,15 @@ class TestDLQCli:
         assert data["ok"] is True
         assert data["count"] == 3
         assert len(data["data"]) == 3
+        tasks_found = {item["task"] for item in data["data"]}
+        assert tasks_found == {
+            "myapp.tasks.fail_0",
+            "myapp.tasks.fail_1",
+            "myapp.tasks.fail_2",
+        }
         for item in data["data"]:
-            assert "ulid" in item
-            assert "task" in item
-            assert "error" in item
+            assert item["ulid"]  # non-empty
+            assert item["error"]  # non-empty
             assert item["original_queue"] == "default"
 
     def test_dlq_list_human(self, runner, dlq_populated_db):
@@ -1297,6 +1302,7 @@ class TestDLQCli:
         assert result.exit_code == 0
         assert "ULID" in result.output
         assert "Task" in result.output
+        assert "myapp.tasks.fail_" in result.output
         assert "3 item(s)" in result.output
 
     def test_dlq_list_empty(self, runner, db_path):
@@ -1346,6 +1352,7 @@ class TestDLQCli:
         result = runner.invoke(cli, ["dlq", "--db", db_path, "count"])
         assert result.exit_code == 0
         data = json.loads(result.output)
+        assert data["ok"] is True
         assert data["count"] == 0
 
     def test_dlq_job_detail(self, runner, dlq_populated_db):
@@ -1398,11 +1405,19 @@ class TestDLQCli:
         assert data["data"][0]["queue_name"] == "retry_queue"
 
     def test_dlq_replay_all(self, runner, dlq_populated_db):
+        # Capture pre-replay ULIDs
+        pre = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "list"])
+        pre_ulids = {item["ulid"] for item in json.loads(pre.output)["data"]}
+        assert len(pre_ulids) == 3
+
         result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "replay", "--all"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["ok"] is True
         assert data["count"] == 3
+        assert len(data["data"]) == 3
+        replayed_ulids = {item["ulid"] for item in data["data"]}
+        assert replayed_ulids == pre_ulids
 
         # Verify DLQ is now empty
         count_result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "count"])
@@ -1414,6 +1429,7 @@ class TestDLQCli:
             "dlq", "--db", db_path, "replay", "NONEXISTENT"
         ])
         assert result.exit_code == 1
+        assert "NONEXISTENT" in result.output
 
     def test_dlq_replay_requires_ulid_or_all(self, runner, db_path):
         runner.invoke(cli, ["init", "--db", db_path])
@@ -1427,6 +1443,7 @@ class TestDLQCli:
         ])
         assert result.exit_code == 0
         assert "Replayed 3 job(s)" in result.output
+        assert "default" in result.output  # all three replay to original queue
 
     def test_dlq_purge_with_confirm(self, runner, dlq_populated_db):
         result = runner.invoke(cli, [
@@ -1445,6 +1462,10 @@ class TestDLQCli:
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["dlq", "--db", db_path, "purge"])
         assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data["ok"] is False
+        assert "confirm" in data["error"].lower() or "older-than" in data["error"].lower()
+        assert "data" not in data
 
     def test_dlq_purge_with_older_than(self, runner, db_path):
         """Purge with --older-than only deletes old DLQ jobs."""
@@ -1520,11 +1541,11 @@ class TestDLQCli:
         assert json.loads(result.output)["count"] == 1
 
     def test_dlq_json_envelope_error(self, runner, db_path):
-        """Error envelope has ok=false and error key."""
+        """Error envelope has ok=false and error key with context."""
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["dlq", "--db", db_path, "job", "FAKE"])
         assert result.exit_code == 1
         data = json.loads(result.output)
         assert data["ok"] is False
-        assert "error" in data
+        assert "FAKE" in data["error"]
         assert "data" not in data
