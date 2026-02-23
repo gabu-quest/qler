@@ -234,6 +234,23 @@ Lightweight health endpoint for worker observability via procler.
 - ✅ Human-readable + `--json` output; exit code 0 on success, 1 on failure
 - ✅ 18 tests (12 worker + 6 CLI)
 
+### M13: `qler tasks` Command ✅
+
+List registered tasks with their configuration.
+
+- ✅ `qler tasks` CLI command with `--app`/`--db`+`--module`, `--queue` filter, `--json`
+- ✅ Shows task path, queue, retries, rate limit, cron expression, active job count
+- ✅ Human table + JSON output formats
+- ✅ 9 tests
+
+### M14: v0.3.0 Release ✅
+
+Tag v0.3.0 with M9–M13 features.
+
+- ✅ Version bump to 0.3.0
+- ✅ CHANGELOG.md v0.3.0 entry
+- ✅ ROADMAP.md updated
+
 ---
 
 ## Future (v0.4+)
@@ -245,7 +262,6 @@ Lightweight health endpoint for worker observability via procler.
 | Payload encryption | Optional encryption for sensitive fields |
 | Per-task idempotency key generators | `idempotency_key=lambda order_id: f"charge:{order_id}"` |
 | `qler backup` command | Safe backup via SQLite backup API |
-| `qler tasks` command | List registered tasks with config |
 | logler db_source input validation | Sanitize user-supplied table names beyond SQL quoting; allowlist approach |
 | logler JsonHandler robustness | Graceful degradation when stream write fails mid-entry |
 | logler db_source temp file cleanup | Context manager API for automatic temp file cleanup on exception paths |

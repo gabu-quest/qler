@@ -2,6 +2,16 @@
 
 All notable changes to qler will be documented in this file.
 
+## [0.3.0] — 2026-02-23
+
+### Added
+
+- **Cron catchup** (M9) — recover missed cron runs on worker restart (`catchup="latest"` or `catchup=N`)
+- **Job dependencies** (M10) — `depends_on` parameter for job chaining with cascading cancel
+- **Dead letter queue** (M11) — auto-move failed jobs, replay, `qler dlq` CLI command group
+- **procler integration** (M12) — health endpoint for worker observability (`--health-port`, `--health-socket`)
+- **`qler tasks` command** (M13) — list registered tasks with config, rate limits, cron, active job counts
+
 ## [0.2.0] — 2026-02-18
 
 ### Added

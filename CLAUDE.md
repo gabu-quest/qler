@@ -1,6 +1,6 @@
 # Claude Context: qler
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Type:** Python library — background job queue on SQLite
 
 ---
@@ -20,12 +20,12 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 
 ## Project Status
 
-**Fully implemented.** v0.2.0 with cron scheduling, rate limiting, cooperative cancellation. 313 passing tests.
+**Fully implemented.** v0.3.0 with cron catchup, job dependencies, DLQ, health endpoint, tasks CLI. 468 passing tests.
 
 | File | Purpose |
 |------|---------|
-| `ROADMAP.md` | **Milestone tracker** — M-2 through M8 complete, M9+ planned |
-| `CHANGELOG.md` | Release history (v0.1.0, v0.2.0) |
+| `ROADMAP.md` | **Milestone tracker** — M-2 through M14 complete |
+| `CHANGELOG.md` | Release history (v0.1.0, v0.2.0, v0.3.0) |
 | `NORTH_STAR.md` | Vision, philosophy, non-negotiable principles |
 | `SPEC.md` | v0.1.0 MVP build spec (historical reference) |
 | `SQLER_GAPS.md` | sqler prerequisites (historical — all resolved) |
@@ -141,4 +141,4 @@ tests/
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — M0–M8 complete. M9–M11 planned for v0.3+.
+- [ROADMAP.md](./ROADMAP.md) — M0–M14 complete. v0.4+ planned.
