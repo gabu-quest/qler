@@ -7,7 +7,7 @@ from click.testing import CliRunner
 def test_import_qler():
     import qler
 
-    assert qler.__version__ == "0.2.0"
+    assert qler.__version__ == "0.3.0"
 
 
 def test_enums_importable():
@@ -132,4 +132,4 @@ def test_cli_entrypoint():
     runner = CliRunner()
     result = runner.invoke(cli, ["--version"])
     assert result.exit_code == 0
-    assert result.output.strip() == "qler, version 0.2.0"
+    assert result.output.strip() == "qler, version 0.3.0"
