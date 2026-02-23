@@ -1222,7 +1222,7 @@ class TestVersionHelp:
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
-        assert "0.2.0" in result.output
+        assert "0.3.0" in result.output
 
     def test_help(self, runner):
         result = runner.invoke(cli, ["--help"])
@@ -1233,7 +1233,7 @@ class TestVersionHelp:
         commands = [
             "init", "worker", "status", "jobs", "job",
             "attempts", "retry", "cancel", "purge", "doctor",
-            "dlq", "health",
+            "dlq", "health", "tasks",
         ]
         for cmd in commands:
             result = runner.invoke(cli, [cmd, "--help"])
@@ -1674,3 +1674,224 @@ class TestHealthCommand:
         result = runner.invoke(cli, ["health", "--help"])
         assert result.exit_code == 0
         assert "health endpoint" in result.output.lower()
+
+
+# -----------------------------------------------------------------------
+# qler tasks
+# -----------------------------------------------------------------------
+
+
+def _write_task_module(tmp_path: Path, filename: str, content: str) -> str:
+    """Write a temp Python module and return its import path."""
+    mod_file = tmp_path / filename
+    mod_file.write_text(content)
+    return str(tmp_path)
+
+
+class TestTasksCommand:
+    """Tests for `qler tasks` CLI command."""
+
+    def test_tasks_requires_app_or_db(self, runner):
+        result = runner.invoke(cli, ["tasks"])
+        assert result.exit_code == 2
+        assert "Either --db or --app is required" in result.output
+
+    def test_tasks_empty(self, runner, db_path):
+        """No tasks registered → informative message."""
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["tasks", "--db", db_path])
+        assert result.exit_code == 0
+        assert "No tasks registered" in result.output
+
+    def test_tasks_lists_registered(self, runner, tmp_path):
+        """Lists tasks with correct path, queue, config in human table."""
+        db_path = str(tmp_path / "test.db")
+        mod_dir = _write_task_module(tmp_path, "_tasks_app.py", f"""
+from qler import Queue, task
+
+q = Queue("{db_path}")
+
+@task(q, max_retries=3, retry_delay=10, priority=5)
+async def send_email():
+    pass
+
+@task(q, queue_name="urgent", sync=True)
+def process_sync():
+    pass
+""")
+        import sys
+        sys.path.insert(0, mod_dir)
+        try:
+            result = runner.invoke(cli, ["tasks", "--app", "_tasks_app:q"])
+            assert result.exit_code == 0
+            assert "send_email" in result.output
+            assert "process_sync" in result.output
+            assert "urgent" in result.output
+        finally:
+            sys.path.remove(mod_dir)
+            sys.modules.pop("_tasks_app", None)
+
+    def test_tasks_json_output(self, runner, tmp_path):
+        """JSON output has all expected fields with correct values."""
+        db_path = str(tmp_path / "test.db")
+        mod_dir = _write_task_module(tmp_path, "_tasks_json.py", f"""
+from qler import Queue, task
+
+q = Queue("{db_path}", default_max_retries=2, default_retry_delay=30)
+
+@task(q, max_retries=5, retry_delay=15, priority=10, lease_duration=600)
+async def my_task():
+    pass
+""")
+        import sys
+        sys.path.insert(0, mod_dir)
+        try:
+            result = runner.invoke(cli, ["tasks", "--app", "_tasks_json:q", "--json"])
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert isinstance(data, list)
+            assert len(data) == 1
+            t = data[0]
+            assert t["task"] == "_tasks_json.my_task"
+            assert t["queue"] == "default"
+            assert t["sync"] is False
+            assert t["max_retries"] == 5
+            assert t["retry_delay"] == 15
+            assert t["priority"] == 10
+            assert t["lease_duration"] == 600
+            assert t["rate_limit"] is None
+            assert t["cron"] is None
+            assert t["active_jobs"] == 0
+        finally:
+            sys.path.remove(mod_dir)
+            sys.modules.pop("_tasks_json", None)
+
+    def test_tasks_shows_rate_limit(self, runner, tmp_path):
+        """Rate-limited tasks show rate spec string."""
+        db_path = str(tmp_path / "test.db")
+        mod_dir = _write_task_module(tmp_path, "_tasks_rate.py", f"""
+from qler import Queue, task
+
+q = Queue("{db_path}")
+
+@task(q, rate_limit="10/m")
+async def rate_limited():
+    pass
+""")
+        import sys
+        sys.path.insert(0, mod_dir)
+        try:
+            result = runner.invoke(cli, ["tasks", "--app", "_tasks_rate:q", "--json"])
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert len(data) == 1
+            assert data[0]["rate_limit"] == "10/60s"
+        finally:
+            sys.path.remove(mod_dir)
+            sys.modules.pop("_tasks_rate", None)
+
+    def test_tasks_shows_cron(self, runner, tmp_path):
+        """Cron tasks show cron expression."""
+        db_path = str(tmp_path / "test.db")
+        mod_dir = _write_task_module(tmp_path, "_tasks_cron.py", f"""
+from qler import Queue, cron
+
+q = Queue("{db_path}")
+
+@cron(q, "*/5 * * * *")
+async def periodic_cleanup():
+    pass
+""")
+        import sys
+        sys.path.insert(0, mod_dir)
+        try:
+            result = runner.invoke(cli, ["tasks", "--app", "_tasks_cron:q", "--json"])
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert len(data) == 1
+            assert data[0]["cron"] == "*/5 * * * *"
+        finally:
+            sys.path.remove(mod_dir)
+            sys.modules.pop("_tasks_cron", None)
+
+    def test_tasks_active_job_count(self, runner, tmp_path):
+        """Active job count reflects pending+running jobs in DB."""
+        import asyncio
+
+        db_path = str(tmp_path / "test.db")
+        mod_dir = _write_task_module(tmp_path, "_tasks_count.py", f"""
+from qler import Queue, task
+
+q = Queue("{db_path}")
+
+@task(q)
+async def counted_task():
+    pass
+""")
+        import sys
+        sys.path.insert(0, mod_dir)
+        try:
+            # Pre-populate DB with jobs
+            async def _setup():
+                mod = __import__("_tasks_count")
+                q = mod.q
+                await q.init_db()
+                for _ in range(3):
+                    await q.enqueue(mod.counted_task.task_path)
+                await q.close()
+
+            asyncio.run(_setup())
+
+            result = runner.invoke(cli, ["tasks", "--app", "_tasks_count:q", "--json"])
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert len(data) == 1
+            assert data[0]["active_jobs"] == 3
+        finally:
+            sys.path.remove(mod_dir)
+            sys.modules.pop("_tasks_count", None)
+
+    def test_tasks_filter_by_queue(self, runner, tmp_path):
+        """--queue filters to tasks in that queue only."""
+        db_path = str(tmp_path / "test.db")
+        mod_dir = _write_task_module(tmp_path, "_tasks_filter.py", f"""
+from qler import Queue, task
+
+q = Queue("{db_path}")
+
+@task(q, queue_name="emails")
+async def send_email():
+    pass
+
+@task(q, queue_name="reports")
+async def generate_report():
+    pass
+""")
+        import sys
+        sys.path.insert(0, mod_dir)
+        try:
+            # Filter to emails only
+            result = runner.invoke(cli, [
+                "tasks", "--app", "_tasks_filter:q", "--json", "--queue", "emails"
+            ])
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert len(data) == 1
+            assert data[0]["task"] == "_tasks_filter.send_email"
+
+            # Filter to reports only
+            result = runner.invoke(cli, [
+                "tasks", "--app", "_tasks_filter:q", "--json", "--queue", "reports"
+            ])
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert len(data) == 1
+            assert data[0]["task"] == "_tasks_filter.generate_report"
+        finally:
+            sys.path.remove(mod_dir)
+            sys.modules.pop("_tasks_filter", None)
+
+    def test_tasks_has_help(self, runner):
+        result = runner.invoke(cli, ["tasks", "--help"])
+        assert result.exit_code == 0
+        assert "registered tasks" in result.output.lower()
