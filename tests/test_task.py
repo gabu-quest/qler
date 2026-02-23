@@ -177,22 +177,48 @@ class TestIdempotencyKeyFn:
         job2 = await wrapped.enqueue(42, 0)
         assert job1.ulid == job2.ulid
         assert job1.idempotency_key == "order:42"
+        assert job2.idempotency_key == "order:42"
+
+    async def test_key_fn_discriminates_different_args(self, queue):
+        """Different args produce different keys and different jobs."""
+        wrapped = task(
+            queue, idempotency_key=lambda x, y: f"order:{x}"
+        )(add_task)
+        job_a = await wrapped.enqueue(1, 0)
+        job_b = await wrapped.enqueue(2, 0)
+        assert job_a.ulid != job_b.ulid
+        assert job_a.idempotency_key == "order:1"
+        assert job_b.idempotency_key == "order:2"
 
     async def test_key_fn_with_kwargs(self, queue):
-        """Key fn receives kwargs correctly."""
+        """Key fn receives kwargs correctly and deduplicates."""
         wrapped = task(
             queue, idempotency_key=lambda x, y=0: f"add:{x}:{y}"
         )(add_task_default)
-        job = await wrapped.enqueue(1, y=2)
-        assert job.idempotency_key == "add:1:2"
+        job1 = await wrapped.enqueue(1, y=2)
+        assert job1.idempotency_key == "add:1:2"
+        job2 = await wrapped.enqueue(1, y=2)
+        assert job2.ulid == job1.ulid
 
     async def test_explicit_key_overrides_fn(self, queue):
         """Explicit _idempotency_key= takes precedence over fn."""
         wrapped = task(
             queue, idempotency_key=lambda x, y: f"auto:{x}"
         )(add_task)
-        job = await wrapped.enqueue(1, 2, _idempotency_key="manual:override")
-        assert job.idempotency_key == "manual:override"
+        job1 = await wrapped.enqueue(1, 2, _idempotency_key="manual:override")
+        assert job1.idempotency_key == "manual:override"
+        job2 = await wrapped.enqueue(1, 2, _idempotency_key="manual:override")
+        assert job2.ulid == job1.ulid
+
+    async def test_cancelled_job_does_not_block_reenqueue(self, queue):
+        """Cancelled job with same key allows re-enqueue."""
+        wrapped = task(queue, idempotency_key=lambda: "key-x")(noop_task)
+        job1 = await wrapped.enqueue()
+        assert job1.idempotency_key == "key-x"
+        await queue.cancel_job(job1)
+        job2 = await wrapped.enqueue()
+        assert job2.ulid != job1.ulid
+        assert job2.idempotency_key == "key-x"
 
     async def test_no_key_without_fn(self, queue):
         """No fn and no explicit key → no idempotency key (existing behavior)."""
