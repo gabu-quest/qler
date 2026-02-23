@@ -1233,7 +1233,7 @@ class TestVersionHelp:
         commands = [
             "init", "worker", "status", "jobs", "job",
             "attempts", "retry", "cancel", "purge", "doctor",
-            "dlq",
+            "dlq", "health",
         ]
         for cmd in commands:
             result = runner.invoke(cli, [cmd, "--help"])
@@ -1549,3 +1549,128 @@ class TestDLQCli:
         assert data["ok"] is False
         assert "FAKE" in data["error"]
         assert "data" not in data
+
+
+# -----------------------------------------------------------------------
+# qler health
+# -----------------------------------------------------------------------
+
+
+class TestHealthCommand:
+    """Tests for `qler health` CLI command."""
+
+    def test_health_requires_port_or_socket(self, runner):
+        result = runner.invoke(cli, ["health"])
+        assert result.exit_code == 2
+        assert "Either --port or --socket is required" in result.output
+
+    def test_health_rejects_both_port_and_socket(self, runner):
+        result = runner.invoke(cli, [
+            "health", "--port", "9100", "--socket", "/tmp/h.sock"
+        ])
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_health_connection_refused(self, runner):
+        """Connecting to a port with no listener → exit code 1."""
+        result = runner.invoke(cli, ["health", "--port", "19199"])
+        assert result.exit_code == 1
+        assert "Health check failed" in result.stderr
+
+    def test_health_tcp_json(self, runner):
+        """JSON output from a mocked health response."""
+        import socket as sock_mod
+
+        health_data = {
+            "status": "healthy",
+            "worker_id": "host:1:ABCD",
+            "uptime_seconds": 120,
+            "active_jobs": 2,
+            "concurrency": 4,
+            "queues": ["default", "priority"],
+            "started_at": 1708700000,
+        }
+        body = json.dumps(health_data)
+        response = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n"
+            f"{body}"
+        ).encode()
+
+        def mock_create_connection(address, timeout=None):
+            class FakeSocket:
+                def sendall(self, data): pass
+                def recv(self, size):
+                    if not hasattr(self, '_sent'):
+                        self._sent = True
+                        return response
+                    return b""
+                def close(self): pass
+                def settimeout(self, t): pass
+            return FakeSocket()
+
+        with patch("qler.cli.socket_mod.create_connection", mock_create_connection):
+            result = runner.invoke(cli, [
+                "health", "--port", "9100", "--json"
+            ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["status"] == "healthy"
+        assert data["worker_id"] == "host:1:ABCD"
+        assert data["uptime_seconds"] == 120
+        assert data["active_jobs"] == 2
+        assert data["concurrency"] == 4
+        assert data["queues"] == ["default", "priority"]
+        assert data["started_at"] == 1708700000
+
+    def test_health_tcp_human(self, runner):
+        """Human-readable output from a mocked health response."""
+        import socket as sock_mod
+
+        health_data = {
+            "status": "healthy",
+            "worker_id": "host:1:ABCD",
+            "uptime_seconds": 3661,
+            "active_jobs": 2,
+            "concurrency": 4,
+            "queues": ["default", "priority"],
+            "started_at": 1708700000,
+        }
+        body = json.dumps(health_data)
+        response = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n"
+            f"{body}"
+        ).encode()
+
+        def mock_create_connection(address, timeout=None):
+            class FakeSocket:
+                def sendall(self, data): pass
+                def recv(self, size):
+                    if not hasattr(self, '_sent'):
+                        self._sent = True
+                        return response
+                    return b""
+                def close(self): pass
+                def settimeout(self, t): pass
+            return FakeSocket()
+
+        with patch("qler.cli.socket_mod.create_connection", mock_create_connection):
+            result = runner.invoke(cli, [
+                "health", "--port", "9100"
+            ])
+        assert result.exit_code == 0
+        assert "healthy" in result.output
+        assert "host:1:ABCD" in result.output
+        assert "1h 1m 1s" in result.output
+        assert "2/4" in result.output
+        assert "default, priority" in result.output
+
+    def test_health_has_help(self, runner):
+        result = runner.invoke(cli, ["health", "--help"])
+        assert result.exit_code == 0
+        assert "health endpoint" in result.output.lower()
