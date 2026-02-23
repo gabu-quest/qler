@@ -1,6 +1,7 @@
 """Tests for the Worker class — init, execution, concurrency, shutdown, correlation."""
 
 import asyncio
+import json
 import re
 
 import pytest
@@ -686,3 +687,249 @@ class TestRetryExhaustion:
         assert attempts[0].attempt_number == 1
         assert attempts[1].status == AttemptStatus.FAILED.value
         assert attempts[1].attempt_number == 2
+
+
+# ---------------------------------------------------------------------------
+# TestHealthEndpoint
+# ---------------------------------------------------------------------------
+
+
+async def _http_get(host: str, port: int, path: str) -> tuple[int, dict]:
+    """Make an HTTP GET request and return (status_code, parsed_json_body)."""
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(f"GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+        await writer.drain()
+        data = await reader.read()
+        text = data.decode("utf-8")
+        status_line = text.split("\r\n", 1)[0]
+        status_code = int(status_line.split(" ", 2)[1])
+        body = text.split("\r\n\r\n", 1)[1]
+        return status_code, json.loads(body)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _unix_http_get(socket_path: str, path: str) -> tuple[int, dict]:
+    """Make an HTTP GET request over a Unix socket."""
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+    try:
+        writer.write(f"GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode())
+        await writer.drain()
+        data = await reader.read()
+        text = data.decode("utf-8")
+        status_line = text.split("\r\n", 1)[0]
+        status_code = int(status_line.split(" ", 2)[1])
+        body = text.split("\r\n\r\n", 1)[1]
+        return status_code, json.loads(body)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+class TestHealthEndpoint:
+    """Health endpoint: TCP and Unix socket, JSON response, lifecycle."""
+
+    def test_constructor_rejects_both_port_and_socket(self, worker_queue):
+        with pytest.raises(
+            ConfigurationError, match="mutually exclusive"
+        ):
+            Worker(worker_queue, health_port=9100, health_socket="/tmp/h.sock")
+
+    def test_constructor_rejects_invalid_port_zero(self, worker_queue):
+        with pytest.raises(
+            ConfigurationError, match="health_port must be between 1 and 65535"
+        ):
+            Worker(worker_queue, health_port=0)
+
+    def test_constructor_rejects_invalid_port_too_high(self, worker_queue):
+        with pytest.raises(
+            ConfigurationError, match="health_port must be between 1 and 65535"
+        ):
+            Worker(worker_queue, health_port=70000)
+
+    def test_status_property_before_run(self, worker_queue):
+        """Before run(), _running is False → status is 'draining'."""
+        w = _make_worker(worker_queue)
+        assert w.status == "draining"
+
+    def test_started_at_set_on_init(self, worker_queue):
+        before = now_epoch()
+        w = _make_worker(worker_queue)
+        after = now_epoch()
+        assert before <= w._started_at <= after
+
+    async def test_health_not_started_without_flag(self, worker_queue):
+        """No health server starts without explicit port/socket."""
+        w = _make_worker(worker_queue)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.sleep(0.05)
+        try:
+            # No health background task should exist (only lease renewal + recovery)
+            health_tasks = [
+                t for t in w._background_tasks
+                if "health" in (t.get_name() or "")
+            ]
+            # The health task won't have "health" in name by default, but
+            # the total count should be exactly 2 (lease renewal + recovery)
+            assert len(w._background_tasks) == 2
+        finally:
+            w._running = False
+            await asyncio.sleep(0.05)
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_health_tcp_responds(self, worker_queue):
+        """TCP health endpoint returns 200 with correct JSON fields."""
+        port = 19100
+        before = now_epoch()
+        w = _make_worker(worker_queue, health_port=port)
+        after = now_epoch()
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.sleep(0.15)  # Let server start
+
+        try:
+            status_code, data = await _http_get("127.0.0.1", port, "/health")
+            assert status_code == 200
+            assert data["status"] == "healthy"
+            assert data["worker_id"] == w.worker_id
+            assert data["concurrency"] == w.concurrency
+            assert data["queues"] == w.queues
+            assert data["active_jobs"] == 0
+            assert data["started_at"] == w._started_at
+            assert before <= data["started_at"] <= after
+            assert 0 <= data["uptime_seconds"] <= (now_epoch() - before) + 1
+        finally:
+            w._running = False
+            await asyncio.sleep(0.1)
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_health_unix_socket_responds(self, worker_queue, tmp_path):
+        """Unix socket health endpoint returns 200 with correct JSON."""
+        sock_path = str(tmp_path / "health.sock")
+        w = _make_worker(worker_queue, health_socket=sock_path)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.sleep(0.15)
+
+        try:
+            status_code, data = await _unix_http_get(sock_path, "/health")
+            assert status_code == 200
+            assert data["status"] == "healthy"
+            assert data["worker_id"] == w.worker_id
+            assert data["concurrency"] == w.concurrency
+            assert data["queues"] == w.queues
+        finally:
+            w._running = False
+            await asyncio.sleep(0.1)
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_health_unix_socket_cleanup(self, worker_queue, tmp_path):
+        """Socket file is removed after worker stops."""
+        sock_path = str(tmp_path / "health.sock")
+        w = _make_worker(worker_queue, health_socket=sock_path)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.sleep(0.15)
+
+        import pathlib
+        assert pathlib.Path(sock_path).exists()
+
+        w._running = False
+        await asyncio.sleep(0.2)
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+        # Give a moment for cleanup
+        await asyncio.sleep(0.1)
+        assert not pathlib.Path(sock_path).exists()
+
+    async def test_health_404_on_other_path(self, worker_queue):
+        """Non-/health path returns 404."""
+        port = 19101
+        w = _make_worker(worker_queue, health_port=port)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.sleep(0.15)
+
+        try:
+            status_code, data = await _http_get("127.0.0.1", port, "/other")
+            assert status_code == 404
+            assert data["error"] == "not found"
+        finally:
+            w._running = False
+            await asyncio.sleep(0.1)
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_health_draining_status(self, worker_queue):
+        """After _running = False, health response status becomes 'draining'.
+
+        Runs the health server loop directly (not via worker.run()) so
+        _running can be toggled without triggering the full shutdown sequence.
+        """
+        port = 19102
+        w = _make_worker(worker_queue, health_port=port)
+        w._running = True  # Simulate started state
+        health_task = asyncio.create_task(w._health_server_loop())
+        await asyncio.sleep(0.15)
+
+        try:
+            status_code, data = await _http_get("127.0.0.1", port, "/health")
+            assert data["status"] == "healthy"
+
+            w._running = False
+
+            status_code, data = await _http_get("127.0.0.1", port, "/health")
+            assert data["status"] == "draining"
+        finally:
+            health_task.cancel()
+            try:
+                await health_task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_health_response_active_jobs(self, worker_queue):
+        """active_jobs count reflects running work."""
+        port = 19103
+        wrapped = task(worker_queue)(slow_task)
+        job = await wrapped.enqueue(duration=2.0)
+
+        w = _make_worker(worker_queue, health_port=port)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.sleep(0.15)
+
+        try:
+            # Wait for job to be claimed
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if w._active_jobs:
+                    break
+            assert len(w._active_jobs) == 1
+
+            status_code, data = await _http_get("127.0.0.1", port, "/health")
+            assert status_code == 200
+            assert data["active_jobs"] == 1
+        finally:
+            w._running = False
+            await asyncio.sleep(0.1)
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass

@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import pathlib
 import signal
 import socket
 from contextlib import contextmanager
@@ -47,6 +48,8 @@ class Worker:
         poll_interval: float = 1.0,
         lease_recovery_interval: float = 60.0,
         shutdown_timeout: float = 30.0,
+        health_port: int | None = None,
+        health_socket: str | None = None,
     ) -> None:
         if queues is not None and len(queues) == 0:
             raise ConfigurationError("queues list must not be empty")
@@ -58,6 +61,14 @@ class Worker:
             raise ConfigurationError(
                 f"shutdown_timeout must be > 0, got {shutdown_timeout}"
             )
+        if health_port is not None and health_socket is not None:
+            raise ConfigurationError(
+                "health_port and health_socket are mutually exclusive"
+            )
+        if health_port is not None and not (1 <= health_port <= 65535):
+            raise ConfigurationError(
+                f"health_port must be between 1 and 65535, got {health_port}"
+            )
 
         self.queue = queue
         self.queues = queues or ["default"]
@@ -65,16 +76,124 @@ class Worker:
         self.poll_interval = poll_interval
         self.lease_recovery_interval = lease_recovery_interval
         self.shutdown_timeout = shutdown_timeout
+        self.health_port = health_port
+        self.health_socket = health_socket
 
         hostname = socket.gethostname()
         pid = os.getpid()
         self.worker_id = f"{hostname}:{pid}:{generate_ulid()}"
 
         self._running = False
+        self._started_at = now_epoch()
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._active_jobs: dict[str, Any] = {}  # ulid -> Job
         self._active_tasks: set[asyncio.Task] = set()
         self._background_tasks: list[asyncio.Task] = []
+
+    @property
+    def status(self) -> str:
+        """Return 'healthy' if running, 'draining' if shutting down."""
+        return "healthy" if self._running else "draining"
+
+    def _health_response(self) -> dict[str, Any]:
+        """Build the JSON health response from live instance state."""
+        return {
+            "status": self.status,
+            "worker_id": self.worker_id,
+            "uptime_seconds": now_epoch() - self._started_at,
+            "active_jobs": len(self._active_jobs),
+            "concurrency": self.concurrency,
+            "queues": self.queues,
+            "started_at": self._started_at,
+        }
+
+    async def _handle_health_request(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Minimal HTTP/1.1 handler for health checks."""
+        try:
+            async with asyncio.timeout(5.0):
+                request_line = await reader.readline()
+                # Consume remaining headers (capped to prevent abuse)
+                for _ in range(100):
+                    line = await reader.readline()
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+
+            decoded = request_line.decode("utf-8", errors="replace")
+            parts = decoded.strip().split()
+            path = parts[1] if len(parts) >= 2 else "/"
+
+            if path == "/health":
+                body = json.dumps(self._health_response())
+                response = (
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                    f"{body}"
+                )
+            else:
+                body = '{"error": "not found"}'
+                response = (
+                    f"HTTP/1.1 404 Not Found\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n"
+                    f"\r\n"
+                    f"{body}"
+                )
+
+            writer.write(response.encode())
+            await writer.drain()
+        except TimeoutError:
+            pass  # Slow client — silently drop
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def _health_server_loop(self) -> None:
+        """Start and run the health check server.
+
+        Keeps serving until cancelled (not until _running=False) so that
+        draining status can be queried by health probes during shutdown.
+        """
+        server: asyncio.AbstractServer | None = None
+        try:
+            if self.health_socket is not None:
+                # Remove stale socket from a previous crash
+                pathlib.Path(self.health_socket).unlink(missing_ok=True)
+                server = await asyncio.start_unix_server(
+                    self._handle_health_request, path=self.health_socket
+                )
+                logger.info(
+                    "Health endpoint listening on unix:%s", self.health_socket
+                )
+            else:
+                server = await asyncio.start_server(
+                    self._handle_health_request,
+                    host="127.0.0.1",
+                    port=self.health_port,
+                )
+                logger.info(
+                    "Health endpoint listening on 127.0.0.1:%d", self.health_port
+                )
+
+            # Serve until cancelled by _shutdown(). This means the health
+            # endpoint stays up during graceful drain so procler can see
+            # status="draining" instead of a connection refusal.
+            await asyncio.Future()  # block forever until cancelled
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if server is not None:
+                server.close()
+                await server.wait_closed()
+            if self.health_socket is not None:
+                sock_path = pathlib.Path(self.health_socket)
+                if sock_path.exists():
+                    sock_path.unlink()
 
     async def run(self) -> None:
         """Start the worker loop. Blocks until shutdown."""
@@ -106,6 +225,10 @@ class Worker:
             if self.queue._cron_tasks:
                 self._background_tasks.append(
                     asyncio.create_task(self._cron_scheduler_loop())
+                )
+            if self.health_port is not None or self.health_socket is not None:
+                self._background_tasks.append(
+                    asyncio.create_task(self._health_server_loop())
                 )
 
             # Main claim loop
