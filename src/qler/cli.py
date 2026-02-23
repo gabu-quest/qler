@@ -1155,6 +1155,7 @@ def tasks_cmd(
                     "lease_duration": tw.lease_duration,
                     "rate_limit": rate_str,
                     "cron": cron_expr,
+                    "idempotency_key": tw.idempotency_key_fn is not None,
                     "active_jobs": active_count,
                 })
             return tasks
