@@ -165,6 +165,73 @@ class TestTaskEnqueue:
         assert job.correlation_id == "req-abc"
 
 
+class TestIdempotencyKeyFn:
+    """Verify per-task idempotency key generation."""
+
+    async def test_key_fn_generates_key_and_deduplicates(self, queue):
+        """Key fn is called and its output used for dedup."""
+        wrapped = task(
+            queue, idempotency_key=lambda x, y: f"order:{x}"
+        )(add_task)
+        job1 = await wrapped.enqueue(42, 0)
+        job2 = await wrapped.enqueue(42, 0)
+        assert job1.ulid == job2.ulid
+        assert job1.idempotency_key == "order:42"
+
+    async def test_key_fn_with_kwargs(self, queue):
+        """Key fn receives kwargs correctly."""
+        wrapped = task(
+            queue, idempotency_key=lambda x, y=0: f"add:{x}:{y}"
+        )(add_task_default)
+        job = await wrapped.enqueue(1, y=2)
+        assert job.idempotency_key == "add:1:2"
+
+    async def test_explicit_key_overrides_fn(self, queue):
+        """Explicit _idempotency_key= takes precedence over fn."""
+        wrapped = task(
+            queue, idempotency_key=lambda x, y: f"auto:{x}"
+        )(add_task)
+        job = await wrapped.enqueue(1, 2, _idempotency_key="manual:override")
+        assert job.idempotency_key == "manual:override"
+
+    async def test_no_key_without_fn(self, queue):
+        """No fn and no explicit key → no idempotency key (existing behavior)."""
+        wrapped = task(queue)(noop_task)
+        job = await wrapped.enqueue()
+        assert job.idempotency_key is None
+
+    def test_non_callable_raises_configuration_error(self, queue):
+        """Non-callable idempotency_key raises ConfigurationError at decoration time."""
+        with pytest.raises(ConfigurationError, match="idempotency_key must be callable"):
+            task(queue, idempotency_key="not-a-function")(noop_task)
+
+    async def test_key_fn_exception_propagates(self, queue):
+        """Exception in key fn propagates to caller."""
+        def bad_key(*args, **kwargs):
+            raise ValueError("key generation failed")
+
+        wrapped = task(queue, idempotency_key=bad_key)(noop_task)
+        with pytest.raises(ValueError, match="key generation failed"):
+            await wrapped.enqueue()
+
+    async def test_key_fn_returns_non_string_raises_type_error(self, queue):
+        """Non-string return from key fn raises TypeError."""
+        wrapped = task(
+            queue, idempotency_key=lambda: 42
+        )(noop_task)
+        with pytest.raises(TypeError, match="must return str"):
+            await wrapped.enqueue()
+
+    async def test_idempotency_key_fn_attr_stored(self, queue):
+        """The idempotency_key_fn attribute is accessible on TaskWrapper."""
+        key_fn = lambda x: f"key:{x}"
+        wrapped = task(queue, idempotency_key=key_fn)(add_task)
+        assert wrapped.idempotency_key_fn is key_fn
+
+        wrapped_no_fn = task(queue)(noop_task)
+        assert wrapped_no_fn.idempotency_key_fn is None
+
+
 class TestTaskRunNow:
     """Verify TaskWrapper.run_now executes directly."""
 

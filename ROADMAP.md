@@ -251,17 +251,43 @@ Tag v0.3.0 with M9–M13 features.
 - ✅ CHANGELOG.md v0.3.0 entry
 - ✅ ROADMAP.md updated
 
+### M15: Per-Task Idempotency Key Generators ✅
+
+Custom idempotency key generation per task, so callers don't have to construct keys manually.
+
+- ✅ `@task(q, idempotency_key=lambda order_id: f"charge:{order_id}")`
+- ✅ Key function receives the same args/kwargs as the task
+- ✅ Explicit `_idempotency_key=` on `enqueue()` takes precedence over fn
+- ✅ Validation: callable check at decoration time, string check at call time
+- ✅ `qler tasks --json` shows `idempotency_key` boolean field
+- ✅ 8 tests
+
+### M16: `qler backup` Command ⬚
+
+Safe online backup of the qler SQLite database.
+
+- `qler backup --db <source> --to <destination>`
+- Uses SQLite backup API (`VACUUM INTO` or `sqlite3.backup()`)
+- Safe to run while workers are active (WAL mode)
+- `--json` output with backup metadata (size, duration)
+
+### M17: Web Dashboard ⬚
+
+Read-only + operational web dashboard for qler.
+
+- Vue 3 + Naive UI
+- Queue depths, job list, job detail, attempt history
+- Operational: retry, cancel, replay from DLQ
+- Separate package (`qler-dashboard`) or optional dependency
+
 ---
 
-## Future (v0.4+)
+## Future (v0.5+)
 
 | Feature | Notes |
 |---------|-------|
-| Web dashboard | Vue 3 + Naive UI (read-only + operational) |
 | Prometheus metrics | Export queue depths, throughput, failure rates |
 | Payload encryption | Optional encryption for sensitive fields |
-| Per-task idempotency key generators | `idempotency_key=lambda order_id: f"charge:{order_id}"` |
-| `qler backup` command | Safe backup via SQLite backup API |
 | logler db_source input validation | Sanitize user-supplied table names beyond SQL quoting; allowlist approach |
 | logler JsonHandler robustness | Graceful degradation when stream write fails mid-entry |
 | logler db_source temp file cleanup | Context manager API for automatic temp file cleanup on exception paths |
