@@ -30,6 +30,7 @@ class TaskWrapper:
         lease_duration: Optional[int] = None,
         sync: bool = False,
         rate_limit: Optional[str] = None,
+        idempotency_key: Optional[Callable[..., str]] = None,
     ) -> None:
         self.fn = fn
         self.queue = queue
@@ -41,6 +42,7 @@ class TaskWrapper:
         self.sync = sync
         self.task_path = f"{fn.__module__}.{fn.__qualname__}"
         self.rate_spec: Optional[RateSpec] = parse_rate(rate_limit) if rate_limit else None
+        self.idempotency_key_fn = idempotency_key
 
         # Register on queue
         queue._tasks[self.task_path] = self
@@ -85,6 +87,13 @@ class TaskWrapper:
         **kwargs: Any,
     ) -> "Job":
         """Enqueue this task for background execution."""
+        if _idempotency_key is None and self.idempotency_key_fn is not None:
+            _idempotency_key = self.idempotency_key_fn(*args, **kwargs)
+            if not isinstance(_idempotency_key, str):
+                raise TypeError(
+                    f"idempotency_key function must return str, "
+                    f"got {type(_idempotency_key).__name__}"
+                )
         return await self.queue.enqueue(
             self.task_path,
             args=args,
@@ -132,6 +141,7 @@ def task(
     lease_duration: Optional[int] = None,
     sync: bool = False,
     rate_limit: Optional[str] = None,
+    idempotency_key: Optional[Callable[..., str]] = None,
 ) -> Callable[[Callable], TaskWrapper]:
     """Decorator to register a function as a qler task.
 
@@ -144,10 +154,16 @@ def task(
         lease_duration: Default lease duration override.
         sync: If True, the function is synchronous and will be run via asyncio.to_thread.
         rate_limit: Rate limit spec (e.g., "10/m", "100/h"). None = unlimited.
+        idempotency_key: Callable that generates an idempotency key from task args/kwargs.
     """
     # Validate rate_limit early (fail at import time, not at enqueue time)
     if rate_limit is not None:
         parse_rate(rate_limit)
+
+    if idempotency_key is not None and not callable(idempotency_key):
+        raise ConfigurationError(
+            f"idempotency_key must be callable, got {type(idempotency_key).__name__}"
+        )
 
     def decorator(fn: Callable) -> TaskWrapper:
         # Reject nested functions (methods, closures, inner functions)
@@ -185,6 +201,7 @@ def task(
             lease_duration=lease_duration,
             sync=sync,
             rate_limit=rate_limit,
+            idempotency_key=idempotency_key,
         )
 
     return decorator
