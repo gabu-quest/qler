@@ -1724,9 +1724,26 @@ def process_sync():
         try:
             result = runner.invoke(cli, ["tasks", "--app", "_tasks_app:q"])
             assert result.exit_code == 0
-            assert "send_email" in result.output
-            assert "process_sync" in result.output
-            assert "urgent" in result.output
+            lines = result.output.strip().splitlines()
+            # Table: header + separator + 2 data rows
+            assert len(lines) == 4
+            # Column headers
+            assert "Task" in lines[0]
+            assert "Queue" in lines[0]
+            assert "Retries" in lines[0]
+            assert "Rate" in lines[0]
+            assert "Cron" in lines[0]
+            assert "Active" in lines[0]
+            # Separator line
+            assert "---" in lines[1]
+            # Find which row has each task and verify column values
+            email_row = next(l for l in lines[2:] if "send_email" in l)
+            sync_row = next(l for l in lines[2:] if "process_sync" in l)
+            # send_email: default queue, max_retries=3
+            assert "default" in email_row
+            assert "  3  " in email_row or email_row.split()[2] == "3"
+            # process_sync: urgent queue, max_retries=0 (queue default)
+            assert "urgent" in sync_row
         finally:
             sys.path.remove(mod_dir)
             sys.modules.pop("_tasks_app", None)
@@ -1815,7 +1832,7 @@ async def periodic_cleanup():
             sys.modules.pop("_tasks_cron", None)
 
     def test_tasks_active_job_count(self, runner, tmp_path):
-        """Active job count reflects pending+running jobs in DB."""
+        """Active job count reflects only pending+running, excludes completed/failed."""
         import asyncio
 
         db_path = str(tmp_path / "test.db")
@@ -1831,13 +1848,34 @@ async def counted_task():
         import sys
         sys.path.insert(0, mod_dir)
         try:
-            # Pre-populate DB with jobs
             async def _setup():
+                from sqler import F
+                from qler.enums import FailureKind
                 mod = __import__("_tasks_count")
                 q = mod.q
                 await q.init_db()
-                for _ in range(3):
-                    await q.enqueue(mod.counted_task.task_path)
+                task_path = mod.counted_task.task_path
+                now = now_epoch()
+                # 2 pending
+                await q.enqueue(task_path)
+                await q.enqueue(task_path)
+                # 1 completed (should NOT count)
+                j = await q.enqueue(task_path)
+                await Job.query().filter(
+                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.COMPLETED.value, finished_at=now, updated_at=now,
+                )
+                # 1 failed (should NOT count)
+                j2 = await q.enqueue(task_path)
+                await Job.query().filter(
+                    (F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.FAILED.value,
+                    last_error="err",
+                    last_failure_kind=FailureKind.EXCEPTION.value,
+                    finished_at=now, updated_at=now,
+                )
                 await q.close()
 
             asyncio.run(_setup())
@@ -1846,7 +1884,7 @@ async def counted_task():
             assert result.exit_code == 0
             data = json.loads(result.output)
             assert len(data) == 1
-            assert data[0]["active_jobs"] == 3
+            assert data[0]["active_jobs"] == 2  # only pending, not completed/failed
         finally:
             sys.path.remove(mod_dir)
             sys.modules.pop("_tasks_count", None)
@@ -1895,3 +1933,8 @@ async def generate_report():
         result = runner.invoke(cli, ["tasks", "--help"])
         assert result.exit_code == 0
         assert "registered tasks" in result.output.lower()
+        assert "--app" in result.output
+        assert "--db" in result.output
+        assert "--module" in result.output
+        assert "--queue" in result.output
+        assert "--json" in result.output
