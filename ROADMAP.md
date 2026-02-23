@@ -221,14 +221,18 @@ Configurable DLQ for permanently failed jobs.
 - ✅ Immediate mode respects DLQ configuration
 - ✅ 49 tests (26 core + 23 CLI)
 
-### M12: procler Integration ⬚
+### M12: procler Integration ✅
 
-Health endpoint, worker process definitions.
+Lightweight health endpoint for worker observability via procler.
 
-- procler process definition for `qler worker`
-- Health check endpoint (HTTP or Unix socket)
-- Worker heartbeat reporting
-- `procler` manages worker lifecycle (start, stop, restart)
+- ✅ Health endpoint: TCP (`--health-port`) or Unix socket (`--health-socket`), opt-in only
+- ✅ JSON response: status, worker_id, uptime, active_jobs, concurrency, queues, started_at
+- ✅ Status values: `"healthy"` (running) or `"draining"` (shutdown signal received)
+- ✅ Server stays up during drain so procler sees draining, not connection refused
+- ✅ Non-`/health` paths return 404; Unix socket file cleaned up on exit
+- ✅ `qler health` CLI command: queries a running worker's health endpoint (TCP or Unix)
+- ✅ Human-readable + `--json` output; exit code 0 on success, 1 on failure
+- ✅ 18 tests (12 worker + 6 CLI)
 
 ---
 
