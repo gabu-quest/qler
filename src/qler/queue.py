@@ -23,6 +23,7 @@ from qler.exceptions import (
 from qler.models.attempt import JobAttempt
 from qler.models.bucket import RateLimitBucket
 from qler.models.job import Job
+from qler.lifecycle import emit as _lifecycle
 from qler.rate_limit import RateSpec, parse_rate, try_acquire
 
 if TYPE_CHECKING:
@@ -344,6 +345,12 @@ class Queue:
         )
         await job.save()
 
+        _lifecycle(
+            "job.enqueued", job_id=job.ulid, queue=queue_name,
+            task=task_path, correlation_id=job.correlation_id,
+            priority=job.priority,
+        )
+
         if self._metrics:
             self._metrics.inc_enqueued(queue_name, task_path)
 
@@ -507,6 +514,11 @@ class Queue:
         for job in job_instances:
             if job._id is None:  # New job, not an existing idempotency match
                 await job.save()
+                _lifecycle(
+                    "job.enqueued", job_id=job.ulid, queue=job.queue_name,
+                    task=job.task, correlation_id=job.correlation_id,
+                    priority=job.priority, batch=True,
+                )
                 if self._metrics:
                     self._metrics.inc_enqueued(job.queue_name, job.task)
 
@@ -699,6 +711,12 @@ class Queue:
         )
         await attempt.save()
 
+        _lifecycle(
+            "job.claimed", job_id=job.ulid, queue=job.queue_name,
+            task=job.task, correlation_id=job.correlation_id,
+            worker_id=worker_id, attempt=job.attempts,
+        )
+
         if self._metrics:
             self._metrics.inc_claimed(job.queue_name, job.task)
 
@@ -793,6 +811,11 @@ class Queue:
         if updated is None:
             return  # Lost ownership
 
+        _lifecycle(
+            "job.completed", job_id=job.ulid, queue=job.queue_name,
+            task=job.task, correlation_id=job.correlation_id,
+        )
+
         if self._metrics:
             self._metrics.inc_completed(job.queue_name, job.task)
 
@@ -859,6 +882,20 @@ class Queue:
         if updated is None:
             return  # Lost ownership
 
+        if can_retry:
+            _lifecycle(
+                "job.retried", job_id=job.ulid, queue=job.queue_name,
+                task=job.task, correlation_id=job.correlation_id,
+                failure_kind=failure_kind.value, retry_count=job.retry_count + 1,
+                error=error_msg or "",
+            )
+        else:
+            _lifecycle(
+                "job.failed", job_id=job.ulid, queue=job.queue_name,
+                task=job.task, correlation_id=job.correlation_id,
+                failure_kind=failure_kind.value, error=error_msg or "",
+            )
+
         if self._metrics:
             if can_retry:
                 self._metrics.inc_retried(job.queue_name, job.task)
@@ -911,6 +948,11 @@ class Queue:
             )
             if job is None:
                 break
+
+            _lifecycle(
+                "job.lease_recovered", job_id=job.ulid, queue=job.queue_name,
+                task=job.task, correlation_id=job.correlation_id,
+            )
 
             # Terminalize the attempt as LEASE_EXPIRED
             await self._terminalize_attempt(

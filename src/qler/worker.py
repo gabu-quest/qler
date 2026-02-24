@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from qler._context import _current_job
+from qler.lifecycle import emit as _lifecycle
 from qler._time import generate_ulid, now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.exceptions import ConfigurationError
@@ -402,8 +403,13 @@ class Worker:
             await self.queue.complete_job(job, self.worker_id, result=result)
 
         finally:
+            duration = time.monotonic() - start_time
+            _lifecycle(
+                "job.executed", job_id=job.ulid, queue=job.queue_name,
+                task=job.task, correlation_id=job.correlation_id or job.ulid,
+                duration=round(duration, 4),
+            )
             if self.queue._metrics:
-                duration = time.monotonic() - start_time
                 self.queue._metrics.observe_duration(
                     job.queue_name, job.task, duration
                 )
