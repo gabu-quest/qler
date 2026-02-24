@@ -347,9 +347,27 @@ Optional metrics export for production observability.
 - ✅ Zero overhead when disabled (no `prometheus_client` import)
 - ✅ 20 tests
 
-### M23: v0.4.0 Release ⬚
+### M23: v0.4.0 Release ✅
 
-Tag v0.4.0 with M17–M22 features.
+Tag v0.4.0 with M15–M22 features.
+
+- ✅ Version bump to 0.4.0
+- ✅ CHANGELOG.md v0.4.0 entry
+- ✅ ROADMAP.md updated
+
+### M24: Structured Lifecycle Events (logler Integration) ⬚
+
+Emit structured log entries at every job lifecycle transition, aligned with Prometheus metric labels, so logler can query and correlate metric events without Prometheus.
+
+- Structured JSON log entries at enqueue, claim, complete, fail, retry, lease recovery
+- Labels aligned with Prometheus counters (queue, task, failure_kind, duration)
+- job_id and correlation_id on every event for logler correlation
+- Uses Python `logging` module so logler's CorrelationFilter/JsonHandler pick them up
+- Consistent event naming convention (`qler.job.enqueued`, `qler.job.completed`, etc.)
+
+### M25: v0.5.0 Release ⬚
+
+Tag v0.5.0 with M24.
 
 - Version bump, CHANGELOG, ROADMAP update
 
