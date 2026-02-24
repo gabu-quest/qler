@@ -966,7 +966,11 @@ class TestTimeout:
         w = _make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
-            await asyncio.sleep(2)
+            for _ in range(60):
+                await asyncio.sleep(0.1)
+                await job.refresh()
+                if job.status != JobStatus.RUNNING.value:
+                    break
         finally:
             w._running = False
             worker_task.cancel()
@@ -988,7 +992,11 @@ class TestTimeout:
         w = _make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
-            await asyncio.sleep(2)
+            for _ in range(60):
+                await asyncio.sleep(0.1)
+                await job.refresh()
+                if job.status != JobStatus.RUNNING.value:
+                    break
         finally:
             w._running = False
             worker_task.cancel()
@@ -1001,6 +1009,7 @@ class TestTimeout:
         # Should be pending (requeued for retry), not permanently failed
         assert job.status == JobStatus.PENDING.value
         assert job.retry_count == 1
+        assert job.last_failure_kind == FailureKind.TIMEOUT.value
 
     async def test_no_timeout_no_limit(self, worker_queue):
         """Task without timeout runs without time limit (existing behavior)."""
@@ -1014,6 +1023,18 @@ class TestTimeout:
         assert job.status == JobStatus.COMPLETED.value
         assert job.timeout is None
 
+    async def test_no_timeout_slow_task_completes(self, worker_queue):
+        """Slow task without timeout completes normally (no accidental global timeout)."""
+        wrapped = task(worker_queue)(slow_task)
+        job = await wrapped.enqueue(0.5)
+
+        w = _make_worker(worker_queue)
+        await _run_worker_until_job_done(w, job)
+
+        await job.refresh()
+        assert job.status == JobStatus.COMPLETED.value
+        assert job.result == "done"
+
     async def test_per_job_timeout_override(self, worker_queue):
         """Per-job _timeout overrides task default."""
         wrapped = task(worker_queue, timeout=60)(timeout_slow_task)
@@ -1025,7 +1046,11 @@ class TestTimeout:
         w = _make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
-            await asyncio.sleep(2)
+            for _ in range(60):
+                await asyncio.sleep(0.1)
+                await job.refresh()
+                if job.status != JobStatus.RUNNING.value:
+                    break
         finally:
             w._running = False
             worker_task.cancel()
@@ -1037,6 +1062,7 @@ class TestTimeout:
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
         assert job.last_failure_kind == FailureKind.TIMEOUT.value
+        assert "timed out after 1s" in job.last_error
 
     async def test_fast_task_within_timeout(self, worker_queue):
         """Task completing before timeout succeeds normally."""
@@ -1058,7 +1084,11 @@ class TestTimeout:
         w = _make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
-            await asyncio.sleep(2)
+            for _ in range(60):
+                await asyncio.sleep(0.1)
+                await job.refresh()
+                if job.status != JobStatus.RUNNING.value:
+                    break
         finally:
             w._running = False
             worker_task.cancel()
@@ -1083,7 +1113,11 @@ class TestTimeout:
         w = _make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
-            await asyncio.sleep(2)
+            for _ in range(60):
+                await asyncio.sleep(0.1)
+                await job.refresh()
+                if job.status != JobStatus.RUNNING.value:
+                    break
         finally:
             w._running = False
             worker_task.cancel()
@@ -1095,3 +1129,9 @@ class TestTimeout:
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
         assert job.last_failure_kind == FailureKind.TIMEOUT.value
+        assert "timed out" in job.last_error
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        assert len(attempts) == 1
+        assert attempts[0].status == AttemptStatus.FAILED.value
+        assert attempts[0].failure_kind == FailureKind.TIMEOUT.value
+        assert "timed out" in attempts[0].error
