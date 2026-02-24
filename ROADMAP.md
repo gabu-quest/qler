@@ -262,14 +262,16 @@ Custom idempotency key generation per task, so callers don't have to construct k
 - ✅ `qler tasks --json` shows `idempotency_key` boolean field
 - ✅ 8 tests
 
-### M16: `qler backup` Command ⬚
+### M16: `qler backup` Command ✅
 
 Safe online backup of the qler SQLite database.
 
-- `qler backup --db <source> --to <destination>`
-- Uses SQLite backup API (`VACUUM INTO` or `sqlite3.backup()`)
-- Safe to run while workers are active (WAL mode)
-- `--json` output with backup metadata (size, duration)
+- ✅ `qler backup --db <source> --to <destination> [--json]`
+- ✅ Uses sqler's `async_backup()` (SQLite backup API via `sqlite3.backup()`)
+- ✅ Safe to run while workers are active (WAL mode)
+- ✅ Refuses to overwrite existing destination (safety first)
+- ✅ `--json` output with BackupResult metadata (success, size, duration, paths)
+- ✅ 8 tests
 
 ### M17: Web Dashboard ⬚
 
