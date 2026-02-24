@@ -770,6 +770,8 @@ class Queue:
             update_fields["status"] = JobStatus.PENDING.value
             update_fields["eta"] = _calculate_retry_eta(job)
             update_fields["retry_count"] = job.retry_count + 1
+            update_fields["progress"] = None
+            update_fields["progress_message"] = ""
         else:
             update_fields["status"] = JobStatus.FAILED.value
             update_fields["finished_at"] = now
@@ -827,6 +829,8 @@ class Queue:
                 worker_id="",
                 lease_expires_at=None,
                 updated_at=now,
+                progress=None,
+                progress_message="",
             )
             if job is None:
                 break
@@ -926,6 +930,8 @@ class Queue:
             finished_at=None,
             eta=now,
             updated_at=now,
+            progress=None,
+            progress_message="",
         )
         return updated
 

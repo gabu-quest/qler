@@ -26,6 +26,41 @@ def current_job() -> "Job":
     return job
 
 
+async def set_progress(percent: int, message: str = "") -> None:
+    """Update the current job's progress (0–100) with optional message.
+
+    Writes directly to the database so callers can poll for updates.
+
+    Raises:
+        RuntimeError: If called outside a task execution context.
+        ValueError: If percent is not in 0–100 range.
+    """
+    from qler._time import now_epoch
+    from qler.models.job import Job
+    from sqler import F
+
+    if not isinstance(percent, int) or percent < 0 or percent > 100:
+        raise ValueError(f"progress must be an integer 0–100, got {percent!r}")
+
+    job = _current_job.get()
+    if job is None:
+        raise RuntimeError(
+            "set_progress() called outside of a task execution context. "
+            "This function can only be used inside a @task-decorated function."
+        )
+
+    await Job.query().filter(
+        (F("ulid") == job.ulid) & (F("worker_id") == job.worker_id)
+    ).update_one(
+        progress=percent,
+        progress_message=message,
+        updated_at=now_epoch(),
+    )
+    # Update local instance too
+    job.progress = percent
+    job.progress_message = message
+
+
 async def is_cancellation_requested() -> bool:
     """Check if the current job has cancellation requested. Queries the DB.
 
