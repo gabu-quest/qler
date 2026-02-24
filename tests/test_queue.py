@@ -483,7 +483,8 @@ class TestQueueClose:
 
         await q.close()
         # External DB should NOT be closed
-        assert q._db is not None or not q._owns_db
+        assert q._db is db
+        assert q._owns_db is False
 
     async def test_close_idempotent(self, tmp_path):
         db_path = str(tmp_path / "test_close2.db")
