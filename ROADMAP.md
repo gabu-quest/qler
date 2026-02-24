@@ -273,7 +273,7 @@ Safe online backup of the qler SQLite database.
 - ✅ `--json` output with BackupResult metadata (success, size, duration, paths)
 - ✅ 8 tests
 
-### M17: Job Timeouts ⬚
+### M17: Job Timeouts 🔄
 
 Per-task and per-job execution timeouts to prevent hung tasks from holding concurrency slots.
 

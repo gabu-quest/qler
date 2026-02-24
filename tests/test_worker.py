@@ -87,6 +87,22 @@ async def capture_no_correlation_task():
     return "ok"
 
 
+async def timeout_slow_task():
+    await asyncio.sleep(10)
+    return "should not reach"
+
+
+async def timeout_fast_task():
+    await asyncio.sleep(0.01)
+    return "fast"
+
+
+def timeout_sync_task():
+    import time
+    time.sleep(3)
+    return "should not reach"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -933,3 +949,149 @@ class TestHealthEndpoint:
                 await worker_task
             except asyncio.CancelledError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# TestTimeout
+# ---------------------------------------------------------------------------
+
+class TestTimeout:
+    """Job timeout enforcement via asyncio.wait_for."""
+
+    async def test_timeout_triggers_failure(self, worker_queue):
+        """Task exceeding timeout is failed with TIMEOUT failure kind."""
+        wrapped = task(worker_queue, timeout=1)(timeout_slow_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(worker_queue)
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.sleep(2)
+        finally:
+            w._running = False
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+        await job.refresh()
+        assert job.status == JobStatus.FAILED.value
+        assert job.last_failure_kind == FailureKind.TIMEOUT.value
+        assert "timed out" in job.last_error
+
+    async def test_timeout_is_retryable(self, worker_queue):
+        """Timed-out job is retried when max_retries allows it."""
+        wrapped = task(worker_queue, timeout=1, max_retries=2)(timeout_slow_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(worker_queue)
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.sleep(2)
+        finally:
+            w._running = False
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+        await job.refresh()
+        # Should be pending (requeued for retry), not permanently failed
+        assert job.status == JobStatus.PENDING.value
+        assert job.retry_count == 1
+
+    async def test_no_timeout_no_limit(self, worker_queue):
+        """Task without timeout runs without time limit (existing behavior)."""
+        wrapped = task(worker_queue)(timeout_fast_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(worker_queue)
+        await _run_worker_until_job_done(w, job)
+
+        await job.refresh()
+        assert job.status == JobStatus.COMPLETED.value
+        assert job.timeout is None
+
+    async def test_per_job_timeout_override(self, worker_queue):
+        """Per-job _timeout overrides task default."""
+        wrapped = task(worker_queue, timeout=60)(timeout_slow_task)
+        # Override with short timeout
+        job = await wrapped.enqueue(_timeout=1)
+
+        assert job.timeout == 1
+
+        w = _make_worker(worker_queue)
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.sleep(2)
+        finally:
+            w._running = False
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+        await job.refresh()
+        assert job.status == JobStatus.FAILED.value
+        assert job.last_failure_kind == FailureKind.TIMEOUT.value
+
+    async def test_fast_task_within_timeout(self, worker_queue):
+        """Task completing before timeout succeeds normally."""
+        wrapped = task(worker_queue, timeout=5)(timeout_fast_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(worker_queue)
+        await _run_worker_until_job_done(w, job)
+
+        await job.refresh()
+        assert job.status == JobStatus.COMPLETED.value
+        assert job.result == "fast"
+
+    async def test_timeout_attempt_recorded(self, worker_queue):
+        """Timed-out job creates a failed attempt with error details."""
+        wrapped = task(worker_queue, timeout=1)(timeout_slow_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(worker_queue)
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.sleep(2)
+        finally:
+            w._running = False
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+        await job.refresh()
+        attempts = await JobAttempt.query().filter(
+            F("job_ulid") == job.ulid
+        ).all()
+        assert len(attempts) == 1
+        assert attempts[0].status == AttemptStatus.FAILED.value
+        assert "timed out" in attempts[0].error
+
+    async def test_sync_task_timeout(self, worker_queue):
+        """Sync task (via to_thread) is also subject to timeout."""
+        wrapped = task(worker_queue, sync=True, timeout=1)(timeout_sync_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(worker_queue)
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.sleep(2)
+        finally:
+            w._running = False
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+        await job.refresh()
+        assert job.status == JobStatus.FAILED.value
+        assert job.last_failure_kind == FailureKind.TIMEOUT.value
