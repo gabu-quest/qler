@@ -323,14 +323,40 @@ class Worker:
                 )
                 return
 
-            # 4. Execute with correlation context
+            # 4. Execute with correlation context and optional timeout
             correlation_id = job.correlation_id or job.ulid
+            timeout = job.timeout
             try:
                 with correlation_context(correlation_id):
                     if task_wrapper.sync:
-                        result = await asyncio.to_thread(fn, *args, **kwargs)
+                        coro = asyncio.to_thread(fn, *args, **kwargs)
                     else:
-                        result = await fn(*args, **kwargs)
+                        coro = fn(*args, **kwargs)
+                    if timeout is not None:
+                        if task_wrapper.sync:
+                            # Sync tasks run in threads that can't be cancelled.
+                            # Shield prevents wait_for from blocking on cancellation.
+                            result = await asyncio.wait_for(
+                                asyncio.shield(coro), timeout=timeout
+                            )
+                        else:
+                            result = await asyncio.wait_for(coro, timeout=timeout)
+                    else:
+                        result = await coro
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Task %s timed out after %ss (job %s)",
+                    job.task, timeout, job.ulid,
+                )
+                await self.queue.fail_job(
+                    job,
+                    self.worker_id,
+                    TimeoutError(
+                        f"Task {job.task} timed out after {timeout}s"
+                    ),
+                    failure_kind=FailureKind.TIMEOUT,
+                )
+                return
             except asyncio.CancelledError:
                 logger.warning(
                     "Task %s cancelled (job %s), marking failed",

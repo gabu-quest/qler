@@ -25,6 +25,9 @@ class FailureKind(str, Enum):
     SIGNATURE_MISMATCH = "signature_mismatch"
     PAYLOAD_INVALID = "payload_invalid"
     CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
 
 
-RETRYABLE_FAILURES: frozenset[FailureKind] = frozenset({FailureKind.EXCEPTION})
+RETRYABLE_FAILURES: frozenset[FailureKind] = frozenset(
+    {FailureKind.EXCEPTION, FailureKind.TIMEOUT}
+)

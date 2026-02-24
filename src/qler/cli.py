@@ -1197,6 +1197,7 @@ def tasks_cmd(
                     "rate_limit": rate_str,
                     "cron": cron_expr,
                     "idempotency_key": tw.idempotency_key_fn is not None,
+                    "timeout": tw._timeout,
                     "active_jobs": active_count,
                 })
             return tasks
