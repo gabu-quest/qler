@@ -56,6 +56,8 @@ class Job(AsyncSQLerSafeModel):
     correlation_id: str = ""
     idempotency_key: Optional[str] = None
     timeout: Optional[int] = None
+    progress: Optional[int] = None
+    progress_message: str = ""
     cancel_requested: bool = False
     original_queue: str = ""
     dependencies: list[str] = []
@@ -223,6 +225,8 @@ class Job(AsyncSQLerSafeModel):
             retry_count=0,
             finished_at=None,
             updated_at=now,
+            progress=None,
+            progress_message="",
         )
         if updated is None:
             return False

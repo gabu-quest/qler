@@ -285,21 +285,27 @@ Per-task and per-job execution timeouts to prevent hung tasks from holding concu
 - ✅ `qler tasks --json` shows timeout config
 - ✅ 19 tests (8 config, 8 worker execution, 3 immediate mode)
 
-### M18: Batch Enqueue 🔄
+### M18: Batch Enqueue ✅
 
 Single-transaction bulk job creation for performance.
 
-- `Queue.enqueue_many(jobs)` — atomic batch insert
-- `TaskWrapper.delay_many(*arg_tuples)` — convenience wrapper
-- All-or-nothing validation (bad payload in batch → none created)
+- ✅ `Queue.enqueue_many(jobs)` — atomic batch insert
+- ✅ `TaskWrapper.enqueue_many(arg_list)` — convenience wrapper
+- ✅ All-or-nothing validation (bad payload in batch → none created)
+- ✅ Intra-batch dependency support
+- ✅ Idempotency key checking within batches
+- ✅ 15 tests (10 queue + 5 task wrapper)
 
-### M19: Job Progress ⬚
+### M19: Job Progress ✅
 
 Tasks report progress for long-running operations.
 
-- `current_job().set_progress(pct, message="")` — update from inside task
-- `progress` promoted column on Job model (0–100)
-- `qler job <id>` shows progress in output
+- ✅ `set_progress(percent, message="")` — async function, update from inside task
+- ✅ `progress` and `progress_message` fields on Job model
+- ✅ `qler job <id>` shows progress in human + JSON output
+- ✅ Progress reset on auto-retry, manual retry, and DLQ replay
+- ✅ Validation: integer 0–100, raises outside task context
+- ✅ 12 tests
 
 ### M20: Unique Jobs ⬚
 
