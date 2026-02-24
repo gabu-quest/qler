@@ -23,7 +23,7 @@ from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
