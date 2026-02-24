@@ -141,4 +141,4 @@ tests/
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — M0–M16 complete. M17–M23 (v0.4) planned.
+- [ROADMAP.md](./ROADMAP.md) — M0–M21 complete. M22–M23 (v0.4) planned.
