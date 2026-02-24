@@ -18,6 +18,7 @@ from qler.exceptions import (
     TaskNotRegisteredError,
 )
 from qler.models import Job, JobAttempt
+from qler.metrics import QlerMetrics
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
@@ -28,6 +29,7 @@ __all__ = [
     "__version__",
     # Core
     "Queue",
+    "QlerMetrics",
     "Worker",
     "task",
     "cron",
