@@ -355,15 +355,17 @@ Tag v0.4.0 with M15–M22 features.
 - ✅ CHANGELOG.md v0.4.0 entry
 - ✅ ROADMAP.md updated
 
-### M24: Structured Lifecycle Events (logler Integration) ⬚
+### M24: Structured Lifecycle Events (logler Integration) ✅
 
 Emit structured log entries at every job lifecycle transition, aligned with Prometheus metric labels, so logler can query and correlate metric events without Prometheus.
 
-- Structured JSON log entries at enqueue, claim, complete, fail, retry, lease recovery
-- Labels aligned with Prometheus counters (queue, task, failure_kind, duration)
-- job_id and correlation_id on every event for logler correlation
-- Uses Python `logging` module so logler's CorrelationFilter/JsonHandler pick them up
-- Consistent event naming convention (`qler.job.enqueued`, `qler.job.completed`, etc.)
+- ✅ `qler.lifecycle` logger with `emit()` helper — standard fields (event, job_id, queue, task, correlation_id) + per-event extras
+- ✅ Always-on: fires via Python `logging` regardless of Prometheus config (~200ns overhead when no handler attached)
+- ✅ 7 events: `job.enqueued`, `job.claimed`, `job.completed`, `job.failed`, `job.retried`, `job.lease_recovered`, `job.executed`
+- ✅ Labels aligned with Prometheus counters (queue, task, failure_kind, duration)
+- ✅ job_id and correlation_id on every event for logler correlation
+- ✅ logler fix: CorrelationFilter preserves explicit correlation_id; JsonHandler forwards extra fields to JSON
+- ✅ 15 tests
 
 ### M25: v0.5.0 Release ⬚
 
