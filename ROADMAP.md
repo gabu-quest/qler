@@ -322,18 +322,16 @@ Prevent duplicate pending/running jobs for the same task.
 - ✅ `qler tasks --json` shows `unique`/`unique_key` fields
 - ✅ 19 tests
 
-### BUG: Lease expiry doesn't reset progress fields
-
-`recover_expired_leases()` in `queue.py` resets a RUNNING job back to PENDING but does NOT clear `progress`/`progress_message`. Auto-retry, manual retry, and DLQ replay all reset progress — lease expiry is the odd one out. A recovered job will carry stale progress into its next attempt.
-
-**Fix:** Add `progress=None, progress_message=""` to the `update_one()` call in `recover_expired_leases()`. Add a regression test.
-
-### M21: `qler logs` ⬚
+### M21: `qler logs` ✅
 
 Bridge CLI to logler for job-correlated log viewing.
 
-- `qler logs <job_id>` — show logs by correlation_id via logler API
-- Graceful fallback if logler not installed
+- ✅ `qler logs <job_id> --db <db>` — show logs matching job ULID via logler
+- ✅ Searches `db_to_jsonl()` output for ULID (matches both job and attempt records)
+- ✅ `--level` filter, `--limit`, `--json` output
+- ✅ Graceful fallback if logler not installed (helpful error message)
+- ✅ Correlation ID tip shown in human output when present
+- ✅ 5 tests
 
 ### M22: Prometheus Metrics ⬚
 

@@ -1403,7 +1403,7 @@ class TestVersionHelp:
         commands = [
             "init", "backup", "worker", "status", "jobs", "job",
             "attempts", "retry", "cancel", "purge", "doctor",
-            "dlq", "health", "tasks",
+            "dlq", "health", "tasks", "logs",
         ]
         for cmd in commands:
             result = runner.invoke(cli, [cmd, "--help"])
@@ -2109,3 +2109,102 @@ async def generate_report():
         assert "--module" in result.output
         assert "--queue" in result.output
         assert "--json" in result.output
+
+
+# -----------------------------------------------------------------------
+# qler logs
+# -----------------------------------------------------------------------
+
+
+logler = pytest.importorskip("logler")
+
+
+@pytest.fixture
+def logs_db(tmp_path):
+    """Create an on-disk DB with a completed job (job + attempt records)."""
+    import asyncio
+
+    db_path = str(tmp_path / "logs-test.db")
+
+    async def _setup():
+        q = Queue(db_path)
+        await q.init_db()
+        j = await q.enqueue(
+            "myapp.tasks.greet",
+            queue_name="default",
+            correlation_id="corr-123",
+        )
+        claimed = await q.claim_job("w1", ["default"])
+        await q.complete_job(claimed, "w1", result="ok")
+        await q.close()
+        return j.ulid
+
+    ulid = asyncio.run(_setup())
+    return db_path, ulid
+
+
+class TestLogs:
+    """Tests for `qler logs` CLI command."""
+
+    def test_logs_json_shows_job_entries(self, runner, logs_db):
+        db_path, ulid = logs_db
+        result = runner.invoke(cli, ["logs", ulid, "--db", db_path, "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        # Fixture creates 1 job + 1 attempt → logler maps both tables;
+        # each row with ULID in the message template matches.
+        assert len(data["results"]) == data["total_matches"]
+        assert data["total_matches"] >= 2  # at least job + attempt records
+        for r in data["results"]:
+            assert ulid in r["entry"]["message"]
+
+    def test_logs_human_output(self, runner, logs_db):
+        db_path, ulid = logs_db
+        result = runner.invoke(cli, ["logs", ulid, "--db", db_path])
+        assert result.exit_code == 0
+        assert ulid in result.output
+        assert "entries found" in result.output
+        assert "Correlation ID: corr-123" in result.output
+
+    def test_logs_job_not_found(self, runner, db_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        result = runner.invoke(cli, ["logs", "NONEXISTENT", "--db", db_path])
+        assert result.exit_code == 1
+        assert "not found" in result.output
+
+    def test_logs_level_filter_positive(self, runner, logs_db):
+        db_path, ulid = logs_db
+        # DB-sourced entries are INFO — filtering to INFO should find them
+        result = runner.invoke(cli, [
+            "logs", ulid, "--db", db_path, "--json", "--level", "INFO"
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["total_matches"] >= 2
+
+    def test_logs_level_filter_negative(self, runner, logs_db):
+        db_path, ulid = logs_db
+        # Filter to ERROR — no entries should match
+        result = runner.invoke(cli, [
+            "logs", ulid, "--db", db_path, "--json", "--level", "ERROR"
+        ])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["total_matches"] == 0
+
+    def test_logs_missing_logler(self, runner, db_path):
+        """When logler is not importable, exit code 1 with helpful message."""
+        import builtins
+
+        runner.invoke(cli, ["init", "--db", db_path])
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name.startswith("logler"):
+                raise ImportError("No module named 'logler'")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=fake_import):
+            result = runner.invoke(cli, ["logs", "FAKE", "--db", db_path])
+        assert result.exit_code == 1
+        assert "logler is required" in result.output
