@@ -163,6 +163,9 @@ def _job_to_dict(job: Job) -> dict[str, Any]:
         "last_attempt_id": job.last_attempt_id,
         "correlation_id": job.correlation_id,
         "idempotency_key": job.idempotency_key,
+        "timeout": job.timeout,
+        "progress": job.progress,
+        "progress_message": job.progress_message,
         "cancel_requested": job.cancel_requested,
         "original_queue": job.original_queue,
         "dependencies": job.dependencies,
@@ -624,6 +627,11 @@ def job(ulid: str, db: str, output_json: bool) -> None:
         click.echo(f"Worker:          {result.worker_id or '-'}")
         click.echo(f"Correlation ID:  {result.correlation_id or '-'}")
         click.echo(f"Idempotency key: {result.idempotency_key or '-'}")
+        if result.progress is not None:
+            progress_str = f"{result.progress}%"
+            if result.progress_message:
+                progress_str += f" — {result.progress_message}"
+            click.echo(f"Progress:        {progress_str}")
         if result.cancel_requested:
             click.echo(f"Cancel req:      Yes")
         if result.dependencies:
