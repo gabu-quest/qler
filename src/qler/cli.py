@@ -163,6 +163,7 @@ def _job_to_dict(job: Job) -> dict[str, Any]:
         "last_attempt_id": job.last_attempt_id,
         "correlation_id": job.correlation_id,
         "idempotency_key": job.idempotency_key,
+        "unique_key": job.unique_key,
         "timeout": job.timeout,
         "progress": job.progress,
         "progress_message": job.progress_message,
@@ -1206,6 +1207,8 @@ def tasks_cmd(
                     "cron": cron_expr,
                     "idempotency_key": tw.idempotency_key_fn is not None,
                     "timeout": tw._timeout,
+                    "unique": tw._unique or tw.unique_key_fn is not None,
+                    "unique_key": tw.unique_key_fn is not None,
                     "active_jobs": active_count,
                 })
             return tasks

@@ -32,6 +32,8 @@ class TaskWrapper:
         rate_limit: Optional[str] = None,
         idempotency_key: Optional[Callable[..., str]] = None,
         timeout: Optional[int] = None,
+        unique: bool = False,
+        unique_key: Optional[Callable[..., str]] = None,
     ) -> None:
         self.fn = fn
         self.queue = queue
@@ -41,6 +43,8 @@ class TaskWrapper:
         self._priority = priority
         self._lease_duration = lease_duration
         self._timeout = timeout
+        self._unique = unique
+        self.unique_key_fn = unique_key
         self.sync = sync
         self.task_path = f"{fn.__module__}.{fn.__qualname__}"
         self.rate_spec: Optional[RateSpec] = parse_rate(rate_limit) if rate_limit else None
@@ -87,6 +91,7 @@ class TaskWrapper:
         _correlation_id: Optional[str] = None,
         _depends_on: Optional[list[str]] = None,
         _timeout: Optional[int] = None,
+        _unique_key: Optional[str] = None,
         **kwargs: Any,
     ) -> "Job":
         """Enqueue this task for background execution."""
@@ -97,6 +102,17 @@ class TaskWrapper:
                     f"idempotency_key function must return str, "
                     f"got {type(_idempotency_key).__name__}"
                 )
+        # Compute unique_key if not explicitly provided
+        if _unique_key is None:
+            if self.unique_key_fn is not None:
+                _unique_key = self.unique_key_fn(*args, **kwargs)
+                if not isinstance(_unique_key, str):
+                    raise TypeError(
+                        f"unique_key function must return str, "
+                        f"got {type(_unique_key).__name__}"
+                    )
+            elif self._unique:
+                _unique_key = self.task_path
         return await self.queue.enqueue(
             self.task_path,
             args=args,
@@ -112,6 +128,7 @@ class TaskWrapper:
             correlation_id=_correlation_id,
             depends_on=_depends_on,
             timeout=_timeout if _timeout is not None else self._timeout,
+            unique_key=_unique_key,
         )
 
     async def enqueue_many(
@@ -158,6 +175,21 @@ class TaskWrapper:
                     )
                 spec["idempotency_key"] = key
 
+            # Apply unique_key function if set and no explicit key
+            if "unique_key" not in spec:
+                if self.unique_key_fn is not None:
+                    args = spec.get("args", ())
+                    kwargs = spec.get("kwargs", {})
+                    ukey = self.unique_key_fn(*args, **kwargs)
+                    if not isinstance(ukey, str):
+                        raise TypeError(
+                            f"unique_key function must return str, "
+                            f"got {type(ukey).__name__}"
+                        )
+                    spec["unique_key"] = ukey
+                elif self._unique:
+                    spec["unique_key"] = self.task_path
+
             jobs.append(spec)
 
         return await self.queue.enqueue_many(jobs)
@@ -195,6 +227,8 @@ def task(
     rate_limit: Optional[str] = None,
     idempotency_key: Optional[Callable[..., str]] = None,
     timeout: Optional[int] = None,
+    unique: bool = False,
+    unique_key: Optional[Callable[..., str]] = None,
 ) -> Callable[[Callable], TaskWrapper]:
     """Decorator to register a function as a qler task.
 
@@ -209,6 +243,8 @@ def task(
         rate_limit: Rate limit spec (e.g., "10/m", "100/h"). None = unlimited.
         idempotency_key: Callable that generates an idempotency key from task args/kwargs.
         timeout: Execution timeout in seconds. None = no limit.
+        unique: If True, at most one PENDING/RUNNING job per task_path+queue.
+        unique_key: Callable that generates a uniqueness key from task args/kwargs.
     """
     # Validate rate_limit early (fail at import time, not at enqueue time)
     if rate_limit is not None:
@@ -222,6 +258,16 @@ def task(
     if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
         raise ConfigurationError(
             f"timeout must be a positive integer, got {timeout!r}"
+        )
+
+    if unique and unique_key is not None:
+        raise ConfigurationError(
+            "unique and unique_key are mutually exclusive — use one or the other"
+        )
+
+    if unique_key is not None and not callable(unique_key):
+        raise ConfigurationError(
+            f"unique_key must be callable, got {type(unique_key).__name__}"
         )
 
     def decorator(fn: Callable) -> TaskWrapper:
@@ -262,6 +308,8 @@ def task(
             rate_limit=rate_limit,
             idempotency_key=idempotency_key,
             timeout=timeout,
+            unique=unique,
+            unique_key=unique_key,
         )
 
     return decorator
