@@ -126,6 +126,21 @@ class TestRecoverExpiredLeases:
             assert j.worker_id == ""
 
 
+    async def test_recover_expired_lease_resets_progress(self, queue):
+        """Progress fields are cleared when a lease-expired job is recovered."""
+        job = await _make_running_job(queue, lease_offset=-10)
+        # Set progress on the running job
+        await Job.query().filter(F("ulid") == job.ulid).update_one(
+            progress=75, progress_message="three quarters"
+        )
+        recovered = await queue.recover_expired_leases()
+        assert recovered == 1
+        refreshed = await Job.query().filter(F("ulid") == job.ulid).first()
+        assert refreshed.status == JobStatus.PENDING.value
+        assert refreshed.progress is None
+        assert refreshed.progress_message == ""
+
+
 class TestRenewLease:
     """Job.renew_lease() tests."""
 
