@@ -298,6 +298,7 @@ class TestDLQReplay:
 
     async def test_replay_preserves_attempt_history(self, dlq_queue):
         """Replay does not delete attempt records."""
+        from qler.enums import AttemptStatus
         from qler.models.attempt import JobAttempt
 
         dlq_job = await self._make_dlq_job(dlq_queue)
@@ -312,6 +313,8 @@ class TestDLQReplay:
             F("job_ulid") == dlq_job.ulid
         ).all()
         assert len(attempts_after) == 1  # unchanged
+        assert attempts_after[0].status == AttemptStatus.FAILED.value
+        assert attempts_after[0].error == "boom"
 
     async def test_replay_defaults_to_default_queue(self, dlq_queue):
         """If original_queue is empty, replay falls back to 'default'."""

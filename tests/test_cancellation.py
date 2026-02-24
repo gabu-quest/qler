@@ -359,7 +359,7 @@ class TestCliCancelRunning:
 
         ulid = asyncio.run(_setup())
         result = runner.invoke(cli, ["cancel", ulid, "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 1
         assert "running" in result.output.lower()
         assert "--running" in result.output
 
@@ -414,5 +414,5 @@ class TestCliCancelRunning:
         """qler cancel <nonexistent> → error."""
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["cancel", "nonexistent-ulid", "--db", db_path])
-        assert result.exit_code != 0
+        assert result.exit_code == 1
         assert "not found" in result.output.lower()

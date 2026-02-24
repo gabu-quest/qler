@@ -183,7 +183,7 @@ class TestClaimRateLimit:
         assert len(remaining) == 2
         # At least one should have a future ETA (delayed)
         future_etas = [j for j in remaining if j.eta > j1.eta]
-        assert len(future_etas) >= 1
+        assert len(future_etas) == 1
 
     async def test_rate_limit_allows(self, queue):
         """With tokens available, job is claimed normally."""

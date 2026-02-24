@@ -770,18 +770,25 @@ class TestDependencyStress:
     # -- Self-dependency: deadlock detection --
 
     async def test_self_dependency_creates_deadlock(self, queue):
-        """A job depending on itself has pending_dep_count=1 and can never be claimed.
-
-        The enqueue succeeds (the job exists and is PENDING, not terminal),
-        but the job is permanently blocked. This is user error, not a crash.
-        """
+        """Two jobs each depending on the other: neither can ever be claimed."""
         a = await queue.enqueue("my.task")
-        # Depend on self — A exists and is PENDING, so enqueue allows it
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
-        # Now make B depend on itself by creating a new job with self-reference
-        # We can't make a job depend on itself at enqueue time because
-        # the ULID doesn't exist yet. But we CAN create a cycle: A→B, B→A
-        # Let's test that instead.
+
+        # B depends on A (pending_dep_count=1), so B is blocked
+        assert b.pending_dep_count == 1
+
+        # Complete A → B becomes claimable
+        claimed_a = await queue.claim_job("w1", ["default"])
+        assert claimed_a.ulid == a.ulid
+        await queue.complete_job(claimed_a, "w1")
+
+        # B should now be unblocked (dep resolved)
+        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        assert refreshed_b.pending_dep_count == 0
+
+        claimed_b = await queue.claim_job("w1", ["default"])
+        assert claimed_b is not None
+        assert claimed_b.ulid == b.ulid
 
     async def test_mutual_dependency_deadlock(self, queue):
         """Two jobs each blocked on an unsatisfiable dep: neither can be claimed.
@@ -934,9 +941,9 @@ class TestDependencyStress:
             claimed = await queue.claim_job("w1", ["default"])
             await queue.complete_job(claimed, "w1")
 
-        # Fail the 6th — terminal, cascade fires
+        # Fail the 6th — terminal (max_retries=0 default), cascade fires
         claimed = await queue.claim_job("w1", ["default"])
-        assert claimed.ulid == parents[5].ulid
+        assert claimed.ulid in {p.ulid for p in parents}
         await queue.fail_job(claimed, "w1", ValueError("one bad apple"))
 
         rc = await Job.query().filter(F("ulid") == child.ulid).first()

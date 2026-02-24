@@ -135,7 +135,6 @@ class TestImmediateHappyPath:
         assert job.status == JobStatus.COMPLETED.value
         assert job.result == 5
         assert job.attempts == 1
-        assert job.finished_at > 0
         assert job.finished_at >= job.created_at
 
     async def test_result_property_dict(self, imm_queue):
@@ -166,7 +165,7 @@ class TestImmediateHappyPath:
         # Immediate mode executes regardless of delay
         assert job.status == JobStatus.COMPLETED.value
         assert job.result == "done"
-        assert job.eta > 0
+        assert job.eta >= job.created_at
 
 
 class TestImmediateFailure:
@@ -179,7 +178,7 @@ class TestImmediateFailure:
         assert job.status == JobStatus.FAILED.value
         assert "kaboom" in job.last_error
         assert job.last_failure_kind == FailureKind.EXCEPTION.value
-        assert job.finished_at > 0
+        assert job.finished_at >= job.created_at
 
     async def test_failure_with_retries(self, imm_queue):
         wrapper = imm_queue._tasks[f"{__name__}.flaky_task"]
@@ -197,9 +196,8 @@ class TestImmediateFailure:
         # complete_job detects non-serializable result and calls fail_job
         assert job.status == JobStatus.FAILED.value
         assert job.last_failure_kind == FailureKind.EXCEPTION.value
-        assert job.last_error is not None
-        assert "serializable" in job.last_error.lower() or "JSON" in job.last_error
-        assert job.finished_at > 0
+        assert "is not JSON serializable" in job.last_error
+        assert job.finished_at >= job.created_at
 
 
 class TestImmediateSyncTask:
@@ -265,8 +263,7 @@ class TestImmediateAttemptRecord:
         assert attempt.status == AttemptStatus.COMPLETED.value
         assert attempt.worker_id == "__immediate__"
         assert attempt.attempt_number == 1
-        assert attempt.started_at > 0
-        assert attempt.finished_at > 0
+        assert attempt.started_at >= job.created_at
         assert attempt.finished_at >= attempt.started_at
 
     async def test_failed_attempt_record(self, imm_queue):
@@ -284,7 +281,7 @@ class TestImmediateAttemptRecord:
         assert "oops" in attempt.error
         assert attempt.traceback is not None
         assert "RuntimeError" in attempt.traceback
-        assert attempt.finished_at > 0
+        assert attempt.finished_at >= attempt.started_at
 
 
 class TestImmediateCorrelation:
@@ -345,8 +342,7 @@ class TestImmediateRetryExhaustion:
         assert job.status == JobStatus.FAILED.value
         assert job.retry_count == 1
         assert job.last_failure_kind == FailureKind.EXCEPTION.value
-        assert job.finished_at is not None
-        assert job.finished_at > 0
+        assert job.finished_at >= job.created_at
 
 
 class TestImmediateIdempotencyAfterCancellation:

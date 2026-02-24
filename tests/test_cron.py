@@ -252,7 +252,7 @@ async def test_cron_scheduler_loop_enqueues(queue):
     all_jobs = await Job.query().filter(
         F("task") == wrapped.task_path
     ).all()
-    assert len(all_jobs) >= 1
+    assert len(all_jobs) == 1
 
 
 async def test_cron_timezone():
@@ -482,11 +482,9 @@ async def test_catchup_enqueues_missed(queue):
     all_jobs = await Job.query().filter(
         F("task") == wrapped.task_path
     ).all()
-    # At minimum: original seed + at least 1 catchup job
-    assert len(all_jobs) >= 2
-    # All should have cron idempotency keys
+    # Seed + catchup: 4 hours of hourly runs = seed + 3 catchups = 4, but timing can vary ±1
+    assert 3 <= len(all_jobs) <= 5
     for job in all_jobs:
-        assert job.idempotency_key is not None
         assert job.idempotency_key.startswith(f"cron:{wrapped.task_path}:")
 
 
@@ -557,8 +555,7 @@ async def test_catchup_idempotent(queue):
     all_jobs = await Job.query().filter(
         F("task") == wrapped.task_path
     ).all()
-    # Guard: at least seed + 1 catchup job exist
-    assert len(all_jobs) >= 2
+    assert 2 <= len(all_jobs) <= 4  # seed + 1-2 catchups + possible normal tick
     # No duplicate idempotency keys
     keys = [j.idempotency_key for j in all_jobs]
     assert len(keys) == len(set(keys))
@@ -573,8 +570,8 @@ async def test_catchup_no_history_skips(queue):
     all_jobs = await Job.query().filter(
         F("task") == wrapped.task_path
     ).all()
-    # Should have at most 1-2 jobs (from normal scheduling), not a flood
-    assert len(all_jobs) <= 2
+    # Should have exactly 1 job (from normal scheduling), not a flood
+    assert len(all_jobs) == 1
 
 
 async def test_catchup_latest_picks_most_recent(queue):

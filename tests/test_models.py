@@ -101,7 +101,7 @@ class TestJobRoundTrip:
             updated_at=1000,
         )
         await job.save()
-        assert job._id is not None
+        assert isinstance(job._id, int)
 
         loaded = await Job.from_id(job._id)
         assert loaded is not None
@@ -123,7 +123,7 @@ class TestJobRoundTrip:
             started_at=1000,
         )
         await attempt.save()
-        assert attempt._id is not None
+        assert isinstance(attempt._id, int)
 
         loaded = await JobAttempt.from_id(attempt._id)
         assert loaded is not None
