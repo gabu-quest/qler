@@ -301,6 +301,162 @@ class Queue:
 
         return job
 
+    async def enqueue_many(
+        self,
+        jobs: list[dict[str, Any]],
+    ) -> list[Job]:
+        """Enqueue multiple jobs atomically. All-or-nothing: if any job fails
+        validation, none are created.
+
+        Each dict accepts the same keys as enqueue():
+            task_path (required), args, kwargs, queue_name, delay, eta,
+            priority, max_retries, retry_delay, lease_duration,
+            idempotency_key, correlation_id, depends_on, timeout.
+
+        Returns list of Job instances in the same order as input.
+        """
+        if not jobs:
+            return []
+
+        await self._lazy_init()
+        now = now_epoch()
+
+        # Phase 1: Validate all jobs and build Job instances
+        job_instances: list[Job] = []
+        batch_ulids: dict[str, Job] = {}  # for intra-batch dependency resolution
+
+        for i, spec in enumerate(jobs):
+            task_path = spec.get("task_path")
+            if not task_path:
+                raise ConfigurationError(
+                    f"Job at index {i}: task_path is required"
+                )
+
+            args = spec.get("args", ())
+            kwargs = spec.get("kwargs", None)
+            queue_name = spec.get("queue_name", "default")
+            delay = spec.get("delay")
+            eta = spec.get("eta")
+            priority = spec.get("priority", 0)
+            max_retries = spec.get("max_retries")
+            retry_delay = spec.get("retry_delay")
+            lease_duration = spec.get("lease_duration")
+            idempotency_key = spec.get("idempotency_key")
+            correlation_id = spec.get("correlation_id")
+            depends_on = spec.get("depends_on")
+            timeout = spec.get("timeout")
+
+            # Serialize payload
+            payload = {"args": list(args), "kwargs": kwargs or {}}
+            try:
+                payload_json = json.dumps(payload)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise PayloadNotSerializableError(
+                    f"Job at index {i}: payload is not JSON-serializable: {exc}"
+                ) from exc
+
+            if len(payload_json) > self.max_payload_size:
+                raise PayloadTooLargeError(
+                    f"Job at index {i}: payload size {len(payload_json)} exceeds max {self.max_payload_size}",
+                    size=len(payload_json),
+                    max_size=self.max_payload_size,
+                )
+
+            # Idempotency check
+            if idempotency_key is not None:
+                existing = await Job.query().filter(
+                    (F("idempotency_key") == idempotency_key)
+                    & (F("status") != JobStatus.CANCELLED.value)
+                ).first()
+                if existing is not None:
+                    job_instances.append(existing)
+                    continue
+
+            # Validate dependencies (including intra-batch)
+            dep_list: list[str] = []
+            pending_dep_count = 0
+            if depends_on:
+                dep_list = list(dict.fromkeys(depends_on))
+                # Check DB for existing deps
+                db_dep_ulids = [u for u in dep_list if u not in batch_ulids]
+                batch_dep_ulids = [u for u in dep_list if u in batch_ulids]
+
+                if db_dep_ulids:
+                    dep_jobs = await Job.query().filter(
+                        F("ulid").in_list(db_dep_ulids)
+                    ).all()
+                    found_ulids = {j.ulid for j in dep_jobs}
+                    for dep_ulid in db_dep_ulids:
+                        if dep_ulid not in found_ulids:
+                            raise DependencyError(
+                                f"Job at index {i}: dependency {dep_ulid} not found",
+                                dependency_ulid=dep_ulid,
+                            )
+                    for dep_job in dep_jobs:
+                        if dep_job.status == JobStatus.FAILED.value:
+                            raise DependencyError(
+                                f"Job at index {i}: dependency {dep_job.ulid} is failed",
+                                dependency_ulid=dep_job.ulid,
+                            )
+                        if dep_job.status == JobStatus.CANCELLED.value:
+                            raise DependencyError(
+                                f"Job at index {i}: dependency {dep_job.ulid} is cancelled",
+                                dependency_ulid=dep_job.ulid,
+                            )
+                    pending_dep_count += sum(
+                        1 for j in dep_jobs if j.status != JobStatus.COMPLETED.value
+                    )
+
+                # Intra-batch deps are always pending
+                pending_dep_count += len(batch_dep_ulids)
+
+            # Calculate ETA
+            if eta is not None:
+                job_eta = eta
+            elif delay is not None:
+                job_eta = now + delay
+            else:
+                job_eta = now
+
+            job = Job(
+                ulid=generate_ulid(),
+                status=JobStatus.PENDING.value,
+                queue_name=queue_name,
+                priority=priority,
+                eta=job_eta,
+                task=task_path,
+                payload_json=payload_json,
+                max_retries=max_retries if max_retries is not None else self.default_max_retries,
+                retry_delay=retry_delay if retry_delay is not None else self.default_retry_delay,
+                lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
+                correlation_id=correlation_id or "",
+                idempotency_key=idempotency_key,
+                dependencies=dep_list,
+                pending_dep_count=pending_dep_count,
+                timeout=timeout,
+                created_at=now,
+                updated_at=now,
+            )
+            job_instances.append(job)
+            batch_ulids[job.ulid] = job
+
+        # Phase 2: Save all new jobs (skip idempotency-matched existing ones)
+        for job in job_instances:
+            if job._id is None:  # New job, not an existing idempotency match
+                await job.save()
+
+        # Phase 3: Execute in immediate mode if applicable
+        if self.immediate:
+            results = []
+            for job in job_instances:
+                if job.status == JobStatus.PENDING.value:
+                    results.append(await self._execute_immediate(job))
+                else:
+                    results.append(job)
+            return results
+
+        return job_instances
+
     # ------------------------------------------------------------------
     # Immediate execution
     # ------------------------------------------------------------------
