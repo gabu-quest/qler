@@ -307,13 +307,26 @@ Tasks report progress for long-running operations.
 - ✅ Validation: integer 0–100, raises outside task context
 - ✅ 12 tests
 
-### M20: Unique Jobs ⬚
+### M20: Unique Jobs ✅
 
 Prevent duplicate pending/running jobs for the same task.
 
-- `@task(q, unique=True)` — at most one PENDING/RUNNING job per task+queue
-- `@task(q, unique_key=fn)` — scoped uniqueness by key function
-- Partial index for efficient lookup
+- ✅ `@task(q, unique=True)` — at most one PENDING/RUNNING job per task_path
+- ✅ `@task(q, unique_key=fn)` — scoped uniqueness by key function
+- ✅ `unique` and `unique_key` mutually exclusive (ConfigurationError)
+- ✅ Uniqueness check runs after idempotency check; returns existing active job
+- ✅ Terminal states (completed/failed/cancelled) don't block new enqueues
+- ✅ `enqueue_many()` respects uniqueness per-job
+- ✅ `_unique_key` per-call override on `enqueue()`
+- ✅ Partial index on `unique_key` for active jobs
+- ✅ `qler tasks --json` shows `unique`/`unique_key` fields
+- ✅ 19 tests
+
+### BUG: Lease expiry doesn't reset progress fields
+
+`recover_expired_leases()` in `queue.py` resets a RUNNING job back to PENDING but does NOT clear `progress`/`progress_message`. Auto-retry, manual retry, and DLQ replay all reset progress — lease expiry is the odd one out. A recovered job will carry stale progress into its next attempt.
+
+**Fix:** Add `progress=None, progress_message=""` to the `update_one()` call in `recover_expired_leases()`. Add a regression test.
 
 ### M21: `qler logs` ⬚
 
