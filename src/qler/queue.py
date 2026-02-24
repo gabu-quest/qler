@@ -180,6 +180,13 @@ class Queue:
                 "ON qler_jobs (queue_name, status) "
                 "WHERE status = 'failed'"
             ),
+            # 7. Uniqueness: deduplicate active jobs by unique_key
+            (
+                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_unique "
+                "ON qler_jobs (json_extract(data, '$.unique_key')) "
+                "WHERE json_extract(data, '$.unique_key') IS NOT NULL "
+                "AND status IN ('pending', 'running')"
+            ),
         ]
         for ddl in indexes:
             cur = await adapter.execute(ddl)
@@ -207,6 +214,7 @@ class Queue:
         correlation_id: Optional[str] = None,
         depends_on: Optional[list[str]] = None,
         timeout: Optional[int] = None,
+        unique_key: Optional[str] = None,
     ) -> Job:
         """Enqueue a new job. Returns the created Job instance."""
         await self._lazy_init()
@@ -232,6 +240,15 @@ class Queue:
             existing = await Job.query().filter(
                 (F("idempotency_key") == idempotency_key)
                 & (F("status") != JobStatus.CANCELLED.value)
+            ).first()
+            if existing is not None:
+                return existing
+
+        # Uniqueness check: return existing active (pending/running) job with same key
+        if unique_key is not None:
+            existing = await Job.query().filter(
+                (F("unique_key") == unique_key)
+                & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
             ).first()
             if existing is not None:
                 return existing
@@ -288,6 +305,7 @@ class Queue:
             lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
             correlation_id=correlation_id or "",
             idempotency_key=idempotency_key,
+            unique_key=unique_key,
             dependencies=dep_list,
             pending_dep_count=pending_dep_count,
             timeout=timeout,
@@ -345,6 +363,7 @@ class Queue:
             correlation_id = spec.get("correlation_id")
             depends_on = spec.get("depends_on")
             timeout = spec.get("timeout")
+            unique_key = spec.get("unique_key")
 
             # Serialize payload
             payload = {"args": list(args), "kwargs": kwargs or {}}
@@ -367,6 +386,16 @@ class Queue:
                 existing = await Job.query().filter(
                     (F("idempotency_key") == idempotency_key)
                     & (F("status") != JobStatus.CANCELLED.value)
+                ).first()
+                if existing is not None:
+                    job_instances.append(existing)
+                    continue
+
+            # Uniqueness check
+            if unique_key is not None:
+                existing = await Job.query().filter(
+                    (F("unique_key") == unique_key)
+                    & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
                 ).first()
                 if existing is not None:
                     job_instances.append(existing)
@@ -431,6 +460,7 @@ class Queue:
                 lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
                 correlation_id=correlation_id or "",
                 idempotency_key=idempotency_key,
+                unique_key=unique_key,
                 dependencies=dep_list,
                 pending_dep_count=pending_dep_count,
                 timeout=timeout,
