@@ -2,6 +2,17 @@
 
 All notable changes to qler will be documented in this file.
 
+## [0.5.0] — 2026-02-25
+
+### Added
+
+- **Structured lifecycle events** (M24) — `qler.lifecycle` logger emits structured log entries at every job state transition (enqueued, claimed, completed, failed, retried, lease_recovered, executed) with job_id, queue, task, correlation_id, and event-specific fields. Always-on via Python `logging`, works with logler's `JsonHandler` for queryable JSON output. Zero overhead when no handler attached.
+
+### Fixed
+
+- **logler integration** — `CorrelationFilter` now preserves explicitly-set `correlation_id`; `JsonHandler` forwards extra fields to JSON output
+- **`__version__`** — was stuck at "0.3.0" after v0.4.0 release
+
 ## [0.4.0] — 2026-02-25
 
 ### Added

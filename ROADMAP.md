@@ -367,11 +367,13 @@ Emit structured log entries at every job lifecycle transition, aligned with Prom
 - ✅ logler fix: CorrelationFilter preserves explicit correlation_id; JsonHandler forwards extra fields to JSON
 - ✅ 15 tests
 
-### M25: v0.5.0 Release ⬚
+### M25: v0.5.0 Release ✅
 
 Tag v0.5.0 with M24.
 
-- Version bump, CHANGELOG, ROADMAP update
+- ✅ Version bump to 0.5.0 (pyproject.toml + __init__.py)
+- ✅ CHANGELOG.md v0.5.0 entry
+- ✅ ROADMAP.md updated
 
 ---
 

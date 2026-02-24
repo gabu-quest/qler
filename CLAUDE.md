@@ -1,6 +1,6 @@
 # Claude Context: qler
 
-**Version:** 0.4.0
+**Version:** 0.5.0
 **Type:** Python library — background job queue on SQLite
 
 ---
@@ -20,7 +20,7 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 
 ## Project Status
 
-**Fully implemented.** v0.4.0 with timeouts, batch enqueue, progress, unique jobs, Prometheus metrics, logler logs CLI. 588 passing tests.
+**Fully implemented.** v0.5.0 with timeouts, batch enqueue, progress, unique jobs, Prometheus metrics, logler logs CLI, structured lifecycle events. 606 passing tests.
 
 | File | Purpose |
 |------|---------|
@@ -141,4 +141,4 @@ tests/
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — M0–M23 complete (v0.4.0). M24+ planned.
+- [ROADMAP.md](./ROADMAP.md) — M0–M25 complete (v0.5.0).
