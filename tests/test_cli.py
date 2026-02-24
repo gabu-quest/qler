@@ -349,6 +349,179 @@ class TestInit:
 
 
 # -----------------------------------------------------------------------
+# qler backup
+# -----------------------------------------------------------------------
+
+
+class TestBackupCommand:
+    def test_backup_creates_file(self, runner, db_path, tmp_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        dest = str(tmp_path / "backup.db")
+        result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest])
+        assert result.exit_code == 0
+        assert "Backup complete" in result.output
+        assert os.path.exists(dest)
+
+    def test_backup_file_is_valid_sqlite(self, runner, db_path, tmp_path):
+        """Backup is a readable SQLite DB with qler tables."""
+        import asyncio
+
+        runner.invoke(cli, ["init", "--db", db_path])
+        dest = str(tmp_path / "backup.db")
+        result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest])
+        assert result.exit_code == 0
+
+        async def _check():
+            from sqler import AsyncSQLerDB
+
+            db = AsyncSQLerDB.on_disk(dest)
+            await db.connect()
+            cur = await db.adapter.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('qler_jobs', 'qler_job_attempts')"
+            )
+            tables = sorted([row[0] for row in await cur.fetchall()])
+            await cur.close()
+            await db.close()
+            return tables
+
+        tables = asyncio.run(_check())
+        assert tables == ["qler_job_attempts", "qler_jobs"]
+
+    def test_backup_preserves_data(self, runner, db_path, tmp_path):
+        """Jobs in source appear in backup."""
+        import asyncio
+
+        async def _setup():
+            q = Queue(db_path)
+            await q.init_db()
+            await q.enqueue("myapp.tasks.hello")
+            await q.enqueue("myapp.tasks.world")
+            await q.close()
+
+        asyncio.run(_setup())
+
+        dest = str(tmp_path / "backup.db")
+        result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest])
+        assert result.exit_code == 0
+
+        async def _check():
+            q = Queue(dest)
+            await q.init_db()
+            jobs = await Job.query().all()
+            await q.close()
+            return jobs
+
+        jobs = asyncio.run(_check())
+        assert len(jobs) == 2
+        tasks = {j.task for j in jobs}
+        assert tasks == {"myapp.tasks.hello", "myapp.tasks.world"}
+
+    def test_backup_json_output(self, runner, db_path, tmp_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        dest = str(tmp_path / "backup.db")
+        result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest, "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["success"] is True
+        assert data["destination_path"] == dest
+        assert data["source_path"] == db_path
+        assert data["size_bytes"] >= 4096  # minimum SQLite DB size
+        assert isinstance(data["duration_ms"], (int, float))
+        assert data["duration_ms"] >= 0
+        assert data["error"] is None
+
+    def test_backup_refuses_existing_destination(self, runner, db_path, tmp_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        dest = str(tmp_path / "backup.db")
+        Path(dest).write_text("")  # create the file
+        result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest])
+        assert result.exit_code == 1
+        assert "Destination already exists" in result.stderr
+
+    def test_backup_refuses_existing_destination_json(self, runner, db_path, tmp_path):
+        runner.invoke(cli, ["init", "--db", db_path])
+        dest = str(tmp_path / "backup.db")
+        Path(dest).write_text("")
+        result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest, "--json"])
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert "error" in data
+        assert "already exists" in data["error"]
+
+    def test_backup_nonexistent_source_succeeds_empty(self, runner, tmp_path):
+        """SQLite creates the source on connect, so backup succeeds but is empty."""
+        import asyncio
+
+        bad_source = str(tmp_path / "nonexistent.db")
+        dest = str(tmp_path / "backup.db")
+        result = runner.invoke(cli, ["backup", "--db", bad_source, "--to", dest])
+        assert result.exit_code == 0
+        assert os.path.exists(dest)
+
+        # Backup is valid but contains zero jobs
+        async def _check():
+            q = Queue(dest)
+            await q.init_db()
+            count = await Job.query().count()
+            await q.close()
+            return count
+
+        assert asyncio.run(_check()) == 0
+
+    def test_backup_failure_human(self, runner, db_path, tmp_path):
+        """When async_backup returns success=False, exit code is 1 and error goes to stderr."""
+        from unittest.mock import AsyncMock, patch
+        from sqler.ops import BackupResult
+        from datetime import datetime
+
+        runner.invoke(cli, ["init", "--db", db_path])
+        dest = str(tmp_path / "backup.db")
+        fake_result = BackupResult(
+            success=False,
+            source_path=db_path,
+            destination_path=dest,
+            duration_ms=1.0,
+            size_bytes=0,
+            timestamp=datetime.now(),
+            error="disk full",
+        )
+        with patch("sqler.async_backup", new_callable=AsyncMock, return_value=fake_result):
+            result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest])
+        assert result.exit_code == 1
+        assert "disk full" in result.stderr
+
+    def test_backup_failure_json(self, runner, db_path, tmp_path):
+        """When async_backup returns success=False with --json, output has success=false and error."""
+        from unittest.mock import AsyncMock, patch
+        from sqler.ops import BackupResult
+        from datetime import datetime
+
+        runner.invoke(cli, ["init", "--db", db_path])
+        dest = str(tmp_path / "backup.db")
+        fake_result = BackupResult(
+            success=False,
+            source_path=db_path,
+            destination_path=dest,
+            duration_ms=1.0,
+            size_bytes=0,
+            timestamp=datetime.now(),
+            error="disk full",
+        )
+        with patch("sqler.async_backup", new_callable=AsyncMock, return_value=fake_result):
+            result = runner.invoke(cli, ["backup", "--db", db_path, "--to", dest, "--json"])
+        assert result.exit_code == 0  # JSON mode always exits 0, error is in the envelope
+        data = json.loads(result.output)
+        assert data["success"] is False
+        assert data["error"] == "disk full"
+
+    def test_backup_has_help(self, runner):
+        result = runner.invoke(cli, ["backup", "--help"])
+        assert result.exit_code == 0
+        assert "Create a safe online backup" in result.output
+
+
+# -----------------------------------------------------------------------
 # qler status
 # -----------------------------------------------------------------------
 
@@ -1231,7 +1404,7 @@ class TestVersionHelp:
 
     def test_all_commands_have_help(self, runner):
         commands = [
-            "init", "worker", "status", "jobs", "job",
+            "init", "backup", "worker", "status", "jobs", "job",
             "attempts", "retry", "cancel", "purge", "doctor",
             "dlq", "health", "tasks",
         ]

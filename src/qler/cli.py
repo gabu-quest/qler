@@ -265,6 +265,47 @@ def init(db: str, output_json: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# qler backup
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
+@click.option("--to", "destination", required=True, type=click.Path(), help="Backup destination path")
+@click.option("--json", "output_json", is_flag=True, help="Output JSON")
+def backup(db: str, destination: str, output_json: bool) -> None:
+    """Create a safe online backup of the qler database."""
+    from sqler import async_backup
+
+    if os.path.exists(destination):
+        if output_json:
+            _echo_json({"error": f"Destination already exists: {destination}"})
+        else:
+            click.echo(f"Destination already exists: {destination}", err=True)
+        sys.exit(1)
+
+    async def _backup():
+        q = await _get_queue(db)
+        try:
+            return await async_backup(q.db, destination)
+        finally:
+            await q.close()
+
+    result = _run(_backup())
+
+    if output_json:
+        _echo_json(result.to_dict())
+    else:
+        if result.success:
+            click.echo(f"Backup complete: {result.destination_path}")
+            click.echo(f"  Source: {result.source_path}")
+            click.echo(f"  Size:   {result.size_bytes / 1024:.1f} KB")
+            click.echo(f"  Time:   {result.duration_ms:.0f} ms")
+        else:
+            click.echo(f"Backup failed: {result.error}", err=True)
+            sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # qler worker
 # ---------------------------------------------------------------------------
 
