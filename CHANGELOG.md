@@ -2,6 +2,19 @@
 
 All notable changes to qler will be documented in this file.
 
+## [0.4.0] — 2026-02-25
+
+### Added
+
+- **Job timeouts** (M17) — `@task(q, timeout=30)` per-task and `_timeout` per-job execution timeouts with `FailureKind.TIMEOUT`
+- **Batch enqueue** (M18) — `Queue.enqueue_many()` for atomic bulk job creation with intra-batch dependencies
+- **Job progress** (M19) — `set_progress(percent, message)` from inside tasks, visible in CLI and API
+- **Unique jobs** (M20) — `@task(q, unique=True)` and `unique_key=fn` prevent duplicate pending/running jobs
+- **`qler logs` command** (M21) — bridge CLI to logler for job-correlated log viewing
+- **Prometheus metrics** (M22) — opt-in `Queue(metrics=True)` with counters, histograms, gauges, and `/metrics` endpoint
+- **Per-task idempotency key generators** (M15) — `@task(q, idempotency_key=lambda order_id: f"charge:{order_id}")`
+- **`qler backup` command** (M16) — safe online backup via SQLite backup API
+
 ## [0.3.0] — 2026-02-23
 
 ### Added
