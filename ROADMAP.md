@@ -273,27 +273,70 @@ Safe online backup of the qler SQLite database.
 - ✅ `--json` output with BackupResult metadata (success, size, duration, paths)
 - ✅ 8 tests
 
-### M17: Web Dashboard ⬚
+### M17: Job Timeouts ⬚
 
-Read-only + operational web dashboard for qler.
+Per-task and per-job execution timeouts to prevent hung tasks from holding concurrency slots.
 
-- Vue 3 + Naive UI
-- Queue depths, job list, job detail, attempt history
-- Operational: retry, cancel, replay from DLQ
-- Separate package (`qler-dashboard`) or optional dependency
+- `@task(q, timeout=30)` — per-task default timeout in seconds
+- `_timeout` on `.enqueue()` / `.delay()` — per-job override
+- `timeout` promoted column on Job model
+- Worker wraps execution with `asyncio.wait_for()`
+- `FailureKind.TIMEOUT` — retryable failure kind
+
+### M18: Batch Enqueue ⬚
+
+Single-transaction bulk job creation for performance.
+
+- `Queue.enqueue_many(jobs)` — atomic batch insert
+- `TaskWrapper.delay_many(*arg_tuples)` — convenience wrapper
+- All-or-nothing validation (bad payload in batch → none created)
+
+### M19: Job Progress ⬚
+
+Tasks report progress for long-running operations.
+
+- `current_job().set_progress(pct, message="")` — update from inside task
+- `progress` promoted column on Job model (0–100)
+- `qler job <id>` shows progress in output
+
+### M20: Unique Jobs ⬚
+
+Prevent duplicate pending/running jobs for the same task.
+
+- `@task(q, unique=True)` — at most one PENDING/RUNNING job per task+queue
+- `@task(q, unique_key=fn)` — scoped uniqueness by key function
+- Partial index for efficient lookup
+
+### M21: `qler logs` ⬚
+
+Bridge CLI to logler for job-correlated log viewing.
+
+- `qler logs <job_id>` — show logs by correlation_id via logler API
+- Graceful fallback if logler not installed
+
+### M22: Prometheus Metrics ⬚
+
+Optional metrics export for production observability.
+
+- Optional `prometheus_client` dependency
+- Counters: enqueued, completed, failed (by queue/task/kind)
+- Gauges: active jobs, queue depth
+- Histogram: job duration
+- `/metrics` endpoint on health server
+
+### M23: v0.4.0 Release ⬚
+
+Tag v0.4.0 with M17–M22 features.
+
+- Version bump, CHANGELOG, ROADMAP update
 
 ---
 
-## Future (v0.5+)
+## Separate Projects
 
-| Feature | Notes |
-|---------|-------|
-| Prometheus metrics | Export queue depths, throughput, failure rates |
-| Payload encryption | Optional encryption for sensitive fields |
-| logler db_source input validation | Sanitize user-supplied table names beyond SQL quoting; allowlist approach |
-| logler JsonHandler robustness | Graceful degradation when stream write fails mid-entry |
-| logler db_source temp file cleanup | Context manager API for automatic temp file cleanup on exception paths |
-| logler correlation context OTel bridge | Optional trace_id propagation from OpenTelemetry spans |
+| Project | Description |
+|---------|-------------|
+| **qler-web** | Web dashboard (Vue 3 + Naive UI). Separate Python package depending on qler. Follows logler-web pattern. |
 
 ---
 
