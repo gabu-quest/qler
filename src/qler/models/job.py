@@ -55,6 +55,7 @@ class Job(AsyncSQLerSafeModel):
     last_attempt_id: Optional[str] = None
     correlation_id: str = ""
     idempotency_key: Optional[str] = None
+    unique_key: Optional[str] = None
     timeout: Optional[int] = None
     progress: Optional[int] = None
     progress_message: str = ""
