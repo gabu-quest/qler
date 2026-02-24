@@ -204,8 +204,8 @@ class TestHelpers:
     def test_validate_module_path_accepts_dotted(self):
         from qler.cli import _validate_module_path
 
-        # Should not raise
-        _validate_module_path("myapp.tasks.email")
+        result = _validate_module_path("myapp.tasks.email")
+        assert result is None
 
     def test_echo_table_output(self, runner, capsys):
         from qler.cli import _echo_table
@@ -607,13 +607,10 @@ class TestJobs:
         assert by_task["myapp.tasks.done"]["queue_name"] == "default"
         assert by_task["myapp.tasks.fail"]["status"] == "failed"
         assert by_task["myapp.tasks.fail"]["last_error"] == "Something went wrong"
-        # Verify all jobs have required fields
+        # Verify all jobs have correct queue assignments
         for j in data:
-            assert "ulid" in j
-            assert "status" in j
-            assert "queue_name" in j
-            assert "task" in j
-            assert "created_at" in j
+            assert j["queue_name"] in ("default", "email")
+            assert j["status"] in ("pending", "completed", "failed")
 
     def test_since_filter(self, runner, db_path):
         """Jobs created now should be within --since 1h."""
@@ -1465,9 +1462,10 @@ class TestDLQCli:
             "myapp.tasks.fail_1",
             "myapp.tasks.fail_2",
         }
+        errors_found = {item["error"] for item in data["data"]}
+        assert errors_found == {"error_0", "error_1", "error_2"}
         for item in data["data"]:
-            assert item["ulid"]  # non-empty
-            assert item["error"]  # non-empty
+            assert len(item["ulid"]) == 26  # ULID format
             assert item["original_queue"] == "default"
 
     def test_dlq_list_human(self, runner, dlq_populated_db):
