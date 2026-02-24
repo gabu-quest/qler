@@ -10,6 +10,7 @@ import os
 import pathlib
 import signal
 import socket
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -134,6 +135,21 @@ class Worker:
                     f"\r\n"
                     f"{body}"
                 )
+            elif path == "/metrics" and self.queue._metrics:
+                # No auth required — the server is bound to 127.0.0.1 only.
+                # Add token auth before exposing over a network.
+                await self.queue._metrics.update_depth()
+                body_bytes = self.queue._metrics.generate()
+                header = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                    b"Content-Length: " + str(len(body_bytes)).encode() + b"\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
+                )
+                writer.write(header + body_bytes)
+                await writer.drain()
+                return
             else:
                 body = '{"error": "not found"}'
                 response = (
@@ -278,6 +294,7 @@ class Worker:
 
     async def _execute_job(self, job: Any) -> None:
         """Execute a single job: resolve task, validate signature, run, complete/fail."""
+        start_time = time.monotonic()
         token = _current_job.set(job)
         try:
             # 1. Resolve task
@@ -385,6 +402,11 @@ class Worker:
             await self.queue.complete_job(job, self.worker_id, result=result)
 
         finally:
+            if self.queue._metrics:
+                duration = time.monotonic() - start_time
+                self.queue._metrics.observe_duration(
+                    job.queue_name, job.task, duration
+                )
             _current_job.reset(token)
             self._active_jobs.pop(job.ulid, None)
             if self._semaphore is not None:

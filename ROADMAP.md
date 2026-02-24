@@ -333,15 +333,19 @@ Bridge CLI to logler for job-correlated log viewing.
 - ✅ Correlation ID tip shown in human output when present
 - ✅ 5 tests
 
-### M22: Prometheus Metrics ⬚
+### M22: Prometheus Metrics ✅
 
 Optional metrics export for production observability.
 
-- Optional `prometheus_client` dependency
-- Counters: enqueued, completed, failed (by queue/task/kind)
-- Gauges: active jobs, queue depth
-- Histogram: job duration
-- `/metrics` endpoint on health server
+- ✅ Optional `prometheus_client` dependency (`qler[metrics]`)
+- ✅ `Queue(metrics=True)` opt-in with private `CollectorRegistry`
+- ✅ Also accepts `CollectorRegistry` instance for shared registries
+- ✅ Counters: enqueued, claimed, completed, failed (by queue/task/failure_kind), retried, leases_recovered
+- ✅ Gauge: queue depth (by queue/status) — async DB query refreshed on each scrape
+- ✅ Histogram: job duration (by queue/task) with sub-second to 10-minute buckets
+- ✅ `/metrics` endpoint on health server (Prometheus text format)
+- ✅ Zero overhead when disabled (no `prometheus_client` import)
+- ✅ 20 tests
 
 ### M23: v0.4.0 Release ⬚
 

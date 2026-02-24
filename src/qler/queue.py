@@ -6,7 +6,7 @@ import asyncio
 import json
 import random
 import traceback as tb_module
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from sqler import AsyncSQLerDB, F
 
@@ -26,7 +26,10 @@ from qler.models.job import Job
 from qler.rate_limit import RateSpec, parse_rate, try_acquire
 
 if TYPE_CHECKING:
+    from prometheus_client import CollectorRegistry
+
     from qler.cron import CronWrapper
+    from qler.metrics import QlerMetrics
     from qler.task import TaskWrapper
 
 _MAX_TRACEBACK_LENGTH = 8_192
@@ -52,6 +55,7 @@ class Queue:
         max_payload_size: int = 1_000_000,
         rate_limits: Optional[dict[str, str]] = None,
         dlq: Optional[str] = None,
+        metrics: Union[bool, "CollectorRegistry"] = False,
     ) -> None:
         if isinstance(db, str):
             self._db_path: Optional[str] = db
@@ -80,6 +84,27 @@ class Queue:
             for queue_name, spec in rate_limits.items():
                 self._rate_limits[queue_name] = parse_rate(spec)
         self._initialized = False
+
+        # Metrics (opt-in)
+        self._metrics: Optional[QlerMetrics] = None
+        if metrics is not False:
+            try:
+                from qler.metrics import QlerMetrics as _QM
+            except ImportError:
+                raise ConfigurationError(
+                    "prometheus-client required: pip install 'qler[metrics]'"
+                )
+            if metrics is True:
+                self._metrics = _QM()
+            else:
+                from prometheus_client import CollectorRegistry as _CR
+
+                if not isinstance(metrics, _CR):
+                    raise ConfigurationError(
+                        f"metrics must be True or a CollectorRegistry instance, "
+                        f"got {type(metrics).__name__}"
+                    )
+                self._metrics = _QM(registry=metrics)
 
     @property
     def db(self) -> AsyncSQLerDB:
@@ -141,6 +166,11 @@ class Queue:
             pass  # Column already exists
 
         await self._create_indexes()
+
+        # Wire up queue depth query for Prometheus scrapes
+        if self._metrics is not None:
+            self._metrics.set_depth_query(self._query_queue_depth)
+
         self._initialized = True
 
     async def _create_indexes(self) -> None:
@@ -314,6 +344,9 @@ class Queue:
         )
         await job.save()
 
+        if self._metrics:
+            self._metrics.inc_enqueued(queue_name, task_path)
+
         if self.immediate:
             return await self._execute_immediate(job)
 
@@ -474,6 +507,8 @@ class Queue:
         for job in job_instances:
             if job._id is None:  # New job, not an existing idempotency match
                 await job.save()
+                if self._metrics:
+                    self._metrics.inc_enqueued(job.queue_name, job.task)
 
         # Phase 3: Execute in immediate mode if applicable
         if self.immediate:
@@ -664,6 +699,9 @@ class Queue:
         )
         await attempt.save()
 
+        if self._metrics:
+            self._metrics.inc_claimed(job.queue_name, job.task)
+
         return job
 
     async def _poison_pill(
@@ -755,6 +793,9 @@ class Queue:
         if updated is None:
             return  # Lost ownership
 
+        if self._metrics:
+            self._metrics.inc_completed(job.queue_name, job.task)
+
         # Resolve dependencies: unblock dependent jobs
         await self._resolve_dependencies(job.ulid)
 
@@ -818,6 +859,12 @@ class Queue:
         if updated is None:
             return  # Lost ownership
 
+        if self._metrics:
+            if can_retry:
+                self._metrics.inc_retried(job.queue_name, job.task)
+            else:
+                self._metrics.inc_failed(job.queue_name, job.task, failure_kind.value)
+
         # Cascade-cancel dependents on terminal failure
         if not can_retry:
             await self._cascade_cancel_dependents(job.ulid)
@@ -874,6 +921,9 @@ class Queue:
                 error="Lease expired",
             )
             recovered += 1
+
+        if self._metrics and recovered:
+            self._metrics.inc_leases_recovered(recovered)
 
         return recovered
 
@@ -1049,6 +1099,21 @@ class Queue:
         """Ensure init_db has been called."""
         if not self._initialized:
             await self.init_db()
+
+    async def _query_queue_depth(self) -> list[tuple[str, str, int]]:
+        """Async query for queue depth — called before /metrics generation."""
+        if self._db is None:
+            return []
+        try:
+            cur = await self._db.adapter.execute(
+                "SELECT queue_name, status, COUNT(*) "
+                "FROM qler_jobs GROUP BY queue_name, status"
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            return rows
+        except Exception:
+            return []
 
     async def close(self) -> None:
         """Close the database connection if we own it."""

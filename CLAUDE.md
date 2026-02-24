@@ -20,7 +20,7 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 
 ## Project Status
 
-**Fully implemented.** v0.3.0 with cron catchup, job dependencies, DLQ, health endpoint, tasks CLI. 468 passing tests.
+**Fully implemented.** v0.3.0 with cron catchup, job dependencies, DLQ, health endpoint, tasks CLI, Prometheus metrics. 583 passing tests.
 
 | File | Purpose |
 |------|---------|
