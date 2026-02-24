@@ -273,17 +273,19 @@ Safe online backup of the qler SQLite database.
 - ✅ `--json` output with BackupResult metadata (success, size, duration, paths)
 - ✅ 8 tests
 
-### M17: Job Timeouts 🔄
+### M17: Job Timeouts ✅
 
 Per-task and per-job execution timeouts to prevent hung tasks from holding concurrency slots.
 
-- `@task(q, timeout=30)` — per-task default timeout in seconds
-- `_timeout` on `.enqueue()` / `.delay()` — per-job override
-- `timeout` promoted column on Job model
-- Worker wraps execution with `asyncio.wait_for()`
-- `FailureKind.TIMEOUT` — retryable failure kind
+- ✅ `@task(q, timeout=30)` — per-task default timeout in seconds
+- ✅ `_timeout` on `.enqueue()` / `.delay()` — per-job override
+- ✅ `timeout` field on Job model (nullable int)
+- ✅ Worker wraps execution with `asyncio.wait_for()` (async) / `asyncio.shield()` (sync)
+- ✅ `FailureKind.TIMEOUT` — retryable failure kind
+- ✅ `qler tasks --json` shows timeout config
+- ✅ 19 tests (8 config, 8 worker execution, 3 immediate mode)
 
-### M18: Batch Enqueue ⬚
+### M18: Batch Enqueue 🔄
 
 Single-transaction bulk job creation for performance.
 
