@@ -206,6 +206,7 @@ class Queue:
         idempotency_key: Optional[str] = None,
         correlation_id: Optional[str] = None,
         depends_on: Optional[list[str]] = None,
+        timeout: Optional[int] = None,
     ) -> Job:
         """Enqueue a new job. Returns the created Job instance."""
         await self._lazy_init()
@@ -289,6 +290,7 @@ class Queue:
             idempotency_key=idempotency_key,
             dependencies=dep_list,
             pending_dep_count=pending_dep_count,
+            timeout=timeout,
             created_at=now,
             updated_at=now,
         )
@@ -365,13 +367,31 @@ class Queue:
         kwargs = payload.get("kwargs", {})
 
         task_exc: BaseException | None = None
+        failure_kind = FailureKind.EXCEPTION
         result: Any = None
+        timeout = job.timeout
         token = _current_job.set(job)
         try:
             if task_wrapper.sync:
-                result = await asyncio.to_thread(task_wrapper.fn, *args, **kwargs)
+                coro = asyncio.to_thread(task_wrapper.fn, *args, **kwargs)
             else:
-                result = await task_wrapper.fn(*args, **kwargs)
+                coro = task_wrapper.fn(*args, **kwargs)
+            if timeout is not None:
+                if task_wrapper.sync:
+                    # Sync tasks run in threads that can't be cancelled.
+                    # Shield prevents wait_for from blocking on cancellation.
+                    result = await asyncio.wait_for(
+                        asyncio.shield(coro), timeout=timeout
+                    )
+                else:
+                    result = await asyncio.wait_for(coro, timeout=timeout)
+            else:
+                result = await coro
+        except asyncio.TimeoutError:
+            task_exc = TimeoutError(
+                f"Task {job.task} timed out after {timeout}s"
+            )
+            failure_kind = FailureKind.TIMEOUT
         except asyncio.CancelledError:
             await self.fail_job(job, worker_id, failure_kind=FailureKind.CANCELLED)
             raise
@@ -383,7 +403,7 @@ class Queue:
         if task_exc is not None:
             try:
                 await self.fail_job(
-                    job, worker_id, task_exc, failure_kind=FailureKind.EXCEPTION
+                    job, worker_id, task_exc, failure_kind=failure_kind
                 )
             except Exception:
                 # Best-effort: terminalize attempt directly if fail_job raises

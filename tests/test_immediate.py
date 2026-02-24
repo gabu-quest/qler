@@ -67,6 +67,19 @@ async def fail_oops_task():
     raise RuntimeError("oops")
 
 
+import asyncio
+
+
+async def imm_timeout_slow_task():
+    await asyncio.sleep(10)
+    return "unreachable"
+
+
+async def imm_timeout_fast_task():
+    await asyncio.sleep(0.01)
+    return "quick"
+
+
 async def traced_task():
     return "done"
 
@@ -383,3 +396,55 @@ class TestImmediateIdempotencyAfterCancellation:
         job_new = await wrapper2.enqueue(_idempotency_key="cancel-reuse")
         assert job_new.ulid != job_pending.ulid
         assert job_new.status == JobStatus.PENDING.value
+
+
+class TestImmediateTimeout:
+    """Timeout enforcement in immediate mode."""
+
+    async def test_immediate_timeout_triggers_failure(self):
+        """Task exceeding timeout in immediate mode fails with TIMEOUT."""
+        db = AsyncSQLerDB.in_memory(shared=False)
+        await db.connect()
+        try:
+            q = Queue(db, immediate=True)
+            await q.init_db()
+            wrapped = task(q, timeout=1)(imm_timeout_slow_task)
+            job = await wrapped.enqueue()
+            assert job.status == JobStatus.FAILED.value
+            assert job.last_failure_kind == FailureKind.TIMEOUT.value
+            assert "timed out" in job.last_error
+        finally:
+            await db.close()
+
+    async def test_immediate_fast_within_timeout(self):
+        """Task completing before timeout succeeds in immediate mode."""
+        db = AsyncSQLerDB.in_memory(shared=False)
+        await db.connect()
+        try:
+            q = Queue(db, immediate=True)
+            await q.init_db()
+            wrapped = task(q, timeout=5)(imm_timeout_fast_task)
+            job = await wrapped.enqueue()
+            assert job.status == JobStatus.COMPLETED.value
+            assert job.result == "quick"
+        finally:
+            await db.close()
+
+    async def test_immediate_timeout_attempt_recorded(self):
+        """Timed-out immediate job creates a failed attempt."""
+        db = AsyncSQLerDB.in_memory(shared=False)
+        await db.connect()
+        try:
+            q = Queue(db, immediate=True)
+            await q.init_db()
+            wrapped = task(q, timeout=1)(imm_timeout_slow_task)
+            job = await wrapped.enqueue()
+
+            attempts = await JobAttempt.query().filter(
+                F("job_ulid") == job.ulid
+            ).all()
+            assert len(attempts) == 1
+            assert attempts[0].status == AttemptStatus.FAILED.value
+            assert "timed out" in attempts[0].error
+        finally:
+            await db.close()

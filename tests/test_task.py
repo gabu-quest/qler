@@ -290,3 +290,45 @@ class TestTaskCall:
         wrapped = task(queue, sync=True)(sync_add_task)
         result = await wrapped(3, 4)
         assert result == 7
+
+
+class TestTaskTimeout:
+    """Timeout configuration on @task decorator."""
+
+    async def test_timeout_stored_on_wrapper(self, queue):
+        wrapped = task(queue, timeout=30)(noop_task)
+        assert wrapped._timeout == 30
+
+    async def test_timeout_none_by_default(self, queue):
+        wrapped = task(queue)(noop_task)
+        assert wrapped._timeout is None
+
+    async def test_timeout_passed_to_enqueue(self, queue):
+        """Task timeout flows through to Job.timeout on enqueue."""
+        wrapped = task(queue, timeout=45)(noop_task)
+        job = await wrapped.enqueue()
+        assert job.timeout == 45
+
+    async def test_per_job_timeout_overrides_task(self, queue):
+        """_timeout on enqueue overrides task-level default."""
+        wrapped = task(queue, timeout=45)(noop_task)
+        job = await wrapped.enqueue(_timeout=10)
+        assert job.timeout == 10
+
+    async def test_timeout_none_when_not_set(self, queue):
+        """Job has timeout=None when no timeout configured."""
+        wrapped = task(queue)(noop_task)
+        job = await wrapped.enqueue()
+        assert job.timeout is None
+
+    def test_invalid_timeout_zero(self, queue):
+        with pytest.raises(ConfigurationError, match="positive number"):
+            task(queue, timeout=0)(noop_task)
+
+    def test_invalid_timeout_negative(self, queue):
+        with pytest.raises(ConfigurationError, match="positive number"):
+            task(queue, timeout=-5)(noop_task)
+
+    def test_invalid_timeout_string(self, queue):
+        with pytest.raises(ConfigurationError, match="positive number"):
+            task(queue, timeout="30")(noop_task)

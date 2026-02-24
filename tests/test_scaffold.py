@@ -47,13 +47,14 @@ def test_enums_importable():
         FailureKind.SIGNATURE_MISMATCH,
         FailureKind.PAYLOAD_INVALID,
         FailureKind.CANCELLED,
+        FailureKind.TIMEOUT,
     }
 
-    # RETRYABLE_FAILURES — must be frozenset, only EXCEPTION is retryable
+    # RETRYABLE_FAILURES — EXCEPTION and TIMEOUT are retryable
     from qler.enums import RETRYABLE_FAILURES
 
     assert isinstance(RETRYABLE_FAILURES, frozenset)
-    assert RETRYABLE_FAILURES == frozenset({FailureKind.EXCEPTION})
+    assert RETRYABLE_FAILURES == frozenset({FailureKind.EXCEPTION, FailureKind.TIMEOUT})
 
 
 def test_exceptions_hierarchy():

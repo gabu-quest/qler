@@ -31,6 +31,7 @@ class TaskWrapper:
         sync: bool = False,
         rate_limit: Optional[str] = None,
         idempotency_key: Optional[Callable[..., str]] = None,
+        timeout: Optional[int] = None,
     ) -> None:
         self.fn = fn
         self.queue = queue
@@ -39,6 +40,7 @@ class TaskWrapper:
         self._retry_delay = retry_delay
         self._priority = priority
         self._lease_duration = lease_duration
+        self._timeout = timeout
         self.sync = sync
         self.task_path = f"{fn.__module__}.{fn.__qualname__}"
         self.rate_spec: Optional[RateSpec] = parse_rate(rate_limit) if rate_limit else None
@@ -84,6 +86,7 @@ class TaskWrapper:
         _idempotency_key: Optional[str] = None,
         _correlation_id: Optional[str] = None,
         _depends_on: Optional[list[str]] = None,
+        _timeout: Optional[int] = None,
         **kwargs: Any,
     ) -> "Job":
         """Enqueue this task for background execution."""
@@ -108,6 +111,7 @@ class TaskWrapper:
             idempotency_key=_idempotency_key,
             correlation_id=_correlation_id,
             depends_on=_depends_on,
+            timeout=_timeout if _timeout is not None else self._timeout,
         )
 
     async def run_now(self, *args: Any, **kwargs: Any) -> Any:
@@ -142,6 +146,7 @@ def task(
     sync: bool = False,
     rate_limit: Optional[str] = None,
     idempotency_key: Optional[Callable[..., str]] = None,
+    timeout: Optional[int] = None,
 ) -> Callable[[Callable], TaskWrapper]:
     """Decorator to register a function as a qler task.
 
@@ -155,6 +160,7 @@ def task(
         sync: If True, the function is synchronous and will be run via asyncio.to_thread.
         rate_limit: Rate limit spec (e.g., "10/m", "100/h"). None = unlimited.
         idempotency_key: Callable that generates an idempotency key from task args/kwargs.
+        timeout: Execution timeout in seconds. None = no limit.
     """
     # Validate rate_limit early (fail at import time, not at enqueue time)
     if rate_limit is not None:
@@ -163,6 +169,11 @@ def task(
     if idempotency_key is not None and not callable(idempotency_key):
         raise ConfigurationError(
             f"idempotency_key must be callable, got {type(idempotency_key).__name__}"
+        )
+
+    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+        raise ConfigurationError(
+            f"timeout must be a positive number, got {timeout!r}"
         )
 
     def decorator(fn: Callable) -> TaskWrapper:
@@ -202,6 +213,7 @@ def task(
             sync=sync,
             rate_limit=rate_limit,
             idempotency_key=idempotency_key,
+            timeout=timeout,
         )
 
     return decorator
