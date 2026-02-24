@@ -114,6 +114,54 @@ class TaskWrapper:
             timeout=_timeout if _timeout is not None else self._timeout,
         )
 
+    async def enqueue_many(
+        self,
+        arg_list: list[tuple | dict],
+    ) -> list["Job"]:
+        """Enqueue multiple instances of this task at once.
+
+        Each element can be:
+          - A tuple of positional args: (arg1, arg2, ...)
+          - A dict with "args" and/or "kwargs" keys plus optional overrides
+
+        Returns list of Job instances.
+        """
+        jobs = []
+        for item in arg_list:
+            if isinstance(item, tuple):
+                spec: dict[str, Any] = {"args": item}
+            elif isinstance(item, dict):
+                spec = dict(item)
+            else:
+                raise TypeError(
+                    f"Each item must be a tuple or dict, got {type(item).__name__}"
+                )
+
+            spec.setdefault("task_path", self.task_path)
+            spec.setdefault("queue_name", self.queue_name)
+            spec.setdefault("priority", self.priority)
+            spec.setdefault("max_retries", self.max_retries)
+            spec.setdefault("retry_delay", self.retry_delay)
+            spec.setdefault("lease_duration", self.lease_duration)
+            if self._timeout is not None:
+                spec.setdefault("timeout", self._timeout)
+
+            # Apply idempotency key function if set and no explicit key
+            if "idempotency_key" not in spec and self.idempotency_key_fn is not None:
+                args = spec.get("args", ())
+                kwargs = spec.get("kwargs", {})
+                key = self.idempotency_key_fn(*args, **kwargs)
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"idempotency_key function must return str, "
+                        f"got {type(key).__name__}"
+                    )
+                spec["idempotency_key"] = key
+
+            jobs.append(spec)
+
+        return await self.queue.enqueue_many(jobs)
+
     async def run_now(self, *args: Any, **kwargs: Any) -> Any:
         """Execute the task directly (not via queue). Validates payload is serializable."""
         payload = {"args": list(args), "kwargs": kwargs}
@@ -171,9 +219,9 @@ def task(
             f"idempotency_key must be callable, got {type(idempotency_key).__name__}"
         )
 
-    if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
+    if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
         raise ConfigurationError(
-            f"timeout must be a positive number, got {timeout!r}"
+            f"timeout must be a positive integer, got {timeout!r}"
         )
 
     def decorator(fn: Callable) -> TaskWrapper:

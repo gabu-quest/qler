@@ -322,13 +322,60 @@ class TestTaskTimeout:
         assert job.timeout is None
 
     def test_invalid_timeout_zero(self, queue):
-        with pytest.raises(ConfigurationError, match="positive number"):
+        with pytest.raises(ConfigurationError, match="positive integer"):
             task(queue, timeout=0)(noop_task)
 
     def test_invalid_timeout_negative(self, queue):
-        with pytest.raises(ConfigurationError, match="positive number"):
+        with pytest.raises(ConfigurationError, match="positive integer"):
             task(queue, timeout=-5)(noop_task)
 
     def test_invalid_timeout_string(self, queue):
-        with pytest.raises(ConfigurationError, match="positive number"):
+        with pytest.raises(ConfigurationError, match="positive integer"):
             task(queue, timeout="30")(noop_task)
+
+    def test_invalid_timeout_float(self, queue):
+        with pytest.raises(ConfigurationError, match="positive integer"):
+            task(queue, timeout=1.5)(noop_task)
+
+
+class TestEnqueueMany:
+    """TaskWrapper.enqueue_many() — bulk enqueue convenience."""
+
+    async def test_enqueue_many_with_tuples(self, queue):
+        """Each tuple becomes positional args for the task."""
+        wrapped = task(queue)(add_task)
+        jobs = await wrapped.enqueue_many([(1, 2), (3, 4), (5, 6)])
+        assert len(jobs) == 3
+        for job in jobs:
+            assert job.task == wrapped.task_path
+            assert job.queue_name == "default"
+            assert job.status == "pending"
+
+    async def test_enqueue_many_with_dicts(self, queue):
+        """Dicts can specify args, kwargs, and per-job overrides."""
+        wrapped = task(queue)(add_task)
+        jobs = await wrapped.enqueue_many([
+            {"args": (1, 2)},
+            {"args": (3,), "kwargs": {"y": 4}, "priority": 5},
+        ])
+        assert len(jobs) == 2
+        assert jobs[1].priority == 5
+
+    async def test_enqueue_many_empty(self, queue):
+        wrapped = task(queue)(noop_task)
+        jobs = await wrapped.enqueue_many([])
+        assert jobs == []
+
+    async def test_enqueue_many_inherits_task_defaults(self, queue):
+        """Batch jobs inherit task-level config (retries, timeout, etc.)."""
+        wrapped = task(queue, max_retries=3, timeout=30)(noop_task)
+        jobs = await wrapped.enqueue_many([(), ()])
+        assert len(jobs) == 2
+        for job in jobs:
+            assert job.max_retries == 3
+            assert job.timeout == 30
+
+    async def test_enqueue_many_invalid_item_type(self, queue):
+        wrapped = task(queue)(noop_task)
+        with pytest.raises(TypeError, match="tuple or dict"):
+            await wrapped.enqueue_many(["not_valid"])
