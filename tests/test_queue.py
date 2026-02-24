@@ -10,6 +10,7 @@ from qler._time import now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
     ConfigurationError,
+    DependencyError,
     PayloadNotSerializableError,
     PayloadTooLargeError,
 )
@@ -525,3 +526,113 @@ class TestErrorTruncation:
         assert attempts[0].traceback is not None
         assert "ValueError" in attempts[0].traceback
         assert "traceback test" in attempts[0].traceback
+
+
+class TestBatchEnqueue:
+    """Queue.enqueue_many() — atomic batch job creation."""
+
+    async def test_batch_creates_all_jobs(self, queue):
+        """All jobs in a batch are created in a single call."""
+        jobs = await queue.enqueue_many([
+            {"task_path": "app.task_a", "args": (1,)},
+            {"task_path": "app.task_b", "args": (2,)},
+            {"task_path": "app.task_c", "args": (3,)},
+        ])
+        assert len(jobs) == 3
+        assert jobs[0].task == "app.task_a"
+        assert jobs[1].task == "app.task_b"
+        assert jobs[2].task == "app.task_c"
+        for job in jobs:
+            assert job.status == JobStatus.PENDING.value
+            assert job._id is not None  # saved to DB
+
+    async def test_empty_batch_returns_empty_list(self, queue):
+        jobs = await queue.enqueue_many([])
+        assert jobs == []
+
+    async def test_batch_per_job_options(self, queue):
+        """Each job can have individual options."""
+        jobs = await queue.enqueue_many([
+            {"task_path": "t1", "priority": 10, "queue_name": "high"},
+            {"task_path": "t2", "delay": 60, "max_retries": 3},
+            {"task_path": "t3", "timeout": 30},
+        ])
+        assert len(jobs) == 3
+        assert jobs[0].priority == 10
+        assert jobs[0].queue_name == "high"
+        assert jobs[1].max_retries == 3
+        assert jobs[1].eta > jobs[0].eta  # delayed
+        assert jobs[2].timeout == 30
+
+    async def test_batch_atomic_on_bad_payload(self, queue):
+        """If any job has a bad payload, none are created."""
+        with pytest.raises(PayloadNotSerializableError, match="index 1"):
+            await queue.enqueue_many([
+                {"task_path": "good", "args": (1,)},
+                {"task_path": "bad", "args": (object(),)},
+                {"task_path": "good2", "args": (3,)},
+            ])
+
+        # Verify no jobs were created
+        count = await Job.query().count()
+        assert count == 0
+
+    async def test_batch_missing_task_path(self, queue):
+        with pytest.raises(ConfigurationError, match="index 0.*task_path"):
+            await queue.enqueue_many([{"args": (1,)}])
+
+    async def test_batch_idempotency(self, queue):
+        """Idempotency keys are checked per-job within a batch."""
+        # Pre-create a job with idempotency key
+        existing = await queue.enqueue("existing_task", idempotency_key="key-1")
+
+        jobs = await queue.enqueue_many([
+            {"task_path": "new_task", "args": (1,)},
+            {"task_path": "dupe_task", "idempotency_key": "key-1"},
+        ])
+        assert len(jobs) == 2
+        assert jobs[0].task == "new_task"
+        # Second job should be the existing one (idempotency match)
+        assert jobs[1].ulid == existing.ulid
+
+    async def test_batch_with_intra_batch_dependencies(self, queue):
+        """Jobs within a batch can depend on earlier jobs in the same batch."""
+        batch = [
+            {"task_path": "parent"},
+        ]
+        parents = await queue.enqueue_many(batch)
+        parent_ulid = parents[0].ulid
+
+        children = await queue.enqueue_many([
+            {"task_path": "child", "depends_on": [parent_ulid]},
+        ])
+        assert len(children) == 1
+        assert children[0].pending_dep_count == 1
+        assert children[0].dependencies == [parent_ulid]
+
+    async def test_batch_payload_too_large(self, queue):
+        """Payload size check applies per job in batch."""
+        large = "x" * (queue.max_payload_size + 1)
+        with pytest.raises(PayloadTooLargeError, match="index 0"):
+            await queue.enqueue_many([
+                {"task_path": "big", "args": (large,)},
+            ])
+
+    async def test_batch_dependency_not_found(self, queue):
+        """Missing dependency raises DependencyError with index."""
+        with pytest.raises(DependencyError, match="index 0.*not found"):
+            await queue.enqueue_many([
+                {"task_path": "child", "depends_on": ["NONEXISTENT"]},
+            ])
+
+    async def test_batch_default_values(self, queue):
+        """Jobs use queue defaults when options not specified."""
+        jobs = await queue.enqueue_many([
+            {"task_path": "t1"},
+        ])
+        assert len(jobs) == 1
+        assert jobs[0].queue_name == "default"
+        assert jobs[0].priority == 0
+        assert jobs[0].max_retries == queue.default_max_retries
+        assert jobs[0].retry_delay == queue.default_retry_delay
+        assert jobs[0].lease_duration == queue.default_lease_duration
