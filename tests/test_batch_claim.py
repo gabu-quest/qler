@@ -57,13 +57,6 @@ async def queue(db):
 class TestClaimJobs:
     """Verify Queue.claim_jobs batch claiming."""
 
-    async def test_returns_list(self, queue):
-        await queue.enqueue("t1", queue_name="default")
-        await queue.enqueue("t2", queue_name="default")
-        jobs = await queue.claim_jobs("w1", ["default"], n=2)
-        assert isinstance(jobs, list)
-        assert len(jobs) == 2
-
     async def test_respects_n(self, queue):
         for i in range(5):
             await queue.enqueue(f"t{i}", queue_name="default")
@@ -116,7 +109,7 @@ class TestClaimJobs:
         )
 
     async def test_partial_availability(self, queue):
-        """n=5 but only 3 pending → returns 3."""
+        """n=5 but only 3 pending -> returns 3."""
         for i in range(3):
             await queue.enqueue(f"t{i}", queue_name="default")
         jobs = await queue.claim_jobs("w1", ["default"], n=5)
@@ -134,10 +127,8 @@ class TestClaimJobs:
 
     async def test_poison_pill_filtered(self, queue):
         """Jobs with unparseable payloads are excluded from results."""
-        # Create a valid job
         await queue.enqueue("valid_task", queue_name="default")
 
-        # Create a poison pill by directly inserting a bad-payload job
         from qler._time import generate_ulid
         bad_ulid = generate_ulid()
         bad_job = Job(
@@ -151,11 +142,9 @@ class TestClaimJobs:
         await bad_job.save()
 
         jobs = await queue.claim_jobs("w1", ["default"], n=2)
-        # Only the valid job should be returned
         assert len(jobs) == 1
         assert jobs[0].task == "valid_task"
 
-        # The poison pill should be failed
         bad = await Job.query().filter(F("ulid") == bad_ulid).first()
         assert bad.status == JobStatus.FAILED.value
 
@@ -178,9 +167,38 @@ class TestClaimJobs:
         j1 = await queue.enqueue("parent")
         j2 = await queue.enqueue("child", depends_on=[j1.ulid])
         jobs = await queue.claim_jobs("w1", ["default"], n=2)
-        # Only parent should be claimable
         assert len(jobs) == 1
         assert jobs[0].ulid == j1.ulid
+
+    async def test_claims_across_multiple_queues(self, queue):
+        """Jobs from different queues are claimed in a single batch."""
+        await queue.enqueue("alpha_task", queue_name="alpha")
+        await queue.enqueue("beta_task", queue_name="beta")
+        jobs = await queue.claim_jobs("w1", ["alpha", "beta"], n=2)
+        assert len(jobs) == 2
+        queue_names = {j.queue_name for j in jobs}
+        assert queue_names == {"alpha", "beta"}
+        tasks = {j.task for j in jobs}
+        assert tasks == {"alpha_task", "beta_task"}
+
+    async def test_rate_limited_jobs_filtered(self, db):
+        """Rate-limited jobs are requeued and excluded from results."""
+        q = Queue(db, rate_limits={"default": "1/m"})
+        await q.init_db()
+
+        await q.enqueue("t1", queue_name="default")
+        await q.enqueue("t2", queue_name="default")
+
+        jobs = await q.claim_jobs("w1", ["default"], n=2)
+        # First job passes rate limit, second gets rate-limited
+        assert len(jobs) == 1
+        assert jobs[0].task == "t1"
+
+        # The second job should be back to pending (requeued)
+        pending = await Job.query().filter(
+            F("status") == JobStatus.PENDING.value
+        ).count()
+        assert pending == 1
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +228,15 @@ class TestWorkerBatchDispatch:
 
         worker_task = asyncio.create_task(w.run())
         try:
-            # Wait for all 3 jobs to complete
             start = asyncio.get_event_loop().time()
             while len(_batch_log) < 3:
-                if asyncio.get_event_loop().time() - start > 5.0:
-                    break
+                elapsed = asyncio.get_event_loop().time() - start
+                if elapsed > 5.0:
+                    pytest.fail(
+                        f"Worker dispatch timed out after {elapsed:.1f}s: "
+                        f"only {len(_batch_log)}/3 jobs completed. "
+                        f"Completed: {_batch_log}"
+                    )
                 await asyncio.sleep(0.02)
 
             assert len(_batch_log) == 3
