@@ -52,6 +52,8 @@ class Worker:
         shutdown_timeout: float = 30.0,
         health_port: int | None = None,
         health_socket: str | None = None,
+        archive_interval: float | None = None,
+        archive_after: int = 300,
     ) -> None:
         if queues is not None and len(queues) == 0:
             raise ConfigurationError("queues list must not be empty")
@@ -80,6 +82,8 @@ class Worker:
         self.shutdown_timeout = shutdown_timeout
         self.health_port = health_port
         self.health_socket = health_socket
+        self.archive_interval = archive_interval
+        self.archive_after = archive_after
 
         hostname = socket.gethostname()
         pid = os.getpid()
@@ -246,6 +250,10 @@ class Worker:
             if self.health_port is not None or self.health_socket is not None:
                 self._background_tasks.append(
                     asyncio.create_task(self._health_server_loop())
+                )
+            if self.archive_interval is not None:
+                self._background_tasks.append(
+                    asyncio.create_task(self._archival_loop())
                 )
 
             # Main claim loop
@@ -451,6 +459,21 @@ class Worker:
                     logger.info("Recovered %d expired leases", recovered)
             except Exception:
                 logger.exception("Error in lease recovery loop")
+
+    async def _archival_loop(self) -> None:
+        """Background task: periodically archive terminal jobs."""
+        while self._running:
+            await asyncio.sleep(self.archive_interval)
+            if not self._running:
+                break
+            try:
+                count = await self.queue.archive_jobs(
+                    older_than_seconds=self.archive_after
+                )
+                if count:
+                    logger.info("Archived %d terminal jobs", count)
+            except Exception:
+                logger.exception("Error in archival loop")
 
     async def _cron_scheduler_loop(self) -> None:
         """Background task: enqueue cron jobs at their scheduled times.
