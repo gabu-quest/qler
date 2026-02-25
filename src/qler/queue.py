@@ -765,6 +765,106 @@ class Queue:
 
         return job
 
+    async def claim_jobs(
+        self,
+        worker_id: str,
+        queues: list[str],
+        n: int = 1,
+    ) -> list[Job]:
+        """Atomically claim up to *n* eligible jobs. Returns list of Jobs.
+
+        Uses batch UPDATE via ``update_n()`` to claim multiple jobs in a single
+        SQL statement, then performs per-job post-processing (poison pill check,
+        rate limit check, attempt record creation).
+
+        Args:
+            worker_id: Identifier of the claiming worker.
+            queues: Queue names to claim from.
+            n: Maximum number of jobs to claim.
+
+        Returns:
+            list[Job]: Claimed jobs (may be shorter than *n*).
+        """
+        await self._lazy_init()
+
+        if not queues:
+            raise ConfigurationError("queues list must not be empty")
+        if n < 1:
+            raise ConfigurationError("n must be >= 1")
+
+        now_ts = now_epoch()
+
+        # Atomic batch claim
+        jobs = await Job.query().filter(
+            (F("status") == JobStatus.PENDING.value)
+            & F("queue_name").in_list(queues)
+            & (F("eta") <= now_ts)
+            & (F("pending_dep_count") == 0)
+        ).order_by("-priority", "eta", "ulid").update_n(
+            n,
+            status=JobStatus.RUNNING.value,
+            worker_id=worker_id,
+            attempts=F("attempts") + 1,
+            lease_expires_at=now_ts + self.default_lease_duration,
+            updated_at=now_ts,
+        )
+
+        if not jobs:
+            return []
+
+        claimed: list[Job] = []
+        for job in jobs:
+            attempt_id = generate_ulid()
+
+            # Set last_attempt_id per-job (unique per job, can't batch)
+            await Job.query().filter(
+                (F("ulid") == job.ulid)
+                & (F("status") == JobStatus.RUNNING.value)
+            ).update_one(
+                last_attempt_id=attempt_id,
+                updated_at=now_ts,
+            )
+
+            # Poison pill check
+            try:
+                json.loads(job.payload_json)
+            except (json.JSONDecodeError, TypeError):
+                await self._poison_pill(job, worker_id, attempt_id, now_ts)
+                continue
+
+            # Rate limit check
+            if not self.immediate:
+                rate_limited = await self._check_rate_limits(
+                    job, worker_id, now_ts,
+                )
+                if rate_limited:
+                    continue
+
+            # Create attempt record
+            attempt = JobAttempt(
+                ulid=attempt_id,
+                job_ulid=job.ulid,
+                status=AttemptStatus.RUNNING.value,
+                attempt_number=job.attempts,
+                worker_id=worker_id,
+                started_at=now_ts,
+                lease_expires_at=now_ts + self.default_lease_duration,
+            )
+            await attempt.save()
+
+            _lifecycle(
+                "job.claimed", job_id=job.ulid, queue=job.queue_name,
+                task=job.task, correlation_id=job.correlation_id,
+                worker_id=worker_id, attempt=job.attempts,
+            )
+
+            if self._metrics:
+                self._metrics.inc_claimed(job.queue_name, job.task)
+
+            claimed.append(job)
+
+        return claimed
+
     async def _poison_pill(
         self, job: Job, worker_id: str, attempt_id: str, now_ts: int
     ) -> None:

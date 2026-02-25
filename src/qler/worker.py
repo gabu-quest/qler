@@ -267,10 +267,9 @@ class Worker:
         self._running = False
 
     async def _claim_loop(self) -> None:
-        """Main loop: acquire semaphore → claim job → dispatch execution."""
+        """Main loop: acquire semaphore slots → batch claim jobs → dispatch."""
         while self._running:
-            # Use timeout on acquire so _running=False can exit the loop
-            # even when all concurrency slots are occupied by active jobs.
+            # Wait for at least one free slot
             try:
                 await asyncio.wait_for(
                     self._semaphore.acquire(), timeout=self.poll_interval
@@ -282,24 +281,40 @@ class Worker:
                 self._semaphore.release()
                 break
 
+            # Greedily acquire additional free slots for batch claiming
+            batch_size = 1
+            while batch_size < self.concurrency and not self._semaphore.locked():
+                await self._semaphore.acquire()
+                batch_size += 1
+
             try:
-                job = await self.queue.claim_job(self.worker_id, self.queues)
+                jobs = await self.queue.claim_jobs(
+                    self.worker_id, self.queues, n=batch_size,
+                )
             except Exception:
-                self._semaphore.release()
-                logger.exception("Error claiming job")
+                for _ in range(batch_size):
+                    self._semaphore.release()
+                logger.exception("Error claiming jobs")
                 await asyncio.sleep(self.poll_interval)
                 continue
 
-            if job is None:
-                self._semaphore.release()
+            if not jobs:
+                for _ in range(batch_size):
+                    self._semaphore.release()
                 await asyncio.sleep(self.poll_interval)
                 continue
 
-            # Dispatch execution
-            self._active_jobs[job.ulid] = job
-            t = asyncio.create_task(self._execute_job(job))
-            self._active_tasks.add(t)
-            t.add_done_callback(self._active_tasks.discard)
+            # Release unused slots
+            unused = batch_size - len(jobs)
+            for _ in range(unused):
+                self._semaphore.release()
+
+            # Dispatch each claimed job
+            for job in jobs:
+                self._active_jobs[job.ulid] = job
+                t = asyncio.create_task(self._execute_job(job))
+                self._active_tasks.add(t)
+                t.add_done_callback(self._active_tasks.discard)
 
     async def _execute_job(self, job: Any) -> None:
         """Execute a single job: resolve task, validate signature, run, complete/fail."""
