@@ -224,6 +224,12 @@ class Queue:
                 "WHERE json_extract(data, '$.unique_key') IS NOT NULL "
                 "AND status IN ('pending', 'running')"
             ),
+            # 8. Dependency resolution: find pending jobs with unresolved deps
+            (
+                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_pending_deps "
+                "ON qler_jobs (status, pending_dep_count) "
+                "WHERE status = 'pending' AND pending_dep_count > 0"
+            ),
         ]
         for ddl in indexes:
             cur = await adapter.execute(ddl)

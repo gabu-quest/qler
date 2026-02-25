@@ -70,6 +70,17 @@ class TestArchiveTableCreation:
         assert len(rows) == 1
         assert rows[0][0] == "qler_jobs_archive"
 
+    async def test_pending_deps_index_created(self, queue):
+        """init_db() creates a partial index for dependency resolution."""
+        cur = await queue.db.adapter.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_qler_jobs_pending_deps'"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        assert len(rows) == 1
+        assert rows[0][0] == "idx_qler_jobs_pending_deps"
+
 
 # ---------------------------------------------------------------------------
 # archive_jobs()
