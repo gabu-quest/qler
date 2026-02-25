@@ -543,25 +543,27 @@ class Queue:
             job_instances.append(job)
             batch_ulids[job.ulid] = job
 
-        # Phase 2: Save all new jobs (skip idempotency-matched existing ones)
-        for job in job_instances:
-            if job._id is None:  # New job, not an existing idempotency match
-                await job.save()
-                if job.dependencies:
-                    for dep_ulid in job.dependencies:
-                        cur = await self._db.adapter.execute(
-                            "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)",
-                            [dep_ulid, job.ulid],
-                        )
-                        await cur.close()
-                    await self._db.adapter.auto_commit()
-                _lifecycle(
-                    "job.enqueued", job_id=job.ulid, queue=job.queue_name,
-                    task=job.task, correlation_id=job.correlation_id,
-                    priority=job.priority, batch=True,
-                )
-                if self._metrics:
-                    self._metrics.inc_enqueued(job.queue_name, job.task)
+        # Phase 2: Batch-save all new jobs (skip idempotency/uniqueness-matched existing ones)
+        new_jobs = [j for j in job_instances if j._id is None]
+        if new_jobs:
+            await Job.asave_many(new_jobs)
+
+        for job in new_jobs:
+            if job.dependencies:
+                for dep_ulid in job.dependencies:
+                    cur = await self._db.adapter.execute(
+                        "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)",
+                        [dep_ulid, job.ulid],
+                    )
+                    await cur.close()
+                await self._db.adapter.auto_commit()
+            _lifecycle(
+                "job.enqueued", job_id=job.ulid, queue=job.queue_name,
+                task=job.task, correlation_id=job.correlation_id,
+                priority=job.priority, batch=True,
+            )
+            if self._metrics:
+                self._metrics.inc_enqueued(job.queue_name, job.task)
 
         # Phase 3: Execute in immediate mode if applicable
         if self.immediate:
