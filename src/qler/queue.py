@@ -166,6 +166,16 @@ class Queue:
         except Exception:
             pass  # Column already exists
 
+        # Reverse dependency map for O(1) child lookups
+        cur = await self._db.adapter.execute(
+            "CREATE TABLE IF NOT EXISTS qler_job_deps ("
+            "parent_ulid TEXT NOT NULL, "
+            "child_ulid TEXT NOT NULL, "
+            "PRIMARY KEY (parent_ulid, child_ulid))"
+        )
+        await cur.close()
+        await self._db.adapter.auto_commit()
+
         await self._create_indexes()
 
         # Create archive table with same schema (no indexes — read-only)
@@ -230,6 +240,8 @@ class Queue:
                 "ON qler_jobs (status, pending_dep_count) "
                 "WHERE status = 'pending' AND pending_dep_count > 0"
             ),
+            # 9. Reverse dependency map: find children by parent
+            "CREATE INDEX IF NOT EXISTS idx_qler_job_deps_parent ON qler_job_deps (parent_ulid)",
         ]
         for ddl in indexes:
             cur = await adapter.execute(ddl)
@@ -356,6 +368,15 @@ class Queue:
             updated_at=now,
         )
         await job.save()
+
+        if dep_list:
+            for dep_ulid in dep_list:
+                cur = await self._db.adapter.execute(
+                    "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)",
+                    [dep_ulid, job.ulid],
+                )
+                await cur.close()
+            await self._db.adapter.auto_commit()
 
         _lifecycle(
             "job.enqueued", job_id=job.ulid, queue=queue_name,
@@ -526,6 +547,14 @@ class Queue:
         for job in job_instances:
             if job._id is None:  # New job, not an existing idempotency match
                 await job.save()
+                if job.dependencies:
+                    for dep_ulid in job.dependencies:
+                        cur = await self._db.adapter.execute(
+                            "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)",
+                            [dep_ulid, job.ulid],
+                        )
+                        await cur.close()
+                    await self._db.adapter.auto_commit()
                 _lifecycle(
                     "job.enqueued", job_id=job.ulid, queue=job.queue_name,
                     task=job.task, correlation_id=job.correlation_id,
@@ -987,46 +1016,47 @@ class Queue:
 
     async def _resolve_dependencies(self, completed_ulid: str) -> None:
         """Decrement pending_dep_count for jobs depending on the completed job."""
-        # Find PENDING jobs that still have pending deps
-        candidates = await Job.query().filter(
-            (F("status") == JobStatus.PENDING.value)
-            & (F("pending_dep_count") > 0)
-        ).all()
+        cur = await self._db.adapter.execute(
+            "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
+            [completed_ulid],
+        )
+        children = await cur.fetchall()
+        await cur.close()
 
-        for candidate in candidates:
-            if completed_ulid in candidate.dependencies:
-                await Job.query().filter(
-                    (F("ulid") == candidate.ulid)
-                    & (F("status") == JobStatus.PENDING.value)
-                    & (F("pending_dep_count") > 0)
-                ).update_one(
-                    pending_dep_count=F("pending_dep_count") - 1,
-                    updated_at=now_epoch(),
-                )
+        for (child_ulid,) in children:
+            await Job.query().filter(
+                (F("ulid") == child_ulid)
+                & (F("status") == JobStatus.PENDING.value)
+                & (F("pending_dep_count") > 0)
+            ).update_one(
+                pending_dep_count=F("pending_dep_count") - 1,
+                updated_at=now_epoch(),
+            )
 
     async def _cascade_cancel_dependents(self, failed_ulid: str) -> None:
         """Cancel PENDING jobs that depend on a failed/cancelled job, recursively."""
-        candidates = await Job.query().filter(
-            F("status") == JobStatus.PENDING.value
-        ).all()
+        cur = await self._db.adapter.execute(
+            "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
+            [failed_ulid],
+        )
+        children = await cur.fetchall()
+        await cur.close()
 
         now = now_epoch()
         cancelled_ulids: list[str] = []
-        for candidate in candidates:
-            if failed_ulid in candidate.dependencies:
-                updated = await Job.query().filter(
-                    (F("ulid") == candidate.ulid)
-                    & (F("status") == JobStatus.PENDING.value)
-                ).update_one(
-                    status=JobStatus.CANCELLED.value,
-                    last_error=f"Dependency {failed_ulid} failed/cancelled",
-                    finished_at=now,
-                    updated_at=now,
-                )
-                if updated is not None:
-                    cancelled_ulids.append(candidate.ulid)
+        for (child_ulid,) in children:
+            updated = await Job.query().filter(
+                (F("ulid") == child_ulid)
+                & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.CANCELLED.value,
+                last_error=f"Dependency {failed_ulid} failed/cancelled",
+                finished_at=now,
+                updated_at=now,
+            )
+            if updated is not None:
+                cancelled_ulids.append(child_ulid)
 
-        # Recurse for transitive dependents
         for ulid in cancelled_ulids:
             await self._cascade_cancel_dependents(ulid)
 
@@ -1193,6 +1223,15 @@ class Queue:
             cur = await self._db.adapter.execute(
                 f"INSERT INTO qler_jobs_archive SELECT * FROM qler_jobs {_where}",
                 [threshold],
+            )
+            await cur.close()
+
+            # Clean up reverse dependency map for jobs being archived
+            cur = await self._db.adapter.execute(
+                f"DELETE FROM qler_job_deps WHERE parent_ulid IN "
+                f"(SELECT ulid FROM qler_jobs {_where}) "
+                f"OR child_ulid IN (SELECT ulid FROM qler_jobs {_where})",
+                [threshold, threshold],
             )
             await cur.close()
 
