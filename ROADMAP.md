@@ -6,7 +6,7 @@
 
 Resolved all blocking sqler features. See [SQLER_GAPS.md](SQLER_GAPS.md).
 
-**Where:** `/home/gabu/projects/pypi/sqler/` — branch `feat/qler-prerequisites`
+**Where:** `../sqler` — branch `feat/qler-prerequisites`
 
 - ✅ Multi-field `order_by("-priority", "eta", "ulid")` — Django-style, `-` prefix = DESC
 - ✅ Promoted columns (`__promoted__`, `__checks__`) — real SQLite columns, CHECK constraints, SQL rewriting
@@ -24,7 +24,7 @@ Job.query().filter(...).order_by("-priority", "eta", "ulid").update_one(
 
 Give logler the ability to ingest directly from sqler SQLite databases — no manual file exports, no temp file management by the user. logler handles everything behind the scenes.
 
-**Where:** `/home/gabu/projects/logler/`
+**Where:** `../logler`
 
 **Database source (the main bridge):**
 - `Investigator.load_from_db(db_path)` — new data source that reads sqler SQLite tables directly
