@@ -101,6 +101,18 @@ def _parse_since(since: str) -> int:
     return now_epoch() - total
 
 
+def _parse_since_to_seconds(since: str) -> int:
+    """Parse '1h', '30m', '7d' → total seconds."""
+    total = 0
+    for amount, unit in _SINCE_PATTERN.findall(since):
+        total += int(amount) * _SINCE_UNITS[unit]
+    if total == 0:
+        raise click.BadParameter(f"Invalid duration: {since}")
+    if total > _MAX_SINCE_SECONDS:
+        raise click.BadParameter(f"Duration exceeds maximum of 10 years: {since}")
+    return total
+
+
 def _validate_module_path(mod_path: str) -> None:
     """Validate a module path is a valid dotted Python identifier."""
     if not _MODULE_PATTERN.fullmatch(mod_path):
@@ -453,11 +465,12 @@ def health(
 
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
+@click.option("--include-archive", is_flag=True, help="Include archived jobs in counts")
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
-def status(db: str, output_json: bool) -> None:
+def status(db: str, include_archive: bool, output_json: bool) -> None:
     """Show queue depths and job counts."""
 
-    async def _status() -> dict[str, dict[str, int]]:
+    async def _status() -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
         q = await _get_queue(db)
         try:
             sql = """
@@ -477,22 +490,45 @@ def status(db: str, output_json: bool) -> None:
                         "completed": 0, "failed": 0, "cancelled": 0,
                     }
                 queues[queue_name][job_status] = count
-            return queues
+
+            archived: dict[str, dict[str, int]] = {}
+            if include_archive:
+                sql_archive = """
+                    SELECT queue_name, status, COUNT(*) as cnt
+                    FROM qler_jobs_archive
+                    GROUP BY queue_name, status
+                """
+                cur = await q.db.adapter.execute(sql_archive)
+                rows = await cur.fetchall()
+                await cur.close()
+                for queue_name, job_status, count in rows:
+                    if queue_name not in archived:
+                        archived[queue_name] = {
+                            "completed": 0, "failed": 0, "cancelled": 0,
+                        }
+                    archived[queue_name][job_status] = count
+
+            return queues, archived
         finally:
             await q.close()
 
-    result = _run(_status())
-    total = sum(sum(v.values()) for v in result.values())
+    active, archived = _run(_status())
+    total = sum(sum(v.values()) for v in active.values())
+    archived_total = sum(sum(v.values()) for v in archived.values())
 
     if output_json:
-        _echo_json({"queues": result, "total": total})
+        data: dict[str, Any] = {"queues": active, "total": total}
+        if include_archive:
+            data["archived"] = archived
+            data["archived_total"] = archived_total
+        _echo_json(data)
     else:
-        if not result:
+        if not active and not archived:
             click.echo("No jobs found.")
             return
         headers = ["Queue", "Pending", "Running", "Completed", "Failed", "Cancelled"]
         rows = []
-        for name, counts in sorted(result.items()):
+        for name, counts in sorted(active.items()):
             rows.append([
                 name,
                 str(counts["pending"]),
@@ -503,6 +539,18 @@ def status(db: str, output_json: bool) -> None:
             ])
         _echo_table(headers, rows)
         click.echo(f"\nTotal: {total} jobs")
+        if include_archive and archived:
+            click.echo(f"\nArchived: {archived_total} jobs")
+            headers = ["Queue", "Completed", "Failed", "Cancelled"]
+            rows = []
+            for name, counts in sorted(archived.items()):
+                rows.append([
+                    name,
+                    str(counts.get("completed", 0)),
+                    str(counts.get("failed", 0)),
+                    str(counts.get("cancelled", 0)),
+                ])
+            _echo_table(headers, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +567,7 @@ def status(db: str, output_json: bool) -> None:
 @click.option("--task", "filter_task", help="Filter by task path")
 @click.option("--since", "since", help="Time window, e.g. '1h', '30m', '7d'")
 @click.option("--limit", default=50, type=int, help="Max jobs to return")
+@click.option("--include-archive", is_flag=True, help="Also search archived jobs")
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
 def jobs(
     db: str,
@@ -527,12 +576,13 @@ def jobs(
     filter_task: str | None,
     since: str | None,
     limit: int,
+    include_archive: bool,
     output_json: bool,
 ) -> None:
     """List jobs with optional filters."""
     from sqler import F
 
-    async def _jobs() -> list[Job]:
+    async def _jobs() -> tuple[list[Job], list[Job]]:
         q = await _get_queue(db)
         try:
             query = Job.query()
@@ -553,21 +603,38 @@ def jobs(
                     combined = combined & f
                 query = query.filter(combined)
 
-            return await query.order_by("-ulid").limit(limit).all()
+            active = await query.order_by("-ulid").limit(limit).all()
+
+            archived: list[Job] = []
+            if include_archive:
+                archived = await q.archived_jobs(
+                    queue_name=filter_queue,
+                    status=filter_status,
+                    limit=limit,
+                )
+
+            return active, archived
         finally:
             await q.close()
 
-    result = _run(_jobs())
+    active, archived = _run(_jobs())
 
     if output_json:
-        _echo_json([_job_to_dict(j) for j in result])
+        data = [_job_to_dict(j) for j in active]
+        if include_archive:
+            for j in archived:
+                d = _job_to_dict(j)
+                d["archived"] = True
+                data.append(d)
+        _echo_json(data)
     else:
-        if not result:
+        all_jobs = active + archived
+        if not all_jobs:
             click.echo("No jobs found.")
             return
         headers = ["ULID", "Status", "Queue", "Task", "Created", "Error"]
         rows = []
-        for j in result:
+        for j in active:
             error = (j.last_error or "")[:40]
             rows.append([
                 j.ulid[:12] + "...",
@@ -577,8 +644,22 @@ def jobs(
                 _format_ts(j.created_at),
                 error,
             ])
+        for j in archived:
+            error = (j.last_error or "")[:40]
+            rows.append([
+                j.ulid[:12] + "...",
+                j.status + " (archived)",
+                j.queue_name,
+                j.task,
+                _format_ts(j.created_at),
+                error,
+            ])
         _echo_table(headers, rows)
-        click.echo(f"\n{len(result)} jobs shown")
+        shown = len(all_jobs)
+        msg = f"\n{shown} jobs shown"
+        if archived:
+            msg += f" ({len(archived)} archived)"
+        click.echo(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +963,33 @@ def cancel_cmd(
                 click.echo(f"  {u}")
         if not cancelled and not requested:
             click.echo("No jobs cancelled.")
+
+
+# ---------------------------------------------------------------------------
+# qler archive
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
+@click.option("--older-than", default="5m", help="Age threshold, e.g. '5m', '1h', '7d' (default: 5m)")
+@click.option("--json", "output_json", is_flag=True, help="Output JSON")
+def archive(db: str, older_than: str, output_json: bool) -> None:
+    """Move terminal jobs to archive table."""
+    seconds = _parse_since_to_seconds(older_than)
+
+    async def _archive() -> int:
+        q = await _get_queue(db)
+        try:
+            return await q.archive_jobs(older_than_seconds=seconds)
+        finally:
+            await q.close()
+
+    count = _run(_archive())
+
+    if output_json:
+        _echo_json({"archived": count})
+    else:
+        click.echo(f"Archived {count} jobs.")
 
 
 # ---------------------------------------------------------------------------

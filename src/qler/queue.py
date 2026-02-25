@@ -168,6 +168,12 @@ class Queue:
 
         await self._create_indexes()
 
+        # Create archive table with same schema (no indexes — read-only)
+        await self._db._ensure_table_with_promoted(
+            "qler_jobs_archive", Job.__promoted__, Job.__checks__
+        )
+        await self._db._ensure_versioned_table("qler_jobs_archive")
+
         # Wire up queue depth query for Prometheus scrapes
         if self._metrics is not None:
             self._metrics.set_depth_query(self._query_queue_depth)
@@ -1156,6 +1162,87 @@ class Queue:
             return rows
         except Exception:
             return []
+
+    # ------------------------------------------------------------------
+    # Archival
+    # ------------------------------------------------------------------
+
+    _TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
+    async def archive_jobs(self, older_than_seconds: int = 300) -> int:
+        """Move terminal jobs older than threshold to archive table.
+
+        Returns number of jobs archived.
+        """
+        await self._lazy_init()
+        threshold = now_epoch() - older_than_seconds
+
+        _where = (
+            "WHERE status IN ('completed', 'failed', 'cancelled') "
+            "AND json_extract(data, '$.finished_at') IS NOT NULL "
+            "AND json_extract(data, '$.finished_at') < ?"
+        )
+
+        async with self._db.transaction():
+            cur = await self._db.adapter.execute(
+                f"INSERT INTO qler_jobs_archive SELECT * FROM qler_jobs {_where}",
+                [threshold],
+            )
+            await cur.close()
+
+            cur = await self._db.adapter.execute(
+                f"DELETE FROM qler_jobs {_where}",
+                [threshold],
+            )
+            count = cur.rowcount
+            await cur.close()
+
+        if count:
+            _lifecycle(
+                "job.archived",
+                job_id="",
+                queue="*",
+                task="*",
+                count=count,
+                older_than_seconds=older_than_seconds,
+            )
+        return count
+
+    async def archived_jobs(
+        self,
+        *,
+        queue_name: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[Job]:
+        """Query archived jobs (read-only)."""
+        await self._lazy_init()
+        Job.set_db(self._db, "qler_jobs_archive")
+        try:
+            query = Job.query()
+            filters = []
+            if queue_name:
+                filters.append(F("queue_name") == queue_name)
+            if status:
+                filters.append(F("status") == status)
+            if filters:
+                combined = filters[0]
+                for f in filters[1:]:
+                    combined = combined & f
+                query = query.filter(combined)
+            return await query.order_by("-ulid").limit(limit).all()
+        finally:
+            Job.set_db(self._db, "qler_jobs")
+
+    async def archive_count(self) -> int:
+        """Return total number of archived jobs."""
+        await self._lazy_init()
+        cur = await self._db.adapter.execute(
+            "SELECT COUNT(*) FROM qler_jobs_archive"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else 0
 
     async def close(self) -> None:
         """Close the database connection if we own it."""
