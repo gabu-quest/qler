@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import platform
 import resource
 import signal
 import socket
@@ -74,6 +75,18 @@ class Worker:
         if health_port is not None and not (1 <= health_port <= 65535):
             raise ConfigurationError(
                 f"health_port must be between 1 and 65535, got {health_port}"
+            )
+        if archive_interval is not None and archive_interval < 1.0:
+            raise ConfigurationError(
+                f"archive_interval must be >= 1.0 seconds, got {archive_interval}"
+            )
+        if archive_after < 0:
+            raise ConfigurationError(
+                f"archive_after must be >= 0, got {archive_after}"
+            )
+        if memory_limit_mb is not None and memory_limit_mb < 1:
+            raise ConfigurationError(
+                f"memory_limit_mb must be >= 1, got {memory_limit_mb}"
             )
 
         self.queue = queue
@@ -510,9 +523,11 @@ class Worker:
             if not self._running:
                 break
             try:
-                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                # Linux reports KB, macOS reports bytes — normalize to MB
-                rss_mb = rss_kb / 1024
+                rss_raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                if platform.system() == "Darwin":
+                    rss_mb = rss_raw / (1024 * 1024)  # macOS: bytes -> MB
+                else:
+                    rss_mb = rss_raw / 1024  # Linux: KB -> MB
                 if rss_mb > self.memory_limit_mb:
                     logger.warning(
                         "Memory watchdog: RSS %.0f MB exceeds limit %d MB, "

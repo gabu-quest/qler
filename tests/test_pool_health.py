@@ -239,22 +239,45 @@ class TestPoolHealthMethod:
 
     async def test_pool_health_method(self, disk_db, disk_queue):
         """pool_health() reports size, available, and healthy status."""
+        # Idle pool: all 4 connections available
         result = await disk_queue.pool_health()
-        adapter = disk_db.adapter
+        assert result["pool_size"] == 4
+        assert result["available"] == 4
+        assert result["healthy"] is True
 
-        assert result["pool_size"] == adapter._pool_size
-        assert result["available"] == adapter._pool.qsize()
+        # Hold a connection — pool becomes unhealthy
+        conn = await disk_db.adapter._pool.get()
+        try:
+            result = await disk_queue.pool_health()
+            assert result["pool_size"] == 4
+            assert result["available"] == 3
+            assert result["healthy"] is False
+        finally:
+            await disk_db.adapter._pool.put(conn)
+
+        # After release — healthy again
+        result = await disk_queue.pool_health()
+        assert result["available"] == 4
         assert result["healthy"] is True
 
     async def test_health_response_includes_pool(self, disk_db, disk_queue):
-        """Worker._health_response() includes pool stats."""
+        """Worker._health_response() includes pool stats with concrete values."""
         w = _make_worker(disk_queue)
-        # Must init before health response can read adapter
         await disk_queue.init_db()
-        resp = w._health_response()
 
-        assert "pool" in resp
+        # Idle: all connections returned
+        resp = w._health_response()
         pool = resp["pool"]
-        assert pool["size"] == disk_db.adapter._pool_size
-        assert pool["available"] == disk_db.adapter._pool.qsize()
+        assert pool["size"] == 4
+        assert pool["available"] == 4
         assert pool["healthy"] is True
+
+        # Hold a connection — health response reflects it
+        conn = await disk_db.adapter._pool.get()
+        try:
+            resp = w._health_response()
+            pool = resp["pool"]
+            assert pool["available"] == 3
+            assert pool["healthy"] is False
+        finally:
+            await disk_db.adapter._pool.put(conn)
