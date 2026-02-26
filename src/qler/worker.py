@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import resource
 import signal
 import socket
 import time
@@ -54,6 +55,7 @@ class Worker:
         health_socket: str | None = None,
         archive_interval: float | None = None,
         archive_after: int = 300,
+        memory_limit_mb: int | None = None,
     ) -> None:
         if queues is not None and len(queues) == 0:
             raise ConfigurationError("queues list must not be empty")
@@ -84,6 +86,7 @@ class Worker:
         self.health_socket = health_socket
         self.archive_interval = archive_interval
         self.archive_after = archive_after
+        self.memory_limit_mb = memory_limit_mb
 
         hostname = socket.gethostname()
         pid = os.getpid()
@@ -103,6 +106,7 @@ class Worker:
 
     def _health_response(self) -> dict[str, Any]:
         """Build the JSON health response from live instance state."""
+        adapter = self.queue.db.adapter
         return {
             "status": self.status,
             "worker_id": self.worker_id,
@@ -111,6 +115,11 @@ class Worker:
             "concurrency": self.concurrency,
             "queues": self.queues,
             "started_at": self._started_at,
+            "pool": {
+                "size": adapter._pool_size,
+                "available": adapter._pool.qsize(),
+                "healthy": adapter._pool.qsize() == adapter._pool_size,
+            },
         }
 
     async def _handle_health_request(
@@ -254,6 +263,10 @@ class Worker:
             if self.archive_interval is not None:
                 self._background_tasks.append(
                     asyncio.create_task(self._archival_loop())
+                )
+            if self.memory_limit_mb is not None:
+                self._background_tasks.append(
+                    asyncio.create_task(self._memory_watchdog_loop())
                 )
 
             # Main claim loop
@@ -489,6 +502,31 @@ class Worker:
                     logger.info("Archived %d terminal jobs", count)
             except Exception:
                 logger.exception("Error in archival loop")
+
+    async def _memory_watchdog_loop(self) -> None:
+        """Background task: log warnings and trigger archival when RSS exceeds limit."""
+        while self._running:
+            await asyncio.sleep(30)
+            if not self._running:
+                break
+            try:
+                rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                # Linux reports KB, macOS reports bytes — normalize to MB
+                rss_mb = rss_kb / 1024
+                if rss_mb > self.memory_limit_mb:
+                    logger.warning(
+                        "Memory watchdog: RSS %.0f MB exceeds limit %d MB, "
+                        "triggering emergency archival",
+                        rss_mb,
+                        self.memory_limit_mb,
+                    )
+                    count = await self.queue.archive_jobs(older_than_seconds=0)
+                    if count:
+                        logger.info(
+                            "Memory watchdog: archived %d jobs", count
+                        )
+            except Exception:
+                logger.exception("Error in memory watchdog loop")
 
     async def _cron_scheduler_loop(self) -> None:
         """Background task: enqueue cron jobs at their scheduled times.
