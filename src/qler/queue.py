@@ -415,6 +415,7 @@ class Queue:
         # Phase 1: Validate all jobs and build Job instances
         job_instances: list[Job] = []
         batch_ulids: dict[str, Job] = {}  # for intra-batch dependency resolution
+        batch_idem_keys: dict[str, Job] = {}  # for intra-batch idempotency dedup
 
         for i, spec in enumerate(jobs):
             task_path = spec.get("task_path")
@@ -454,7 +455,7 @@ class Queue:
                     max_size=self.max_payload_size,
                 )
 
-            # Idempotency check
+            # Idempotency check (DB then intra-batch)
             if idempotency_key is not None:
                 existing = await Job.query().filter(
                     (F("idempotency_key") == idempotency_key)
@@ -462,6 +463,9 @@ class Queue:
                 ).first()
                 if existing is not None:
                     job_instances.append(existing)
+                    continue
+                if idempotency_key in batch_idem_keys:
+                    job_instances.append(batch_idem_keys[idempotency_key])
                     continue
 
             # Uniqueness check
@@ -542,9 +546,17 @@ class Queue:
             )
             job_instances.append(job)
             batch_ulids[job.ulid] = job
+            if idempotency_key is not None:
+                batch_idem_keys[idempotency_key] = job
 
         # Phase 2: Batch-save all new jobs (skip idempotency/uniqueness-matched existing ones)
-        new_jobs = [j for j in job_instances if j._id is None]
+        # Deduplicate by identity — intra-batch dedup may add the same object twice
+        seen_ids: set[int] = set()
+        new_jobs: list[Job] = []
+        for j in job_instances:
+            if j._id is None and id(j) not in seen_ids:
+                seen_ids.add(id(j))
+                new_jobs.append(j)
         if new_jobs:
             await Job.asave_many(new_jobs)
 
@@ -824,6 +836,8 @@ class Queue:
                 last_attempt_id=attempt_id,
                 updated_at=now_ts,
             )
+            # Keep in-memory object in sync for _terminalize_attempt
+            job.last_attempt_id = attempt_id
 
             # Poison pill check
             try:
@@ -1124,6 +1138,7 @@ class Queue:
         )
         children = await cur.fetchall()
         await cur.close()
+        await self._db.adapter.auto_commit()
 
         for (child_ulid,) in children:
             await Job.query().filter(
@@ -1143,6 +1158,7 @@ class Queue:
         )
         children = await cur.fetchall()
         await cur.close()
+        await self._db.adapter.auto_commit()
 
         now = now_epoch()
         cancelled_ulids: list[str] = []
