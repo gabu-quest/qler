@@ -335,6 +335,9 @@ def backup(db: str, destination: str, output_json: bool) -> None:
 @click.option("--shutdown-timeout", default=30.0, type=float, help="Shutdown timeout in seconds")
 @click.option("--health-port", type=int, default=None, help="TCP port for health endpoint")
 @click.option("--health-socket", type=str, default=None, help="Unix socket path for health endpoint")
+@click.option("--archive-interval", type=float, default=None, help="Archival sweep interval in seconds (disabled by default)")
+@click.option("--archive-after", type=int, default=300, help="Archive jobs older than N seconds (default: 300)")
+@click.option("--memory-limit-mb", type=int, default=None, help="RSS limit in MB — triggers emergency archival (disabled by default)")
 def worker(
     db: str | None,
     app_string: str | None,
@@ -345,6 +348,9 @@ def worker(
     shutdown_timeout: float,
     health_port: int | None,
     health_socket: str | None,
+    archive_interval: float | None,
+    archive_after: int,
+    memory_limit_mb: int | None,
 ) -> None:
     """Start a worker process."""
     from qler.worker import Worker
@@ -367,12 +373,19 @@ def worker(
         shutdown_timeout=shutdown_timeout,
         health_port=health_port,
         health_socket=health_socket,
+        archive_interval=archive_interval,
+        archive_after=archive_after,
+        memory_limit_mb=memory_limit_mb,
     )
     click.echo(f"Worker {w.worker_id} starting (queues={queue_list}, concurrency={concurrency})")
     if health_port is not None:
         click.echo(f"Health endpoint listening on 127.0.0.1:{health_port}")
     elif health_socket is not None:
         click.echo(f"Health endpoint listening on unix:{health_socket}")
+    if archive_interval is not None:
+        click.echo(f"Archival enabled: every {archive_interval}s, jobs older than {archive_after}s")
+    if memory_limit_mb is not None:
+        click.echo(f"Memory watchdog enabled: limit {memory_limit_mb} MB")
     try:
         _run(w.run())
     except KeyboardInterrupt:

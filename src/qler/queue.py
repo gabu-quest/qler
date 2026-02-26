@@ -1397,6 +1397,16 @@ class Queue:
         finally:
             Job.set_db(self._db, "qler_jobs")
 
+    async def pool_health(self) -> dict[str, Any]:
+        """Report connection pool state for monitoring."""
+        await self._lazy_init()
+        adapter = self._db.adapter
+        return {
+            "pool_size": adapter._pool_size,
+            "available": adapter._pool.qsize(),
+            "healthy": adapter._pool.qsize() == adapter._pool_size,
+        }
+
     async def archive_count(self) -> int:
         """Return total number of archived jobs."""
         await self._lazy_init()
