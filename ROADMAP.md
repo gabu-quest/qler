@@ -375,6 +375,17 @@ Tag v0.5.0 with M24.
 - ✅ CHANGELOG.md v0.5.0 entry
 - ✅ ROADMAP.md updated
 
+### M26: Production Readiness (lerproof M5 items) ✅
+
+Three production readiness features identified by lerproof M5 integration testing.
+
+- ✅ Archival CLI flags — `--archive-interval` / `--archive-after` on `qler worker`
+- ✅ Pool health check — `Queue.pool_health()` + `pool` field in Worker `/health` endpoint
+- ✅ Memory watchdog — `--memory-limit-mb` triggers emergency archival when RSS exceeds limit
+- ✅ Input validation — lower-bound guards on all 3 new Worker params
+- ✅ macOS RSS fix — correct bytes-vs-KB normalization for `ru_maxrss`
+- ✅ Pool health tests — concrete assertions, unhealthy-pool scenario coverage
+
 ---
 
 ## Separate Projects
