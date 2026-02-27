@@ -136,15 +136,31 @@ SCENARIO_DESCRIPTIONS = {
         "Bulk submission: `enqueue_many()` (single SQLite transaction) vs "
         "`group().apply_async()` (pipelined Redis publishes).",
     ),
-    "round_trip": (
-        "Round-Trip",
-        "End-to-end: enqueue → worker claims → executes → returns result. "
-        "The number that matters for latency-sensitive workloads.",
+    "raw_api_round_trip": (
+        "Raw API Round-Trip",
+        "Direct API round-trip: enqueue → claim → complete (qler) vs delay().get() (Celery). "
+        "qler side bypasses Worker dispatch — measures raw SQLite API speed.",
     ),
-    "throughput": (
-        "Sustained Throughput",
-        "Sequential enqueue-process-complete cycles. "
-        "The number that matters for batch workloads.",
+    "raw_api_throughput": (
+        "Raw API Throughput",
+        "Sequential enqueue-claim-complete cycles via raw API (no Worker). "
+        "Measures SQLite write throughput, not real-world worker performance.",
+    ),
+    "worker_round_trip": (
+        "Worker Round-Trip",
+        "Real end-to-end: enqueue → Worker dispatch → job.wait() on both sides. "
+        "The honest latency number with actual worker overhead.",
+    ),
+    "worker_throughput": (
+        "Worker Throughput",
+        "Sequential enqueue + job.wait() through real Workers. "
+        "The honest throughput number with actual worker overhead.",
+    ),
+    "cold_start": (
+        "Cold Start",
+        "Time from zero to first job result, including full initialization. "
+        "qler: Queue + init_db + Worker.run + enqueue + wait. "
+        "Celery: subprocess + Redis connect + delay().get().",
     ),
 }
 
@@ -202,7 +218,12 @@ def generate_report(data: dict) -> str:
     lines.append("## Results")
     lines.append("")
 
-    for scenario_key in ["enqueue_latency", "batch_enqueue", "round_trip", "throughput"]:
+    for scenario_key in [
+        "enqueue_latency", "batch_enqueue",
+        "raw_api_round_trip", "raw_api_throughput",
+        "worker_round_trip", "worker_throughput",
+        "cold_start",
+    ]:
         if scenario_key not in paired:
             continue
 
@@ -358,46 +379,108 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
                 "**Batch enqueue**: Both systems show similar batch performance."
             )
 
-    # Round-trip analysis
-    if "round_trip" in paired:
-        winner, ratio = _scenario_winner(paired["round_trip"])
+    # Raw API round-trip analysis
+    if "raw_api_round_trip" in paired:
+        winner, ratio = _scenario_winner(paired["raw_api_round_trip"])
         if winner == "qler":
             parts.append(
-                f"**Round-trip**: qler's same-process architecture wins (~{ratio:.1f}x average). "
-                f"Zero network hops for enqueue → claim → complete gives it a structural "
-                f"advantage over Celery's broker round-trips."
+                f"**Raw API round-trip**: qler's direct API calls (enqueue → claim → "
+                f"complete) are ~{ratio:.1f}x faster than Celery's delay().get(). Note: "
+                f"qler bypasses Worker dispatch here — see Worker Round-Trip for the "
+                f"honest comparison."
             )
         elif winner == "celery":
             parts.append(
-                f"**Round-trip**: Celery wins the end-to-end race (~{1/ratio:.1f}x average). "
-                f"qler's 3 SQLite writes per job (enqueue + claim + complete) add up. "
-                f"Celery's Redis-backed broker + in-memory result backend is faster per operation, "
-                f"even with TCP overhead."
+                f"**Raw API round-trip**: Celery wins even against qler's raw API "
+                f"(~{1/ratio:.1f}x average). Redis's in-memory broker outpaces "
+                f"SQLite's 3-write cycle (enqueue + claim + complete)."
             )
         else:
             parts.append(
-                "**Round-trip**: Both systems show similar end-to-end latency."
+                "**Raw API round-trip**: Both systems show similar raw round-trip latency."
             )
 
-    # Throughput analysis
-    if "throughput" in paired:
-        winner, ratio = _scenario_winner(paired["throughput"])
+    # Raw API throughput analysis
+    if "raw_api_throughput" in paired:
+        winner, ratio = _scenario_winner(paired["raw_api_throughput"])
         if winner == "qler":
             parts.append(
-                f"**Throughput**: qler sustains higher throughput (~{ratio:.1f}x average). "
-                f"Same-process SQLite operations avoid the per-job broker overhead "
-                f"that Celery pays."
+                f"**Raw API throughput**: qler's raw API sustains ~{ratio:.1f}x higher "
+                f"throughput. Note: this bypasses Worker dispatch — see Worker Throughput "
+                f"for realistic numbers."
             )
         elif winner == "celery":
             parts.append(
-                f"**Throughput**: Celery sustains higher throughput (~{1/ratio:.1f}x average). "
-                f"Redis's in-memory operations handle sustained load better than SQLite's "
-                f"disk-backed writes. Note: Celery uses `--pool solo` (c=1) here — "
-                f"real deployments with `prefork` would widen this gap further."
+                f"**Raw API throughput**: Celery sustains higher throughput even against "
+                f"qler's raw API (~{1/ratio:.1f}x average). SQLite's disk-backed writes "
+                f"can't match Redis's in-memory operations at sustained load."
             )
         else:
             parts.append(
-                "**Throughput**: Both systems show similar sustained throughput."
+                "**Raw API throughput**: Both systems show similar raw throughput."
+            )
+
+    # Worker round-trip analysis
+    if "worker_round_trip" in paired:
+        winner, ratio = _scenario_winner(paired["worker_round_trip"])
+        if winner == "qler":
+            parts.append(
+                f"**Worker round-trip**: With real Workers on both sides, qler is "
+                f"~{ratio:.1f}x faster. Same-process SQLite avoids the subprocess IPC "
+                f"and broker round-trips that Celery requires."
+            )
+        elif winner == "celery":
+            parts.append(
+                f"**Worker round-trip**: With real Workers on both sides, Celery is "
+                f"~{1/ratio:.1f}x faster. Redis's in-memory broker + optimized message "
+                f"serialization outperforms qler's SQLite polling loop."
+            )
+        else:
+            parts.append(
+                "**Worker round-trip**: Both systems show similar real-world "
+                "round-trip latency."
+            )
+
+    # Worker throughput analysis
+    if "worker_throughput" in paired:
+        winner, ratio = _scenario_winner(paired["worker_throughput"])
+        if winner == "qler":
+            parts.append(
+                f"**Worker throughput**: Through real Workers, qler sustains "
+                f"~{ratio:.1f}x higher throughput. No subprocess IPC or network hops "
+                f"gives qler a structural advantage."
+            )
+        elif winner == "celery":
+            parts.append(
+                f"**Worker throughput**: Through real Workers, Celery sustains "
+                f"~{1/ratio:.1f}x higher throughput. Redis's in-memory pub/sub scales "
+                f"better than SQLite polling under sustained load. With `prefork` pool "
+                f"(not tested), the gap widens."
+            )
+        else:
+            parts.append(
+                "**Worker throughput**: Both systems show similar sustained "
+                "worker throughput."
+            )
+
+    # Cold start analysis
+    if "cold_start" in paired:
+        winner, ratio = _scenario_winner(paired["cold_start"])
+        if winner == "qler":
+            parts.append(
+                f"**Cold start**: qler initializes ~{ratio:.1f}x faster. No subprocess "
+                f"fork, no Redis connection — just SQLite schema init and an asyncio "
+                f"task. This matters for serverless, CLI tools, and test suites."
+            )
+        elif winner == "celery":
+            parts.append(
+                f"**Cold start**: Celery initializes ~{1/ratio:.1f}x faster — surprising "
+                f"given the subprocess overhead. Redis's fast connection may offset "
+                f"the fork cost."
+            )
+        else:
+            parts.append(
+                "**Cold start**: Both systems show similar initialization time."
             )
 
     if not parts:
