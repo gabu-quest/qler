@@ -38,6 +38,9 @@ CLAUDE.local.md
 # Cross-stack integration test (requires sibling projects)
 tests/integration_ler_stack.py
 
+# Benchmark results (generated at runtime)
+benchmarks/results/
+
 # OS
 .DS_Store
 Thumbs.db
