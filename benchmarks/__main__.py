@@ -44,10 +44,23 @@ def cmd_list(args: argparse.Namespace) -> None:
 
     print("\n  Available benchmark suites:\n")
     for suite_name, scenarios in ALL_SUITES.items():
-        print(f"  [{suite_name}]")
+        suffix = ""
+        if suite_name == "comparison":
+            from benchmarks.suites import _comparison_skip_reason
+
+            skip = _comparison_skip_reason()
+            suffix = f" ✗ ({skip})" if skip else " ✓ (ready)"
+        print(f"  [{suite_name}]{suffix}")
         for s in scenarios:
             print(f"    - {s.name}: {s.description}")
         print()
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    """Generate comparison report from latest results."""
+    from benchmarks.compare import main as compare_main
+
+    compare_main()
 
 
 def main() -> None:
@@ -71,6 +84,10 @@ def main() -> None:
     # list
     list_p = sub.add_parser("list", help="List available scenarios")
     list_p.set_defaults(func=cmd_list)
+
+    # compare
+    compare_p = sub.add_parser("compare", help="Generate comparison report (COMPARISON.md)")
+    compare_p.set_defaults(func=cmd_compare)
 
     args = parser.parse_args()
     args.func(args)

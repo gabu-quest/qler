@@ -46,6 +46,10 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff==0.12.10",
 ]
+bench = [
+    "celery[redis]>=5.4.0",
+    "redis>=5.0.0",
+]
 
 [tool.uv.sources]
 sqler = { path = "../sqler", editable = true }
