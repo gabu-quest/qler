@@ -483,7 +483,20 @@ class Queue:
             dep_list: list[str] = []
             pending_dep_count = 0
             if depends_on:
-                dep_list = list(dict.fromkeys(depends_on))
+                # Resolve integer indices to ULIDs of earlier jobs in this batch
+                resolved: list[str] = []
+                for dep in depends_on:
+                    if isinstance(dep, int):
+                        if dep < 0 or dep >= i:
+                            raise DependencyError(
+                                f"Job at index {i}: integer dependency index {dep} "
+                                f"out of range (must be 0..{i - 1})",
+                                dependency_ulid=str(dep),
+                            )
+                        resolved.append(job_instances[dep].ulid)
+                    else:
+                        resolved.append(dep)
+                dep_list = list(dict.fromkeys(resolved))
                 # Check DB for existing deps
                 db_dep_ulids = [u for u in dep_list if u not in batch_ulids]
                 batch_dep_ulids = [u for u in dep_list if u in batch_ulids]
