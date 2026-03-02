@@ -610,6 +610,62 @@ class TestBatchEnqueue:
         assert children[0].pending_dep_count == 1
         assert children[0].dependencies == [parent_ulid]
 
+    async def test_batch_intra_batch_integer_index_deps(self, queue):
+        """Integer indices in depends_on resolve to earlier jobs in the batch."""
+        jobs = await queue.enqueue_many([
+            {"task_path": "step_a"},
+            {"task_path": "step_b", "depends_on": [0]},
+            {"task_path": "step_c", "depends_on": [0, 1]},
+        ])
+        assert len(jobs) == 3
+        # step_b depends on step_a
+        assert jobs[1].dependencies == [jobs[0].ulid]
+        assert jobs[1].pending_dep_count == 1
+        # step_c depends on both step_a and step_b
+        assert jobs[2].dependencies == [jobs[0].ulid, jobs[1].ulid]
+        assert jobs[2].pending_dep_count == 2
+        # step_a has no deps
+        assert jobs[0].dependencies == []
+        assert jobs[0].pending_dep_count == 0
+
+    async def test_batch_integer_index_self_dep(self, queue):
+        """Integer index pointing to self raises DependencyError."""
+        with pytest.raises(DependencyError, match="index 1.*out of range"):
+            await queue.enqueue_many([
+                {"task_path": "step_a"},
+                {"task_path": "step_b", "depends_on": [1]},
+            ])
+
+    async def test_batch_integer_index_out_of_bounds(self, queue):
+        """Integer index beyond batch size raises DependencyError."""
+        with pytest.raises(DependencyError, match="index 0.*out of range"):
+            await queue.enqueue_many([
+                {"task_path": "step_a", "depends_on": [5]},
+            ])
+
+    async def test_batch_integer_index_negative(self, queue):
+        """Negative integer index raises DependencyError."""
+        with pytest.raises(DependencyError, match="index 1.*out of range"):
+            await queue.enqueue_many([
+                {"task_path": "step_a"},
+                {"task_path": "step_b", "depends_on": [-1]},
+            ])
+
+    async def test_batch_mixed_integer_and_ulid_deps(self, queue):
+        """Integer indices and ULID strings can be mixed in depends_on."""
+        # Create an external parent job first
+        external = await queue.enqueue_many([{"task_path": "external"}])
+        ext_ulid = external[0].ulid
+
+        jobs = await queue.enqueue_many([
+            {"task_path": "step_a"},
+            {"task_path": "step_b", "depends_on": [0, ext_ulid]},
+        ])
+        assert len(jobs) == 2
+        assert ext_ulid in jobs[1].dependencies
+        assert jobs[0].ulid in jobs[1].dependencies
+        assert jobs[1].pending_dep_count == 2
+
     async def test_batch_payload_too_large(self, queue):
         """Payload size check applies per job in batch."""
         large = "x" * (queue.max_payload_size + 1)
