@@ -9,6 +9,9 @@ from typing import Any, ClassVar, Optional
 
 from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, F, RebaseConfig
 
+from qler._notify import clear as _notify_clear
+from qler._notify import fire as _notify_fire
+from qler._notify import register as _notify_register
 from qler._time import now_epoch
 from qler.enums import JobStatus
 from qler.exceptions import JobCancelledError, JobFailedError
@@ -95,6 +98,7 @@ class Job(AsyncSQLerSafeModel):
         )
         if updated is not None:
             self._sync_from(updated)
+            _notify_fire(self.ulid)
             return True
         # If RUNNING, request cooperative cancellation instead
         return await self.request_cancel()
@@ -117,7 +121,12 @@ class Job(AsyncSQLerSafeModel):
         max_interval: float = 5.0,
         backoff: float = 1.5,
     ) -> "Job":
-        """Poll until the job reaches a terminal state.
+        """Wait until the job reaches a terminal state.
+
+        Uses an in-process asyncio.Event for instant wakeup when the Worker
+        completes/fails/cancels the job in the same process. Falls back to
+        DB polling (with exponential backoff) for cross-process completion
+        or if the Event times out.
 
         Returns:
             self on COMPLETED.
@@ -127,29 +136,47 @@ class Job(AsyncSQLerSafeModel):
             JobCancelledError: If the job enters CANCELLED state.
             TimeoutError: If timeout is reached before a terminal state.
         """
-        start = time.monotonic()
-        interval = poll_interval
-        while True:
-            await self.refresh()
-            if self.status == JobStatus.COMPLETED.value:
-                return self
-            if self.status == JobStatus.FAILED.value:
-                raise JobFailedError(
-                    f"Job {self.ulid} failed: {self.last_error}",
-                    ulid=self.ulid,
-                    failure_kind=self.last_failure_kind,
-                )
-            if self.status == JobStatus.CANCELLED.value:
-                raise JobCancelledError(
-                    f"Job {self.ulid} was cancelled",
-                    ulid=self.ulid,
-                )
-            if timeout is not None and time.monotonic() - start >= timeout:
-                raise TimeoutError(
-                    f"Job {self.ulid} did not complete within {timeout}s"
-                )
-            await asyncio.sleep(min(interval, max_interval))
-            interval *= backoff
+        event = _notify_register(self.ulid)
+        try:
+            start = time.monotonic()
+            interval = poll_interval
+            while True:
+                await self.refresh()
+                if self.status == JobStatus.COMPLETED.value:
+                    return self
+                if self.status == JobStatus.FAILED.value:
+                    raise JobFailedError(
+                        f"Job {self.ulid} failed: {self.last_error}",
+                        ulid=self.ulid,
+                        failure_kind=self.last_failure_kind,
+                    )
+                if self.status == JobStatus.CANCELLED.value:
+                    raise JobCancelledError(
+                        f"Job {self.ulid} was cancelled",
+                        ulid=self.ulid,
+                    )
+                if timeout is not None and time.monotonic() - start >= timeout:
+                    raise TimeoutError(
+                        f"Job {self.ulid} did not complete within {timeout}s"
+                    )
+                # Wait for Event (instant wakeup) or fall back to poll
+                wait_duration = min(interval, max_interval)
+                if timeout is not None:
+                    remaining = timeout - (time.monotonic() - start)
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Job {self.ulid} did not complete within {timeout}s"
+                        )
+                    wait_duration = min(wait_duration, remaining)
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=wait_duration)
+                except TimeoutError:
+                    pass  # Event didn't fire — poll DB on next iteration
+                else:
+                    event.clear()  # Reset for next iteration's refresh
+                interval *= backoff
+        finally:
+            _notify_clear(self.ulid)
 
     async def wait_for_dependencies(
         self,
