@@ -636,3 +636,26 @@ class TestBatchEnqueue:
         assert jobs[0].max_retries == queue.default_max_retries
         assert jobs[0].retry_delay == queue.default_retry_delay
         assert jobs[0].lease_duration == queue.default_lease_duration
+
+    async def test_batch_intra_batch_idempotency(self, queue):
+        """Two specs with the same idempotency_key in one batch → only 1 job created."""
+        jobs = await queue.enqueue_many([
+            {"task_path": "task_a", "idempotency_key": "dup"},
+            {"task_path": "task_b", "idempotency_key": "dup"},
+            {"task_path": "task_c", "idempotency_key": "unique"},
+        ])
+        assert len(jobs) == 3  # 3 entries returned (2nd is reference to 1st)
+
+        # First and second should be the same job object
+        assert jobs[0].ulid == jobs[1].ulid
+        assert jobs[0].task == "task_a"  # first spec wins
+        # Third is distinct
+        assert jobs[2].ulid != jobs[0].ulid
+        assert jobs[2].task == "task_c"
+
+        # Only 2 unique jobs in the DB
+        unique_ulids = {j.ulid for j in jobs}
+        assert len(unique_ulids) == 2
+
+        total = await Job.query().count()
+        assert total == 2
