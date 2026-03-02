@@ -392,6 +392,7 @@ Three production readiness features identified by lerproof M5 integration testin
 
 | Project | Description |
 |---------|-------------|
+| **dagler** | DAG pipeline orchestration built on qler + sqler. Scaffolded at `../dagler-test/`. See its own ROADMAP.md (M0–M6). |
 | **qler-web** | Web dashboard (Vue 3 + Naive UI). Separate Python package depending on qler. Follows logler-web pattern. |
 
 ---

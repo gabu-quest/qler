@@ -118,6 +118,7 @@ src/qler/
 ├── enums.py             # JobStatus, AttemptStatus, FailureKind
 ├── exceptions.py        # Error types (QlerError hierarchy)
 ├── _context.py          # current_job() context variable
+├── _notify.py           # In-process asyncio.Event notification for instant wait() wakeup
 ├── _time.py             # Timestamp utilities
 └── py.typed             # PEP 561 marker
 tests/
@@ -133,6 +134,7 @@ tests/
 ├── test_cancellation.py # Cooperative cancellation
 ├── test_cron.py         # @cron scheduler, dedup
 ├── test_rate_limit.py   # Token bucket, requeue
+├── test_notify.py       # Event notification registry + integration
 ├── test_cli.py          # All CLI commands
 └── test_context.py      # current_job context
 ```
