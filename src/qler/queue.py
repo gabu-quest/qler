@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 from sqler import AsyncSQLerDB, F
 
 from qler._context import _current_job
+from qler._notify import fire as _notify_fire
 from qler._time import generate_ulid, now_epoch
 from qler.enums import RETRYABLE_FAILURES, AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
@@ -976,6 +977,8 @@ class Queue:
         if self._metrics:
             self._metrics.inc_completed(job.queue_name, job.task)
 
+        _notify_fire(job.ulid)
+
         # Resolve dependencies: unblock dependent jobs
         await self._resolve_dependencies(job.ulid)
 
@@ -1061,6 +1064,7 @@ class Queue:
 
         # Cascade-cancel dependents on terminal failure
         if not can_retry:
+            _notify_fire(job.ulid)
             await self._cascade_cancel_dependents(job.ulid)
 
         # Terminalize attempt (best effort)
@@ -1173,6 +1177,7 @@ class Queue:
                 updated_at=now,
             )
             if updated is not None:
+                _notify_fire(child_ulid)
                 cancelled_ulids.append(child_ulid)
 
         for ulid in cancelled_ulids:
@@ -1182,6 +1187,7 @@ class Queue:
         """Cancel a job and cascade-cancel its dependents."""
         ok = await job.cancel()
         if ok and job.status == JobStatus.CANCELLED.value:
+            _notify_fire(job.ulid)
             await self._cascade_cancel_dependents(job.ulid)
         return ok
 
