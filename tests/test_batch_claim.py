@@ -108,6 +108,23 @@ class TestClaimJobs:
             f"Expected ULID, got {jobs[0].last_attempt_id!r}"
         )
 
+    async def test_claimed_jobs_have_last_attempt_id_without_refresh(self, queue):
+        """In-memory job objects from claim_jobs() have last_attempt_id set directly."""
+        await queue.enqueue("t1", queue_name="default")
+        await queue.enqueue("t2", queue_name="default")
+        jobs = await queue.claim_jobs("w1", ["default"], n=2)
+        assert len(jobs) == 2
+
+        for job in jobs:
+            # This is the exact bug: without the fix, last_attempt_id is None
+            # on the returned object (only set in DB, not synced to in-memory)
+            assert job.last_attempt_id is not None, (
+                f"Job {job.ulid}: last_attempt_id is None without refresh()"
+            )
+            assert _ULID_PATTERN.match(job.last_attempt_id), (
+                f"Expected ULID, got {job.last_attempt_id!r}"
+            )
+
     async def test_partial_availability(self, queue):
         """n=5 but only 3 pending -> returns 3."""
         for i in range(3):
