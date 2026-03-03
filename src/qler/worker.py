@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from qler._context import _current_job
+from qler._context import _current_job, _current_queue
 from qler.lifecycle import emit as _lifecycle
 from qler._time import generate_ulid, now_epoch
 from qler.enums import FailureKind, JobStatus
@@ -346,6 +346,7 @@ class Worker:
         """Execute a single job: resolve task, validate signature, run, complete/fail."""
         start_time = time.monotonic()
         token = _current_job.set(job)
+        queue_token = _current_queue.set(self.queue)
         try:
             # 1. Resolve task
             task_wrapper = self.queue._tasks.get(job.task)
@@ -463,6 +464,7 @@ class Worker:
                     job.queue_name, job.task, duration
                 )
             _current_job.reset(token)
+            _current_queue.reset(queue_token)
             self._active_jobs.pop(job.ulid, None)
             if self._semaphore is not None:
                 self._semaphore.release()
