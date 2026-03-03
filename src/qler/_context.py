@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from qler.models.job import Job
+    from qler.queue import Queue
 
 _current_job: ContextVar[Optional["Job"]] = ContextVar("qler_current_job", default=None)
+_current_queue: ContextVar[Optional["Queue"]] = ContextVar("qler_current_queue", default=None)
 
 
 def current_job() -> "Job":
@@ -24,6 +26,21 @@ def current_job() -> "Job":
             "This function can only be used inside a @task-decorated function."
         )
     return job
+
+
+def current_queue() -> "Queue":
+    """Return the Queue that owns the currently-executing job.
+
+    Raises:
+        RuntimeError: If called outside a task execution context.
+    """
+    queue = _current_queue.get()
+    if queue is None:
+        raise RuntimeError(
+            "current_queue() called outside of a task execution context. "
+            "This function can only be used inside a @task-decorated function."
+        )
+    return queue
 
 
 async def set_progress(percent: int, message: str = "") -> None:

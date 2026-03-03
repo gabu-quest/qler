@@ -1,6 +1,6 @@
 """qler — Async-first background job queue for Python, built on SQLite via sqler."""
 
-from qler._context import current_job, is_cancellation_requested, set_progress
+from qler._context import current_job, current_queue, is_cancellation_requested, set_progress
 from qler.cron import CronWrapper, cron
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
@@ -35,6 +35,7 @@ __all__ = [
     "cron",
     "CronWrapper",
     "current_job",
+    "current_queue",
     "is_cancellation_requested",
     "set_progress",
     "Job",
