@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 from unittest.mock import patch
 
 import pytest
@@ -715,3 +716,111 @@ class TestBatchEnqueue:
 
         total = await Job.query().count()
         assert total == 2
+
+
+class TestBatchEnqueuePerformance:
+    """Verify enqueue_many scales well with large batches."""
+
+    async def test_enqueue_many_5k_no_deps(self, queue):
+        """5K items with no deps/idem/unique completes in <10s."""
+        specs = [
+            {"task_path": f"task_{i}", "kwargs": {"i": i}}
+            for i in range(5000)
+        ]
+        t0 = time.perf_counter()
+        jobs = await queue.enqueue_many(specs)
+        elapsed = time.perf_counter() - t0
+
+        assert len(jobs) == 5000
+        assert all(j._id is not None for j in jobs)
+        assert len({j.ulid for j in jobs}) == 5000  # all unique
+        assert elapsed < 10, f"enqueue_many(5K) took {elapsed:.1f}s, expected <10s"
+
+        total = await Job.query().count()
+        assert total == 5000
+
+    async def test_enqueue_many_1k_with_intra_batch_deps(self, queue):
+        """1K items with intra-batch deps — all dep edges created correctly."""
+        specs = []
+        # Job 0 has no deps, jobs 1-999 depend on the previous job (linear chain)
+        specs.append({"task_path": "chain_0"})
+        for i in range(1, 1000):
+            specs.append({"task_path": f"chain_{i}", "depends_on": [i - 1]})
+
+        t0 = time.perf_counter()
+        jobs = await queue.enqueue_many(specs)
+        elapsed = time.perf_counter() - t0
+
+        assert len(jobs) == 1000
+        assert elapsed < 10, f"enqueue_many(1K deps) took {elapsed:.1f}s, expected <10s"
+
+        # Verify dep edges in the DB
+        cur = await queue._db.adapter.execute(
+            "SELECT COUNT(*) FROM qler_job_deps", []
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        assert row[0] == 999  # 999 edges (each job depends on previous)
+
+        # First job has no deps
+        assert jobs[0].pending_dep_count == 0
+        # All others have 1 pending dep
+        for j in jobs[1:]:
+            assert j.pending_dep_count == 1
+
+    async def test_enqueue_many_batch_idempotency_prefetch(self, queue):
+        """Batch idempotency pre-fetch deduplicates against DB in one query."""
+        # Pre-create 50 jobs with idempotency keys
+        pre_specs = [
+            {"task_path": "pre_task", "idempotency_key": f"key_{i}"}
+            for i in range(50)
+        ]
+        pre_jobs = await queue.enqueue_many(pre_specs)
+        assert len(pre_jobs) == 50
+
+        # Now enqueue 200 specs: 50 with existing idem keys + 150 new
+        specs = []
+        for i in range(50):
+            specs.append({"task_path": "dup_task", "idempotency_key": f"key_{i}"})
+        for i in range(150):
+            specs.append({"task_path": "new_task", "idempotency_key": f"new_key_{i}"})
+
+        jobs = await queue.enqueue_many(specs)
+        assert len(jobs) == 200
+
+        # First 50 should be the pre-existing jobs
+        for i in range(50):
+            assert jobs[i].ulid == pre_jobs[i].ulid
+            assert jobs[i].task == "pre_task"
+
+        # Last 150 should be new
+        new_ulids = {j.ulid for j in jobs[50:]}
+        assert len(new_ulids) == 150
+
+        total = await Job.query().count()
+        assert total == 200  # 50 pre-existing + 150 new
+
+    async def test_enqueue_many_fan_in_deps(self, queue):
+        """Many jobs depending on one parent — dep edges batched correctly."""
+        # Create a parent job first
+        parent = await queue.enqueue("parent_task")
+
+        # 500 children all depending on the parent
+        specs = [
+            {"task_path": f"child_{i}", "depends_on": [parent.ulid]}
+            for i in range(500)
+        ]
+        jobs = await queue.enqueue_many(specs)
+        assert len(jobs) == 500
+
+        # All dep edges should exist
+        cur = await queue._db.adapter.execute(
+            "SELECT COUNT(*) FROM qler_job_deps WHERE parent_ulid = ?",
+            [parent.ulid],
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        assert row[0] == 500
+
+        # Each child has exactly 1 pending dep (the parent)
+        assert all(j.pending_dep_count == 1 for j in jobs)
