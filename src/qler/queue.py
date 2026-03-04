@@ -413,6 +413,38 @@ class Queue:
         await self._lazy_init()
         now = now_epoch()
 
+        # Pre-fetch existing idempotency and uniqueness keys in batch
+        _PARAM_CHUNK = 900  # stay under SQLite's 999-parameter limit
+
+        all_idem_keys = list(dict.fromkeys(
+            s["idempotency_key"] for s in jobs if s.get("idempotency_key") is not None
+        ))
+        all_unique_keys = list(dict.fromkeys(
+            s["unique_key"] for s in jobs if s.get("unique_key") is not None
+        ))
+
+        idem_existing: dict[str, Job] = {}
+        if all_idem_keys:
+            for off in range(0, len(all_idem_keys), _PARAM_CHUNK):
+                chunk = all_idem_keys[off : off + _PARAM_CHUNK]
+                found = await Job.query().filter(
+                    F("idempotency_key").in_list(chunk)
+                    & (F("status") != JobStatus.CANCELLED.value)
+                ).all()
+                for j in found:
+                    idem_existing[j.idempotency_key] = j
+
+        unique_existing: dict[str, Job] = {}
+        if all_unique_keys:
+            for off in range(0, len(all_unique_keys), _PARAM_CHUNK):
+                chunk = all_unique_keys[off : off + _PARAM_CHUNK]
+                found = await Job.query().filter(
+                    F("unique_key").in_list(chunk)
+                    & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
+                ).all()
+                for j in found:
+                    unique_existing[j.unique_key] = j
+
         # Phase 1: Validate all jobs and build Job instances
         job_instances: list[Job] = []
         batch_ulids: dict[str, Job] = {}  # for intra-batch dependency resolution
@@ -456,27 +488,19 @@ class Queue:
                     max_size=self.max_payload_size,
                 )
 
-            # Idempotency check (DB then intra-batch)
+            # Idempotency check (pre-fetched DB results then intra-batch)
             if idempotency_key is not None:
-                existing = await Job.query().filter(
-                    (F("idempotency_key") == idempotency_key)
-                    & (F("status") != JobStatus.CANCELLED.value)
-                ).first()
-                if existing is not None:
-                    job_instances.append(existing)
+                if idempotency_key in idem_existing:
+                    job_instances.append(idem_existing[idempotency_key])
                     continue
                 if idempotency_key in batch_idem_keys:
                     job_instances.append(batch_idem_keys[idempotency_key])
                     continue
 
-            # Uniqueness check
+            # Uniqueness check (pre-fetched DB results)
             if unique_key is not None:
-                existing = await Job.query().filter(
-                    (F("unique_key") == unique_key)
-                    & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
-                ).first()
-                if existing is not None:
-                    job_instances.append(existing)
+                if unique_key in unique_existing:
+                    job_instances.append(unique_existing[unique_key])
                     continue
 
             # Validate dependencies (including intra-batch)
@@ -574,15 +598,26 @@ class Queue:
         if new_jobs:
             await Job.asave_many(new_jobs)
 
+        # Batch-insert all dependency edges (chunked for SQLite 999-param limit)
+        all_dep_edges: list[tuple[str, str]] = []
         for job in new_jobs:
-            if job.dependencies:
-                for dep_ulid in job.dependencies:
-                    cur = await self._db.adapter.execute(
-                        "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)",
-                        [dep_ulid, job.ulid],
-                    )
-                    await cur.close()
-                await self._db.adapter.auto_commit()
+            for dep_ulid in job.dependencies:
+                all_dep_edges.append((dep_ulid, job.ulid))
+
+        if all_dep_edges:
+            _DEP_CHUNK = 499  # 2 params per edge, SQLite max 999
+            for offset in range(0, len(all_dep_edges), _DEP_CHUNK):
+                chunk = all_dep_edges[offset : offset + _DEP_CHUNK]
+                placeholders = ", ".join(["(?, ?)"] * len(chunk))
+                params: list[str] = [v for edge in chunk for v in edge]
+                cur = await self._db.adapter.execute(
+                    f"INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES {placeholders}",
+                    params,
+                )
+                await cur.close()
+            await self._db.adapter.auto_commit()
+
+        for job in new_jobs:
             _lifecycle(
                 "job.enqueued", job_id=job.ulid, queue=job.queue_name,
                 task=job.task, correlation_id=job.correlation_id,
