@@ -539,7 +539,7 @@ class Queue:
                 job_eta = now
 
             job = Job(
-                ulid=generate_ulid(),
+                ulid=spec.get("ulid") or generate_ulid(),
                 status=JobStatus.PENDING.value,
                 queue_name=queue_name,
                 priority=priority,
