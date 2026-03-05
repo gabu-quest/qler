@@ -1,6 +1,19 @@
 """Shared fixtures for qler tests."""
 
+import os
+import threading
+
 import pytest_asyncio
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Force-exit after test session to avoid asyncio event loop cleanup hang.
+
+    pytest-asyncio's event loop teardown can deadlock on CI runners.
+    All tests have passed/failed by this point; a 5-second grace period
+    lets pytest write its summary before we force-exit.
+    """
+    threading.Timer(5.0, os._exit, args=[exitstatus]).start()
 from qler.queue import Queue
 from sqler import AsyncSQLerDB
 
