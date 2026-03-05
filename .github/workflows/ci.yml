@@ -52,4 +52,4 @@ jobs:
       - name: Run tests
         env:
           PYTHONUTF8: "1"
-        run: uv run pytest -q --disable-warnings
+        run: uv run pytest -v --timeout=30 --disable-warnings
