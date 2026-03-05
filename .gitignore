@@ -1,5 +1,5 @@
-# Local Claude settings (personal; do not share)
-.claude/settings.local.json
+# Claude (dev tooling; not user-facing)
+.claude/
 
 # Python
 __pycache__/
