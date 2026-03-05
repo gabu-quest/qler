@@ -6,15 +6,13 @@ import logging
 
 import pytest
 from click.testing import CliRunner
-from sqler import F
-
 from qler._time import now_epoch
 from qler.cli import cli
 from qler.enums import JobStatus
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.worker import Worker
-
+from sqler import F
 
 # ---------------------------------------------------------------------------
 # Helpers

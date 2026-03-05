@@ -7,16 +7,15 @@ import logging
 
 import pytest
 import pytest_asyncio
-from sqler import AsyncSQLerDB, F
-
 from qler._time import now_epoch
 from qler.enums import FailureKind
-from qler.lifecycle import emit, logger as lifecycle_logger
+from qler.lifecycle import emit
+from qler.lifecycle import logger as lifecycle_logger
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-
+from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required by @task decorator)

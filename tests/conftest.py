@@ -1,10 +1,8 @@
 """Shared fixtures for qler tests."""
 
-import pytest
 import pytest_asyncio
-from sqler import AsyncSQLerDB
-
 from qler.queue import Queue
+from sqler import AsyncSQLerDB
 
 
 @pytest_asyncio.fixture

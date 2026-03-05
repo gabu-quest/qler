@@ -4,21 +4,18 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
-
-from sqler import F
-
 from qler._time import now_epoch
 from qler.cli import cli
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
+from sqler import F
 
 
 @pytest.fixture
@@ -171,7 +168,6 @@ class TestHelpers:
 
     def test_parse_since_invalid(self):
         import click
-
         from qler.cli import _parse_since
 
         with pytest.raises(click.BadParameter, match="Invalid duration"):
@@ -179,7 +175,6 @@ class TestHelpers:
 
     def test_parse_since_exceeds_max(self):
         import click
-
         from qler.cli import _parse_since
 
         with pytest.raises(click.BadParameter, match="exceeds maximum"):
@@ -187,7 +182,6 @@ class TestHelpers:
 
     def test_validate_module_path_rejects_traversal(self):
         import click
-
         from qler.cli import _validate_module_path
 
         with pytest.raises(click.BadParameter, match="Invalid module path"):
@@ -195,7 +189,6 @@ class TestHelpers:
 
     def test_validate_module_path_rejects_spaces(self):
         import click
-
         from qler.cli import _validate_module_path
 
         with pytest.raises(click.BadParameter, match="Invalid module path"):
@@ -231,7 +224,6 @@ class TestHelpers:
 
     def test_import_app_bad_format(self):
         import click
-
         from qler.cli import _import_app
 
         with pytest.raises(click.BadParameter, match="Expected 'module:attribute'"):
@@ -239,7 +231,6 @@ class TestHelpers:
 
     def test_import_app_bad_module(self):
         import click
-
         from qler.cli import _import_app
 
         with pytest.raises(click.BadParameter, match="Cannot import module"):
@@ -247,7 +238,6 @@ class TestHelpers:
 
     def test_import_app_wrong_type(self):
         import click
-
         from qler.cli import _import_app
 
         with pytest.raises(click.BadParameter, match="is not a Queue instance"):
@@ -255,7 +245,6 @@ class TestHelpers:
 
     def test_import_modules_bad(self):
         import click
-
         from qler.cli import _import_modules
 
         with pytest.raises(click.BadParameter, match="Cannot import module"):
@@ -471,9 +460,10 @@ class TestBackupCommand:
 
     def test_backup_failure_human(self, runner, db_path, tmp_path):
         """When async_backup returns success=False, exit code is 1 and error goes to stderr."""
-        from unittest.mock import AsyncMock, patch
-        from sqler.ops import BackupResult
         from datetime import datetime
+        from unittest.mock import AsyncMock, patch
+
+        from sqler.ops import BackupResult
 
         runner.invoke(cli, ["init", "--db", db_path])
         dest = str(tmp_path / "backup.db")
@@ -493,9 +483,10 @@ class TestBackupCommand:
 
     def test_backup_failure_json(self, runner, db_path, tmp_path):
         """When async_backup returns success=False with --json, output has success=false and error."""
-        from unittest.mock import AsyncMock, patch
-        from sqler.ops import BackupResult
         from datetime import datetime
+        from unittest.mock import AsyncMock, patch
+
+        from sqler.ops import BackupResult
 
         runner.invoke(cli, ["init", "--db", db_path])
         dest = str(tmp_path / "backup.db")
@@ -1750,7 +1741,6 @@ class TestHealthCommand:
 
     def test_health_tcp_json(self, runner):
         """JSON output from a mocked health response."""
-        import socket as sock_mod
 
         health_data = {
             "status": "healthy",
@@ -1798,7 +1788,6 @@ class TestHealthCommand:
 
     def test_health_tcp_human(self, runner):
         """Human-readable output from a mocked health response."""
-        import socket as sock_mod
 
         health_data = {
             "status": "healthy",
@@ -2020,8 +2009,8 @@ async def counted_task():
         sys.path.insert(0, mod_dir)
         try:
             async def _setup():
-                from sqler import F
                 from qler.enums import FailureKind
+                from sqler import F
                 mod = __import__("_tasks_count")
                 q = mod.q
                 await q.init_db()

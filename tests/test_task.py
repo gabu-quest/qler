@@ -3,7 +3,6 @@
 import re
 
 import pytest
-
 from qler._time import now_epoch
 from qler.exceptions import ConfigurationError, PayloadNotSerializableError
 from qler.task import TaskWrapper, task

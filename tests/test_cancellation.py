@@ -6,8 +6,6 @@ import json
 import pytest
 import pytest_asyncio
 from click.testing import CliRunner
-from sqler import AsyncSQLerDB, F
-
 from qler._context import _current_job, is_cancellation_requested
 from qler._time import now_epoch
 from qler.cli import cli
@@ -15,7 +13,7 @@ from qler.enums import JobStatus
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
-
+from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions

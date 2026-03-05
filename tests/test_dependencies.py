@@ -4,15 +4,13 @@ import time
 
 import pytest
 import pytest_asyncio
-from sqler import AsyncSQLerDB, F
-
 from qler._time import now_epoch
-from qler.enums import FailureKind, JobStatus
+from qler.enums import JobStatus
 from qler.exceptions import DependencyError, JobCancelledError, JobFailedError
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
-
+from sqler import F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required: @task rejects nested functions)

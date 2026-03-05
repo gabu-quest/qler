@@ -2,8 +2,6 @@
 
 import pytest
 import pytest_asyncio
-from sqler import AsyncSQLerDB, F
-
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
     PayloadNotSerializableError,
@@ -14,7 +12,7 @@ from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
-
+from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required: @task rejects nested functions)

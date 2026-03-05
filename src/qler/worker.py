@@ -18,10 +18,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from qler._context import _current_job, _current_queue
-from qler.lifecycle import emit as _lifecycle
 from qler._time import generate_ulid, now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.exceptions import ConfigurationError
+from qler.lifecycle import emit as _lifecycle
 from qler.models.job import Job
 
 try:

@@ -11,8 +11,6 @@ import pytest_asyncio
 prometheus_client = pytest.importorskip("prometheus_client")
 
 from prometheus_client import CollectorRegistry
-from sqler import AsyncSQLerDB, F
-
 from qler._time import now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.metrics import QlerMetrics
@@ -20,7 +18,7 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-
+from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required — @task rejects nested functions)

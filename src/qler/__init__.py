@@ -18,8 +18,8 @@ from qler.exceptions import (
     TaskNotFoundError,
     TaskNotRegisteredError,
 )
-from qler.models import Job, JobAttempt
 from qler.metrics import QlerMetrics
+from qler.models import Job, JobAttempt
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker

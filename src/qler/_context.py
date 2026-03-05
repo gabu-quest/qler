@@ -52,9 +52,10 @@ async def set_progress(percent: int, message: str = "") -> None:
         RuntimeError: If called outside a task execution context.
         ValueError: If percent is not in 0–100 range.
     """
+    from sqler import F
+
     from qler._time import now_epoch
     from qler.models.job import Job
-    from sqler import F
 
     if not isinstance(percent, int) or percent < 0 or percent > 100:
         raise ValueError(f"progress must be an integer 0–100, got {percent!r}")
@@ -83,8 +84,9 @@ async def is_cancellation_requested() -> bool:
 
     Returns False (not raises) when called outside a task context.
     """
-    from qler.models.job import Job
     from sqler import F
+
+    from qler.models.job import Job
 
     job = _current_job.get()
     if job is None:

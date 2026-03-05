@@ -1,14 +1,12 @@
 """Tests for Queue — init, enqueue, claim, complete, fail operations."""
 
-import json
 import re
 import time
 from unittest.mock import patch
 
 import pytest
-
 from qler._time import now_epoch
-from qler.enums import AttemptStatus, FailureKind, JobStatus
+from qler.enums import FailureKind, JobStatus
 from qler.exceptions import (
     ConfigurationError,
     DependencyError,
@@ -18,8 +16,7 @@ from qler.exceptions import (
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue, _calculate_retry_eta
-from qler.task import task
-from sqler import AsyncSQLerDB, F
+from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 

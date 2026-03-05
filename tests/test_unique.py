@@ -1,13 +1,11 @@
 """Tests for M20 — Unique Jobs."""
 
 import pytest
-from sqler import F
-
 from qler.enums import JobStatus
 from qler.exceptions import ConfigurationError
 from qler.models.job import Job
 from qler.task import TaskWrapper, task
-
+from sqler import F
 
 # ---- helpers: module-level async functions for @task ----
 

@@ -1,7 +1,6 @@
 """Tests for _context.py — current_job() ContextVar access."""
 
 import pytest
-
 from qler._context import _current_job, current_job
 from qler.models.job import Job
 

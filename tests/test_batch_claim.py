@@ -5,8 +5,6 @@ import re
 
 import pytest
 import pytest_asyncio
-from sqler import AsyncSQLerDB, F
-
 from qler._time import now_epoch
 from qler.enums import AttemptStatus, JobStatus
 from qler.exceptions import ConfigurationError
@@ -15,6 +13,7 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
+from sqler import AsyncSQLerDB, F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 

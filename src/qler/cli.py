@@ -20,7 +20,6 @@ from qler.enums import JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
-from qler.cron import CronWrapper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -728,7 +727,7 @@ def job(ulid: str, db: str, output_json: bool) -> None:
                 progress_str += f" — {result.progress_message}"
             click.echo(f"Progress:        {progress_str}")
         if result.cancel_requested:
-            click.echo(f"Cancel req:      Yes")
+            click.echo("Cancel req:      Yes")
         if result.dependencies:
             click.echo(f"Dependencies:    {len(result.dependencies)} job(s)")
             click.echo(f"  Pending deps:  {result.pending_dep_count}")

@@ -9,17 +9,13 @@ import asyncio
 import re
 
 import pytest
-import pytest_asyncio
-from sqler import AsyncSQLerDB, F
-
+from conftest import assert_pool_healthy
 from qler.enums import AttemptStatus, JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
-from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-
-from conftest import assert_pool_healthy
+from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 

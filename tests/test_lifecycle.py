@@ -4,13 +4,10 @@ import asyncio
 import re
 
 import pytest
-
 from qler._time import now_epoch
-from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import JobCancelledError, JobFailedError
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
-from qler.queue import Queue
 from qler.task import task
 from sqler import F
 

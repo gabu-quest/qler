@@ -682,7 +682,7 @@ wheels = [
 
 [[package]]
 name = "sqler"
-version = "1.2026.2.1"
+version = "1.2026.3.5"
 source = { editable = "../sqler" }
 dependencies = [
     { name = "aiosqlite" },
@@ -691,11 +691,12 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.21.0" },
+    { name = "msgspec", marker = "extra == 'msgspec'", specifier = ">=0.19.0" },
     { name = "pydantic", marker = "extra == 'default'", specifier = ">=2.7.0" },
     { name = "pydantic", marker = "extra == 'full'", specifier = ">=2.7.0" },
     { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.7.0" },
 ]
-provides-extras = ["lite", "pydantic", "full", "default"]
+provides-extras = ["lite", "pydantic", "msgspec", "full", "default"]
 
 [package.metadata.requires-dev]
 benchmarks = [{ name = "matplotlib", specifier = ">=3.9.0" }]
@@ -704,7 +705,7 @@ dev = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1" },
-    { name = "marimo", specifier = ">=0.18.4" },
+    { name = "marimo", specifier = ">=0.20" },
     { name = "pre-commit", specifier = ">=4.5.1" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },

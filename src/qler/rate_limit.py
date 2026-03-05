@@ -10,7 +10,7 @@ from qler._time import now_epoch
 from qler.exceptions import ConfigurationError
 
 if TYPE_CHECKING:
-    from qler.models.bucket import RateLimitBucket
+    pass
 
 _RATE_PATTERN = re.compile(r"^(\d+)/([smhd])$")
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}

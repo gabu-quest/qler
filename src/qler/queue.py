@@ -21,10 +21,10 @@ from qler.exceptions import (
     PayloadTooLargeError,
     TaskNotRegisteredError,
 )
+from qler.lifecycle import emit as _lifecycle
 from qler.models.attempt import JobAttempt
 from qler.models.bucket import RateLimitBucket
 from qler.models.job import Job
-from qler.lifecycle import emit as _lifecycle
 from qler.rate_limit import RateSpec, parse_rate, try_acquire
 
 if TYPE_CHECKING:
@@ -91,7 +91,7 @@ class Queue:
         self._metrics: Optional[QlerMetrics] = None
         if metrics is not False:
             try:
-                from qler.metrics import QlerMetrics as _QM
+                from qler.metrics import QlerMetrics as _QM  # noqa: N814
             except ImportError:
                 raise ConfigurationError(
                     "prometheus-client required: pip install 'qler[metrics]'"
@@ -99,7 +99,7 @@ class Queue:
             if metrics is True:
                 self._metrics = _QM()
             else:
-                from prometheus_client import CollectorRegistry as _CR
+                from prometheus_client import CollectorRegistry as _CR  # noqa: N814
 
                 if not isinstance(metrics, _CR):
                     raise ConfigurationError(
@@ -414,7 +414,7 @@ class Queue:
         now = now_epoch()
 
         # Pre-fetch existing idempotency and uniqueness keys in batch
-        _PARAM_CHUNK = 900  # stay under SQLite's 999-parameter limit
+        param_chunk = 900  # stay under SQLite's 999-parameter limit
 
         all_idem_keys = list(dict.fromkeys(
             s["idempotency_key"] for s in jobs if s.get("idempotency_key") is not None
@@ -425,8 +425,8 @@ class Queue:
 
         idem_existing: dict[str, Job] = {}
         if all_idem_keys:
-            for off in range(0, len(all_idem_keys), _PARAM_CHUNK):
-                chunk = all_idem_keys[off : off + _PARAM_CHUNK]
+            for off in range(0, len(all_idem_keys), param_chunk):
+                chunk = all_idem_keys[off : off + param_chunk]
                 found = await Job.query().filter(
                     F("idempotency_key").in_list(chunk)
                     & (F("status") != JobStatus.CANCELLED.value)
@@ -436,8 +436,8 @@ class Queue:
 
         unique_existing: dict[str, Job] = {}
         if all_unique_keys:
-            for off in range(0, len(all_unique_keys), _PARAM_CHUNK):
-                chunk = all_unique_keys[off : off + _PARAM_CHUNK]
+            for off in range(0, len(all_unique_keys), param_chunk):
+                chunk = all_unique_keys[off : off + param_chunk]
                 found = await Job.query().filter(
                     F("unique_key").in_list(chunk)
                     & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
@@ -605,9 +605,9 @@ class Queue:
                 all_dep_edges.append((dep_ulid, job.ulid))
 
         if all_dep_edges:
-            _DEP_CHUNK = 499  # 2 params per edge, SQLite max 999
-            for offset in range(0, len(all_dep_edges), _DEP_CHUNK):
-                chunk = all_dep_edges[offset : offset + _DEP_CHUNK]
+            dep_chunk = 499  # 2 params per edge, SQLite max 999
+            for offset in range(0, len(all_dep_edges), dep_chunk):
+                chunk = all_dep_edges[offset : offset + dep_chunk]
                 placeholders = ", ".join(["(?, ?)"] * len(chunk))
                 params: list[str] = [v for edge in chunk for v in edge]
                 cur = await self._db.adapter.execute(

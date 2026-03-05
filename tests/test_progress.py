@@ -4,8 +4,6 @@ import asyncio
 
 import pytest
 import pytest_asyncio
-from sqler import AsyncSQLerDB, F
-
 from qler._context import _current_job, set_progress
 from qler._time import now_epoch
 from qler.enums import JobStatus
@@ -13,7 +11,7 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-
+from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions

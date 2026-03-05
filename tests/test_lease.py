@@ -2,8 +2,6 @@
 
 import re
 
-import pytest
-
 from qler._time import now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.models.attempt import JobAttempt
