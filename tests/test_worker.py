@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import sys
 
 import pytest
 import pytest_asyncio
@@ -826,6 +827,7 @@ class TestHealthEndpoint:
             except asyncio.CancelledError:
                 pass
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets not available on Windows")
     async def test_health_unix_socket_responds(self, worker_queue, tmp_path):
         """Unix socket health endpoint returns 200 with correct JSON."""
         sock_path = str(tmp_path / "health.sock")
@@ -849,6 +851,7 @@ class TestHealthEndpoint:
             except asyncio.CancelledError:
                 pass
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets not available on Windows")
     async def test_health_unix_socket_cleanup(self, worker_queue, tmp_path):
         """Socket file is removed after worker stops."""
         sock_path = str(tmp_path / "health.sock")

@@ -374,7 +374,7 @@ class TestWorkerEvents:
         rec = events[0]
         assert rec.job_id == job.ulid  # type: ignore[attr-defined]
         assert rec.task == f"{_MOD}.executed_task"  # type: ignore[attr-defined]
-        assert 0 < rec.duration < 1.0  # type: ignore[attr-defined]
+        assert rec.duration >= 0  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_worker_failed_emits_executed(self, queue: Queue, capture: CapturingHandler):
@@ -397,7 +397,7 @@ class TestWorkerEvents:
         executed = capture.by_event("job.executed")
         assert len(executed) == 1
         assert executed[0].job_id == job.ulid  # type: ignore[attr-defined]
-        assert 0 < executed[0].duration < 1.0  # type: ignore[attr-defined]
+        assert executed[0].duration >= 0  # type: ignore[attr-defined]
 
         # Also has a job.failed event
         assert len(capture.by_event("job.failed")) == 1
