@@ -11,7 +11,7 @@
 - **Celery**: 5.6.2
 - **redis-py**: 6.4.0
 - **Scale**: small (warmup=1, iterations=3)
-- **Generated**: 2026-02-28 00:11 UTC
+- **Generated**: 2026-03-05 04:25 UTC
 
 ## Caveats (Read First)
 
@@ -34,14 +34,14 @@ Measures the write path: serialize a job and persist (SQLite) or publish (Redis)
 
 | Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |
 |-----:|--------|------------:|---------:|-------------------:|---|
-| 100 | qler | 65.02 | — | 1,538 | |
-| 100 | celery | 59.02 | — | 1,694 | 1.1x slower |
-| 500 | qler | 243.96 | — | 2,050 | |
-| 500 | celery | 296.55 | — | 1,686 | 1.2x faster |
-| 1000 | qler | 494.94 | — | 2,020 | |
-| 1000 | celery | 565.43 | — | 1,769 | 1.1x faster |
-| 5000 | qler | 2,361.50 | — | 2,117 | |
-| 5000 | celery | 2,859.58 | — | 1,748 | 1.2x faster |
+| 100 | qler | 72.11 | — | 1,387 | |
+| 100 | celery | 57.27 | — | 1,746 | 1.3x slower |
+| 500 | qler | 280.02 | — | 1,786 | |
+| 500 | celery | 275.15 | — | 1,817 | 1.0x slower |
+| 1000 | qler | 525.06 | — | 1,904 | |
+| 1000 | celery | 554.19 | — | 1,804 | 1.1x faster |
+| 5000 | qler | 2,609.03 | — | 1,916 | |
+| 5000 | celery | 2,794.44 | — | 1,789 | 1.1x faster |
 
 ### Batch Enqueue
 
@@ -49,14 +49,14 @@ Bulk submission: `enqueue_many()` (single SQLite transaction) vs `group().apply_
 
 | Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |
 |-----:|--------|------------:|---------:|-------------------:|---|
-| 100 | qler | 34.40 | — | 2,907 | |
-| 100 | celery | 58.11 | — | 1,721 | 1.7x faster |
-| 500 | qler | 79.83 | — | 6,263 | |
-| 500 | celery | 300.16 | — | 1,666 | 3.8x faster |
-| 1000 | qler | 147.76 | — | 6,768 | |
-| 1000 | celery | 596.09 | — | 1,678 | 4.0x faster |
-| 5000 | qler | 661.17 | — | 7,562 | |
-| 5000 | celery | 3,129.20 | — | 1,598 | 4.7x faster |
+| 100 | qler | 34.47 | — | 2,901 | |
+| 100 | celery | 55.81 | — | 1,792 | 1.6x faster |
+| 500 | qler | 74.64 | — | 6,699 | |
+| 500 | celery | 286.87 | — | 1,743 | 3.8x faster |
+| 1000 | qler | 121.28 | — | 8,245 | |
+| 1000 | celery | 566.98 | — | 1,764 | 4.7x faster |
+| 5000 | qler | 501.35 | — | 9,973 | |
+| 5000 | celery | 3,173.56 | — | 1,576 | 6.3x faster |
 
 ### Raw API Round-Trip
 
@@ -64,12 +64,12 @@ Direct API round-trip: enqueue → claim → complete (qler) vs delay().get() (C
 
 | Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |
 |-----:|--------|------------:|---------:|-------------------:|---|
-| 100 | qler | 280.02 | — | 357.1 | |
-| 100 | celery | 159.29 | — | 627.8 | 1.8x slower |
-| 500 | qler | 1,344.14 | — | 372.0 | |
-| 500 | celery | 780.47 | — | 640.6 | 1.7x slower |
-| 1000 | qler | 2,656.27 | — | 376.5 | |
-| 1000 | celery | 1,558.91 | — | 641.5 | 1.7x slower |
+| 100 | qler | 335.61 | — | 298.0 | |
+| 100 | celery | 168.02 | — | 595.2 | 2.0x slower |
+| 500 | qler | 1,616.37 | — | 309.3 | |
+| 500 | celery | 852.59 | — | 586.5 | 1.9x slower |
+| 1000 | qler | 3,112.22 | — | 321.3 | |
+| 1000 | celery | 1,680.91 | — | 594.9 | 1.9x slower |
 
 ### Raw API Throughput
 
@@ -77,14 +77,14 @@ Sequential enqueue-claim-complete cycles via raw API (no Worker). Measures SQLit
 
 | Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |
 |-----:|--------|------------:|---------:|-------------------:|---|
-| 100 | qler | 281.69 | — | 355.0 | |
-| 100 | celery | 172.24 | — | 580.6 | 1.6x slower |
-| 500 | qler | 1,340.57 | — | 373.0 | |
-| 500 | celery | 788.42 | — | 634.2 | 1.7x slower |
-| 1000 | qler | 2,649.39 | — | 377.4 | |
-| 1000 | celery | 1,567.44 | — | 638.0 | 1.7x slower |
-| 5000 | qler | 13,360.05 | — | 374.3 | |
-| 5000 | celery | 7,801.38 | — | 640.9 | 1.7x slower |
+| 100 | qler | 314.51 | — | 318.0 | |
+| 100 | celery | 166.91 | — | 599.1 | 1.9x slower |
+| 500 | qler | 1,562.97 | — | 319.9 | |
+| 500 | celery | 829.75 | — | 602.6 | 1.9x slower |
+| 1000 | qler | 3,031.13 | — | 329.9 | |
+| 1000 | celery | 1,679.96 | — | 595.3 | 1.8x slower |
+| 5000 | qler | 15,804.85 | — | 316.4 | |
+| 5000 | celery | 8,197.26 | — | 610.0 | 1.9x slower |
 
 ### Worker Round-Trip
 
@@ -92,10 +92,10 @@ Real end-to-end: enqueue → Worker dispatch → job.wait() on both sides. The h
 
 | Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |
 |-----:|--------|------------:|---------:|-------------------:|---|
-| 100 | qler | 405.31 | — | 246.7 | |
-| 100 | celery | 136.25 | — | 734.0 | 3.0x slower |
-| 500 | qler | 1,948.48 | — | 256.6 | |
-| 500 | celery | 721.04 | — | 693.4 | 2.7x slower |
+| 100 | qler | 441.99 | — | 226.2 | |
+| 100 | celery | 131.88 | — | 758.3 | 3.4x slower |
+| 500 | qler | 2,230.03 | — | 224.2 | |
+| 500 | celery | 703.76 | — | 710.5 | 3.2x slower |
 
 ### Worker Throughput
 
@@ -103,10 +103,10 @@ Sequential enqueue + job.wait() through real Workers. The honest throughput numb
 
 | Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |
 |-----:|--------|------------:|---------:|-------------------:|---|
-| 100 | qler | 1,993.61 | — | 50.2 | |
-| 100 | celery | 153.85 | — | 650.0 | 13.0x slower |
-| 500 | qler | 9,720.43 | — | 51.4 | |
-| 500 | celery | 764.83 | — | 653.7 | 12.7x slower |
+| 100 | qler | 1,339.66 | — | 74.6 | |
+| 100 | celery | 166.60 | — | 600.3 | 8.0x slower |
+| 500 | qler | 6,468.13 | — | 77.3 | |
+| 500 | celery | 838.46 | — | 596.3 | 7.7x slower |
 
 ### Cold Start
 
@@ -114,26 +114,26 @@ Time from zero to first job result, including full initialization. qler: Queue +
 
 | Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |
 |-----:|--------|------------:|---------:|-------------------:|---|
-| 1 | qler | 33.10 | — | 30.2 | |
-| 1 | celery | 3,427.79 | — | 0.3 | 103.5x faster |
-| 10 | qler | 208.12 | — | 48.0 | |
-| 10 | celery | 3,490.97 | — | 2.9 | 16.8x faster |
+| 1 | qler | 34.11 | — | 29.3 | |
+| 1 | celery | 3,478.48 | — | 0.3 | 102.0x faster |
+| 10 | qler | 1,146.00 | — | 8.7 | |
+| 10 | celery | 3,496.58 | — | 2.9 | 3.1x faster |
 
 ## Analysis
 
-**Enqueue latency**: qler's `enqueue()` is faster than Celery's `apply_async()` at most scale points (~1.1x average). A local SQLite write avoids TCP round-trips to Redis.
+**Enqueue latency**: Both systems show similar enqueue performance at these scales.
 
-**Batch enqueue**: qler's `enqueue_many()` dominates (~3.6x average). A single SQLite transaction for the entire batch beats individual Redis publishes. The advantage grows with batch size.
+**Batch enqueue**: qler's `enqueue_many()` dominates (~4.1x average). A single SQLite transaction for the entire batch beats individual Redis publishes. The advantage grows with batch size.
 
-**Raw API round-trip**: Celery wins even against qler's raw API (~1.7x average). Redis's in-memory broker outpaces SQLite's 3-write cycle (enqueue + claim + complete).
+**Raw API round-trip**: Celery wins even against qler's raw API (~1.9x average). Redis's in-memory broker outpaces SQLite's 3-write cycle (enqueue + claim + complete).
 
-**Raw API throughput**: Celery sustains higher throughput even against qler's raw API (~1.7x average). SQLite's disk-backed writes can't match Redis's in-memory operations at sustained load.
+**Raw API throughput**: Celery sustains higher throughput even against qler's raw API (~1.9x average). SQLite's disk-backed writes can't match Redis's in-memory operations at sustained load.
 
-**Worker round-trip**: With real Workers on both sides, Celery is ~2.8x faster. Redis's in-memory broker + optimized message serialization outperforms qler's SQLite polling loop.
+**Worker round-trip**: With real Workers on both sides, Celery is ~3.3x faster. Redis's in-memory broker + optimized message serialization outperforms qler's SQLite polling loop.
 
-**Worker throughput**: Through real Workers, Celery sustains ~12.8x higher throughput. Redis's in-memory pub/sub scales better than SQLite polling under sustained load. With `prefork` pool (not tested), the gap widens.
+**Worker throughput**: Through real Workers, Celery sustains ~7.9x higher throughput. Redis's in-memory pub/sub scales better than SQLite polling under sustained load. With `prefork` pool (not tested), the gap widens.
 
-**Cold start**: qler initializes ~60.2x faster. No subprocess fork, no Redis connection — just SQLite schema init and an asyncio task. This matters for serverless, CLI tools, and test suites.
+**Cold start**: qler initializes ~52.5x faster. No subprocess fork, no Redis connection — just SQLite schema init and an asyncio task. This matters for serverless, CLI tools, and test suites.
 
 ## When to Use Which
 
