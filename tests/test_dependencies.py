@@ -898,6 +898,8 @@ class TestDependencyStress:
         parents = []
         for _ in range(10):
             parents.append(await queue.enqueue("my.task"))
+        # Sort by ULID to match claim order (ULID ordering = claim priority)
+        parents.sort(key=lambda j: j.ulid)
         child = await queue.enqueue(
             "my.task", depends_on=[p.ulid for p in parents]
         )
