@@ -18,7 +18,7 @@ jobs:
   build-test:
     name: Tests • ${{ matrix.os }} • py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 15
     env:
       UV_NO_SOURCES: "1"
     strategy:
@@ -50,6 +50,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Run tests
+        timeout-minutes: 10
         env:
           PYTHONUTF8: "1"
-        run: uv run pytest -v --timeout=30 --disable-warnings
+        run: uv run pytest -v --timeout=30 --timeout-method=thread -p no:cacheprovider --disable-warnings
