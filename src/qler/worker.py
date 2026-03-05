@@ -9,7 +9,6 @@ import logging
 import os
 import pathlib
 import platform
-import resource
 import signal
 import socket
 import time
@@ -525,11 +524,16 @@ class Worker:
             if not self._running:
                 break
             try:
-                rss_raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                if platform.system() == "Darwin":
-                    rss_mb = rss_raw / (1024 * 1024)  # macOS: bytes -> MB
-                else:
-                    rss_mb = rss_raw / 1024  # Linux: KB -> MB
+                try:
+                    import resource
+
+                    rss_raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    if platform.system() == "Darwin":
+                        rss_mb = rss_raw / (1024 * 1024)  # macOS: bytes -> MB
+                    else:
+                        rss_mb = rss_raw / 1024  # Linux: KB -> MB
+                except ImportError:
+                    continue  # resource module unavailable on Windows
                 if rss_mb > self.memory_limit_mb:
                     logger.warning(
                         "Memory watchdog: RSS %.0f MB exceeds limit %d MB, "
