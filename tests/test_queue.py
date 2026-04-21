@@ -14,6 +14,7 @@ from qler.exceptions import (
     PayloadTooLargeError,
 )
 from qler.models.attempt import JobAttempt
+from qler.models.bucket import RateLimitBucket
 from qler.models.job import Job
 from qler.queue import Queue, _calculate_retry_eta
 from sqler import F
@@ -61,6 +62,50 @@ class TestQueueInit:
         q = Queue(db)
         await q.init_db()
         await q.init_db()  # Should not raise
+
+    async def test_init_db_creates_explicit_unique_indexes(self, queue):
+        cur = await queue.db.adapter.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN ("
+            "'idx_qler_jobs_ulid', "
+            "'idx_qler_job_attempts_ulid', "
+            "'idx_qler_rate_limit_buckets_bucket_key', "
+            "'idx_qler_jobs_archive_ulid'"
+            ")"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        assert {row[0] for row in rows} == {
+            "idx_qler_jobs_ulid",
+            "idx_qler_job_attempts_ulid",
+            "idx_qler_rate_limit_buckets_bucket_key",
+            "idx_qler_jobs_archive_ulid",
+        }
+
+    async def test_init_db_migrates_legacy_rate_limit_bucket_column(self, db):
+        cur = await db.adapter.execute(
+            'CREATE TABLE qler_rate_limit_buckets (_id INTEGER PRIMARY KEY AUTOINCREMENT, data JSON NOT NULL, "key" TEXT NOT NULL, tokens REAL NOT NULL DEFAULT 0.0, max_tokens INTEGER NOT NULL DEFAULT 10, refill_rate REAL NOT NULL DEFAULT 0.167, last_refill_at INTEGER NOT NULL DEFAULT 0)'
+        )
+        await cur.close()
+        cur = await db.adapter.execute(
+            'INSERT INTO qler_rate_limit_buckets (data, "key", tokens, max_tokens, refill_rate, last_refill_at) VALUES (json(?), ?, ?, ?, ?, ?)',
+            ["{}", "task:legacy", 1.0, 10, 0.5, 123],
+        )
+        await cur.close()
+        await db.adapter.auto_commit()
+
+        q = Queue(db)
+        await q.init_db()
+
+        cur = await db.adapter.execute('PRAGMA table_info("qler_rate_limit_buckets")')
+        cols = await cur.fetchall()
+        await cur.close()
+        col_names = {col[1] for col in cols}
+        assert "bucket_key" in col_names
+        assert "key" not in col_names
+
+        bucket = await RateLimitBucket.query().filter(F("bucket_key") == "task:legacy").first()
+        assert bucket is not None
+        assert bucket.bucket_key == "task:legacy"
 
 
 class TestEnqueue:

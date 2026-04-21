@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+from pydantic import Field
 from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, RebaseConfig
 
 
@@ -15,13 +16,24 @@ class RateLimitBucket(AsyncSQLerSafeModel):
     """
 
     __promoted__: ClassVar[dict[str, str]] = {
-        "key": "TEXT UNIQUE NOT NULL",
+        "bucket_key": "TEXT NOT NULL",
     }
     __checks__: ClassVar[dict[str, str]] = {}
     _rebase_config: ClassVar[RebaseConfig] = NO_REBASE_CONFIG
 
-    key: str = ""
+    bucket_key: str = Field(default="", alias="key")
     tokens: float = 0.0
     max_tokens: int = 10
     refill_rate: float = 0.167  # tokens per second
     last_refill_at: int = 0
+
+    model_config = {
+        "extra": "ignore",
+        "frozen": False,
+        "populate_by_name": True,
+    }
+
+    @property
+    def key(self) -> str:
+        """Backward-compatible alias for the renamed promoted field."""
+        return self.bucket_key
