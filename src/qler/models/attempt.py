@@ -11,7 +11,7 @@ class JobAttempt(AsyncSQLerSafeModel):
     """Tracks a single execution attempt of a job."""
 
     __promoted__: ClassVar[dict[str, str]] = {
-        "ulid": "TEXT UNIQUE NOT NULL",
+        "ulid": "TEXT NOT NULL",
         "job_ulid": "TEXT NOT NULL",
         "status": "TEXT NOT NULL DEFAULT 'running'",
     }

@@ -21,7 +21,7 @@ class Job(AsyncSQLerSafeModel):
     """A queued job with optimistic locking and promoted hot columns."""
 
     __promoted__: ClassVar[dict[str, str]] = {
-        "ulid": "TEXT UNIQUE NOT NULL",
+        "ulid": "TEXT NOT NULL",
         "status": "TEXT NOT NULL DEFAULT 'pending'",
         "queue_name": "TEXT NOT NULL DEFAULT 'default'",
         "priority": "INTEGER NOT NULL DEFAULT 0",

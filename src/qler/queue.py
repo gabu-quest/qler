@@ -115,6 +115,58 @@ class Queue:
             raise RuntimeError("Queue not initialized. Call init_db() first.")
         return self._db
 
+    async def _migrate_schema(self) -> None:
+        """Apply qler-owned schema migrations before ensure/create steps."""
+        await self._migrate_rate_limit_bucket_key_column()
+
+    async def _migrate_rate_limit_bucket_key_column(self) -> None:
+        """Rename the legacy reserved-word bucket column to ``bucket_key``."""
+        cur = await self._db.adapter.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='qler_rate_limit_buckets';"
+        )
+        try:
+            row = await cur.fetchone()
+        finally:
+            await cur.close()
+        if row is None:
+            return
+
+        cur = await self._db.adapter.execute('PRAGMA table_info("qler_rate_limit_buckets");')
+        try:
+            columns = {col[1] for col in await cur.fetchall()}
+        finally:
+            await cur.close()
+
+        if "key" in columns and "bucket_key" not in columns:
+            cur = await self._db.adapter.execute(
+                'ALTER TABLE "qler_rate_limit_buckets" RENAME COLUMN "key" TO bucket_key'
+            )
+            await cur.close()
+            await self._db.adapter.auto_commit()
+
+    async def _create_unique_indexes(self) -> None:
+        """Create explicit uniqueness guarantees for promoted columns."""
+        adapter = self._db.adapter
+        indexes = [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_jobs_ulid ON qler_jobs (ulid)",
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_job_attempts_ulid "
+                "ON qler_job_attempts (ulid)"
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_rate_limit_buckets_bucket_key "
+                "ON qler_rate_limit_buckets (bucket_key)"
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_jobs_archive_ulid "
+                "ON qler_jobs_archive (ulid)"
+            ),
+        ]
+        for ddl in indexes:
+            cur = await adapter.execute(ddl)
+            await cur.close()
+        await adapter.auto_commit()
+
     async def init_db(self) -> None:
         """Initialize the database schema. Lazy and idempotent."""
         if self._initialized:
@@ -132,6 +184,8 @@ class Queue:
             ]:
                 cur = await self._db.adapter.execute(pragma)
                 await cur.close()
+
+        await self._migrate_schema()
 
         Job.set_db(self._db, "qler_jobs")
         JobAttempt.set_db(self._db, "qler_job_attempts")
@@ -184,6 +238,7 @@ class Queue:
             "qler_jobs_archive", Job.__promoted__, Job.__checks__
         )
         await self._db._ensure_versioned_table("qler_jobs_archive")
+        await self._create_unique_indexes()
 
         # Wire up queue depth query for Prometheus scrapes
         if self._metrics is not None:

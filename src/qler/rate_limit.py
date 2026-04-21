@@ -70,13 +70,13 @@ async def try_acquire(key: str, rate: RateSpec) -> bool:
 
     # Try to find existing bucket
     bucket = await RateLimitBucket.query().filter(
-        F("key") == key
+        F("bucket_key") == key
     ).first()
 
     if bucket is None:
         # First use — create bucket with full tokens minus 1 (this request)
         bucket = RateLimitBucket(
-            key=key,
+            bucket_key=key,
             tokens=float(rate.limit - 1),
             max_tokens=rate.limit,
             refill_rate=rate.refill_rate,

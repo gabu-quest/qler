@@ -2,6 +2,13 @@
 
 All notable changes to qler will be documented in this file.
 
+## [0.5.1] — 2026-04-21
+
+### Fixed
+
+- **sqler compatibility** — removed inline `UNIQUE` from promoted-column definitions and restored uniqueness with explicit indexes so `Queue.init_db()` works with current `sqler` schema validation
+- **rate-limit bucket schema** — renamed the promoted rate-limit column from reserved-word `key` to `bucket_key`, added a migration for legacy databases, and kept backward-compatible model access via `bucket.key`
+
 ## [0.5.0] — 2026-02-25
 
 ### Added

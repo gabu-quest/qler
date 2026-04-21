@@ -2,6 +2,7 @@
 
 from qler.enums import AttemptStatus, JobStatus
 from qler.models.attempt import JobAttempt
+from qler.models.bucket import RateLimitBucket
 from qler.models.job import Job
 
 
@@ -84,6 +85,18 @@ class TestJobAttemptDefaults:
         assert attempt.error is None
         assert attempt.traceback is None
         assert attempt.lease_expires_at is None
+
+
+class TestRateLimitBucketDefaults:
+    """Verify RateLimitBucket keeps backward-compatible key access."""
+
+    def test_promoted_columns(self):
+        assert set(RateLimitBucket.__promoted__.keys()) == {"bucket_key"}
+
+    def test_constructor_accepts_key_alias(self):
+        bucket = RateLimitBucket(key="task:test")
+        assert bucket.bucket_key == "task:test"
+        assert bucket.key == "task:test"
 
 
 class TestJobRoundTrip:
