@@ -18,6 +18,7 @@ Requires `sqler>=1.2026.11.1`.
 - **Finishing a job is one write.** `complete_job`, `fail_job` and `cancel_job` commit the status, the waiting jobs' dependency counts or cancellations, the dead-letter move and the attempt's end together. Lease recovery does the same. Events, metrics and wake-ups follow the commit.
 - **A running job keeps its lease**, and a worker told to stop ends in bounded time.
 - **Shutdown no longer fails a long job for good.** A job still running after `shutdown_timeout` stays marked running and is run again when its lease ends. Before, it was failed whatever its `max_retries`.
+- **A job a shutdown stopped is claimable at once when its task has ended.** It goes back to the queue as lease recovery would put it, without waiting out its lease. A task that ignores the stop, or a sync task still running in its thread, keeps its lease.
 - **Retry takes a job out of the dead-letter queue.** `Job.retry()` on a dead-lettered job left it pending inside the dead-letter queue, where no worker claims it. It now returns to the queue it came from.
 - **The rate limiter decides and writes in one transaction.** Concurrent calls for one bucket raised `StaleVersionError` after the job was already marked running, and a clock that stepped back stored a negative token count.
 - **A rate limit follows a changed rate.** A bucket kept the limit it was created with for as long as the database file lived.
