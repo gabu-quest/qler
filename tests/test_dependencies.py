@@ -13,6 +13,7 @@ import pytest_asyncio
 from sqler import F
 from sqler.models.async_queryset import AsyncSQLerQuerySet
 
+from qler import _schema as qler_schema
 from qler._time import now_epoch
 from qler.enums import JobStatus
 from qler.exceptions import DependencyError, JobCancelledError, JobFailedError
@@ -1580,16 +1581,16 @@ class TestDependencyEdgesModel:
         the first to finish (or, without the transaction, reads the old table and writes the
         edges a second time). Either way it is released once it has started."""
         path, roles = _old_file(tmp_path)
-        upgrade = Queue._upgrade_job_deps_from_0_5_1
+        upgrade = qler_schema.upgrade_job_deps_from_0_5_1
 
-        async def no_upgrade(self):
+        async def no_upgrade(db):
             return None
 
-        monkeypatch.setattr(Queue, "_upgrade_job_deps_from_0_5_1", no_upgrade)
+        monkeypatch.setattr(qler_schema, "upgrade_job_deps_from_0_5_1", no_upgrade)
         q1, q2 = Queue(path), Queue(path)
         await q1.init_db()
         await q2.init_db()
-        monkeypatch.setattr(Queue, "_upgrade_job_deps_from_0_5_1", upgrade)
+        monkeypatch.setattr(qler_schema, "upgrade_job_deps_from_0_5_1", upgrade)
         try:
             held, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
             save_many = JobDependency.save_many
@@ -1617,9 +1618,9 @@ class TestDependencyEdgesModel:
             monkeypatch.setattr(q2.db, "transaction", marked_transaction)
             monkeypatch.setattr(q2.db, "execute_sql", marked_execute_sql)
 
-            first = asyncio.create_task(q1._upgrade_job_deps_from_0_5_1())
+            first = asyncio.create_task(qler_schema.upgrade_job_deps_from_0_5_1(q1.db))
             await held.wait()
-            second = asyncio.create_task(q2._upgrade_job_deps_from_0_5_1())
+            second = asyncio.create_task(qler_schema.upgrade_job_deps_from_0_5_1(q2.db))
             await second_started.wait()
             release.set()
             await asyncio.gather(first, second)
