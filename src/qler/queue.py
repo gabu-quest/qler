@@ -24,7 +24,7 @@ from qler.exceptions import (
 from qler.lifecycle import emit as _lifecycle
 from qler.models.attempt import JobAttempt
 from qler.models.bucket import RateLimitBucket
-from qler.models.job import Job
+from qler.models.job import Job, failed_to_pending_fields
 from qler.rate_limit import RateSpec, parse_rate, try_acquire
 
 if TYPE_CHECKING:
@@ -1314,15 +1314,7 @@ class Queue:
         updated = await Job.query().filter(
             (F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value)
         ).update_one(
-            status=JobStatus.PENDING.value,
-            queue_name=target_queue,
-            original_queue="",
-            retry_count=0,
-            finished_at=None,
-            eta=now,
-            updated_at=now,
-            progress=None,
-            progress_message="",
+            **failed_to_pending_fields(now, target_queue=target_queue)
         )
         return updated
 
