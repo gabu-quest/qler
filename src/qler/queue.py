@@ -612,6 +612,7 @@ class Queue:
             job_instances: list[Job] = []
             batch_ulids: dict[str, Job] = {}  # for intra-batch dependency resolution
             batch_idem_keys: dict[str, Job] = {}  # for intra-batch idempotency dedup
+            batch_unique_keys: dict[str, Job] = {}  # for intra-batch unique-key dedup
 
             for i, spec in enumerate(jobs):
                 task_path = spec.get("task_path")
@@ -664,6 +665,9 @@ class Queue:
                 if unique_key is not None:
                     if unique_key in unique_existing:
                         job_instances.append(unique_existing[unique_key])
+                        continue
+                    if unique_key in batch_unique_keys:
+                        job_instances.append(batch_unique_keys[unique_key])
                         continue
 
                 # Validate dependencies (including intra-batch)
@@ -749,6 +753,8 @@ class Queue:
                 batch_ulids[job.ulid] = job
                 if idempotency_key is not None:
                     batch_idem_keys[idempotency_key] = job
+                if unique_key is not None:
+                    batch_unique_keys[unique_key] = job
 
             # Phase 2: Batch-save all new jobs (skip idempotency/uniqueness-matched existing ones)
             # Deduplicate by identity — intra-batch dedup may add the same object twice
