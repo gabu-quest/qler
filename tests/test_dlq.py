@@ -104,13 +104,17 @@ class TestDLQOnFailure:
     async def test_terminal_failure_moves_to_dlq(self, dlq_queue):
         """Job that exhausts retries lands in the DLQ queue."""
         job = await dlq_queue.enqueue(
-            "my.task", queue_name="default", max_retries=0,
+            "my.task",
+            queue_name="default",
+            max_retries=0,
         )
         claimed = await dlq_queue.claim_job("w1", ["default"])
         assert claimed is not None
         assert claimed.ulid == job.ulid
 
-        await dlq_queue.fail_job(claimed, "w1", ValueError("boom"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("boom"), failure_kind=FailureKind.EXCEPTION
+        )
 
         updated = await Job.query().filter(F("ulid") == job.ulid).first()
         assert updated.status == JobStatus.FAILED.value
@@ -121,12 +125,16 @@ class TestDLQOnFailure:
     async def test_retryable_failure_stays_in_original_queue(self, dlq_queue):
         """A retryable failure does NOT move to DLQ — it stays pending."""
         job = await dlq_queue.enqueue(
-            "my.task", queue_name="work", max_retries=3,
+            "my.task",
+            queue_name="work",
+            max_retries=3,
         )
         claimed = await dlq_queue.claim_job("w1", ["work"])
         assert claimed is not None
 
-        await dlq_queue.fail_job(claimed, "w1", ValueError("retry me"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("retry me"), failure_kind=FailureKind.EXCEPTION
+        )
 
         updated = await Job.query().filter(F("ulid") == job.ulid).first()
         assert updated.status == JobStatus.PENDING.value
@@ -151,7 +159,9 @@ class TestDLQOnFailure:
         """DLQ jobs retain last_error and last_failure_kind."""
         job = await dlq_queue.enqueue("my.task", max_retries=0)
         claimed = await dlq_queue.claim_job("w1", ["default"])
-        await dlq_queue.fail_job(claimed, "w1", RuntimeError("details here"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", RuntimeError("details here"), failure_kind=FailureKind.EXCEPTION
+        )
 
         updated = await Job.query().filter(F("ulid") == job.ulid).first()
         assert updated.last_error == "details here"
@@ -165,9 +175,11 @@ class TestDLQOnFailure:
             # Reset ETA so retry is immediately claimable
             await Job.query().filter(F("ulid") == job.ulid).update_one(eta=0)
             claimed = await dlq_queue.claim_job("w1", ["default"])
-            assert claimed is not None, f"Claim #{i+1} returned None"
+            assert claimed is not None, f"Claim #{i + 1} returned None"
             assert claimed.ulid == job.ulid
-            await dlq_queue.fail_job(claimed, "w1", ValueError(f"fail #{i+1}"), failure_kind=FailureKind.EXCEPTION)
+            await dlq_queue.fail_job(
+                claimed, "w1", ValueError(f"fail #{i + 1}"), failure_kind=FailureKind.EXCEPTION
+            )
             # Verify retry_count increments correctly each pass
             intermediate = await Job.query().filter(F("ulid") == job.ulid).first()
             assert intermediate.retry_count == i + 1
@@ -177,7 +189,9 @@ class TestDLQOnFailure:
         await Job.query().filter(F("ulid") == job.ulid).update_one(eta=0)
         claimed = await dlq_queue.claim_job("w1", ["default"])
         assert claimed is not None
-        await dlq_queue.fail_job(claimed, "w1", ValueError("final"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("final"), failure_kind=FailureKind.EXCEPTION
+        )
 
         updated = await Job.query().filter(F("ulid") == job.ulid).first()
         assert updated.status == JobStatus.FAILED.value
@@ -188,7 +202,9 @@ class TestDLQOnFailure:
         """DLQ correctly records original_queue for non-default queues."""
         job = await dlq_queue.enqueue("my.task", queue_name="emails", max_retries=0)
         claimed = await dlq_queue.claim_job("w1", ["emails"])
-        await dlq_queue.fail_job(claimed, "w1", ValueError("send failed"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("send failed"), failure_kind=FailureKind.EXCEPTION
+        )
 
         updated = await Job.query().filter(F("ulid") == job.ulid).first()
         assert updated.status == JobStatus.FAILED.value
@@ -203,7 +219,9 @@ class TestDLQOnFailure:
 
         job = await dlq_queue.enqueue("my.task", max_retries=0)
         claimed = await dlq_queue.claim_job("w1", ["default"])
-        await dlq_queue.fail_job(claimed, "w1", RuntimeError("kaboom"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", RuntimeError("kaboom"), failure_kind=FailureKind.EXCEPTION
+        )
 
         attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
@@ -213,11 +231,14 @@ class TestDLQOnFailure:
         assert attempt.failure_kind == FailureKind.EXCEPTION.value
         assert attempt.finished_at is not None
 
-    @pytest.mark.parametrize("fk", [
-        FailureKind.TASK_NOT_FOUND,
-        FailureKind.SIGNATURE_MISMATCH,
-        FailureKind.CANCELLED,
-    ])
+    @pytest.mark.parametrize(
+        "fk",
+        [
+            FailureKind.TASK_NOT_FOUND,
+            FailureKind.SIGNATURE_MISMATCH,
+            FailureKind.CANCELLED,
+        ],
+    )
     async def test_non_retryable_failure_kind_goes_to_dlq(self, dlq_queue, fk):
         """All non-retryable failure kinds route to DLQ on first failure."""
         job = await dlq_queue.enqueue("my.task", max_retries=3)
@@ -243,7 +264,9 @@ class TestDLQReplay:
         """Helper: enqueue → claim → fail terminal → returns the DLQ'd job."""
         job = await dlq_queue.enqueue(task_name, queue_name=queue_name, max_retries=0)
         claimed = await dlq_queue.claim_job("w1", [queue_name])
-        await dlq_queue.fail_job(claimed, "w1", ValueError("boom"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("boom"), failure_kind=FailureKind.EXCEPTION
+        )
         return await Job.query().filter(F("ulid") == job.ulid).first()
 
     async def test_replay_resets_to_original_queue(self, dlq_queue):
@@ -301,16 +324,12 @@ class TestDLQReplay:
         from qler.models.attempt import JobAttempt
 
         dlq_job = await self._make_dlq_job(dlq_queue)
-        attempts_before = await JobAttempt.query().filter(
-            F("job_ulid") == dlq_job.ulid
-        ).all()
+        attempts_before = await JobAttempt.query().filter(F("job_ulid") == dlq_job.ulid).all()
         assert len(attempts_before) == 1
 
         await dlq_queue.replay_job(dlq_job)
 
-        attempts_after = await JobAttempt.query().filter(
-            F("job_ulid") == dlq_job.ulid
-        ).all()
+        attempts_after = await JobAttempt.query().filter(F("job_ulid") == dlq_job.ulid).all()
         assert len(attempts_after) == 1  # unchanged
         assert attempts_after[0].status == AttemptStatus.FAILED.value
         assert attempts_after[0].error == "boom"
@@ -320,9 +339,13 @@ class TestDLQReplay:
         # Manually create a FAILED job in DLQ with no original_queue
         job = await dlq_queue.enqueue("my.task", queue_name="dead_letters", max_retries=0)
         # Force to FAILED status (simulating direct placement)
-        await Job.query().filter(F("ulid") == job.ulid).update_one(
-            status=JobStatus.FAILED.value,
-            finished_at=now_epoch(),
+        await (
+            Job.query()
+            .filter(F("ulid") == job.ulid)
+            .update_one(
+                status=JobStatus.FAILED.value,
+                finished_at=now_epoch(),
+            )
         )
         dlq_job = await Job.query().filter(F("ulid") == job.ulid).first()
         assert dlq_job.original_queue == ""
@@ -398,7 +421,9 @@ class TestDLQWithDependencies:
 
         # Fail parent terminally
         claimed = await dlq_queue.claim_job("w1", ["default"])
-        await dlq_queue.fail_job(claimed, "w1", ValueError("parent died"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("parent died"), failure_kind=FailureKind.EXCEPTION
+        )
 
         # Parent should be in DLQ
         parent_updated = await Job.query().filter(F("ulid") == parent.ulid).first()
@@ -421,7 +446,9 @@ class TestDLQWithDependencies:
 
         # Fail dep_b terminally
         claimed_b = await dlq_queue.claim_job("w1", ["default"])
-        await dlq_queue.fail_job(claimed_b, "w1", ValueError("dep_b died"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed_b, "w1", ValueError("dep_b died"), failure_kind=FailureKind.EXCEPTION
+        )
 
         # dep_b goes to DLQ
         dep_b_updated = await Job.query().filter(F("ulid") == dep_b.ulid).first()
@@ -488,12 +515,16 @@ class TestDLQStress:
         for j in jobs:
             claimed = await dlq_queue.claim_job("w1", ["work"])
             assert claimed is not None
-            await dlq_queue.fail_job(claimed, "w1", ValueError(f"fail {j.ulid}"), failure_kind=FailureKind.EXCEPTION)
+            await dlq_queue.fail_job(
+                claimed, "w1", ValueError(f"fail {j.ulid}"), failure_kind=FailureKind.EXCEPTION
+            )
 
         original_ulids = {j.ulid for j in jobs}
-        dlq_jobs = await Job.query().filter(
-            (F("queue_name") == "dead_letters") & (F("status") == JobStatus.FAILED.value)
-        ).all()
+        dlq_jobs = (
+            await Job.query()
+            .filter((F("queue_name") == "dead_letters") & (F("status") == JobStatus.FAILED.value))
+            .all()
+        )
         assert len(dlq_jobs) == 5
         assert {dj.ulid for dj in dlq_jobs} == original_ulids
         for dj in dlq_jobs:
@@ -506,11 +537,15 @@ class TestDLQStress:
             j = await dlq_queue.enqueue(f"task.{i}", queue_name="default", max_retries=0)
             created_ulids.add(j.ulid)
             claimed = await dlq_queue.claim_job("w1", ["default"])
-            await dlq_queue.fail_job(claimed, "w1", ValueError("fail"), failure_kind=FailureKind.EXCEPTION)
+            await dlq_queue.fail_job(
+                claimed, "w1", ValueError("fail"), failure_kind=FailureKind.EXCEPTION
+            )
 
-        dlq_jobs = await Job.query().filter(
-            (F("queue_name") == "dead_letters") & (F("status") == JobStatus.FAILED.value)
-        ).all()
+        dlq_jobs = (
+            await Job.query()
+            .filter((F("queue_name") == "dead_letters") & (F("status") == JobStatus.FAILED.value))
+            .all()
+        )
         assert len(dlq_jobs) == 3
 
         replayed_ulids = set()
@@ -523,16 +558,20 @@ class TestDLQStress:
 
         assert replayed_ulids == created_ulids
 
-        remaining = await Job.query().filter(
-            (F("queue_name") == "dead_letters") & (F("status") == JobStatus.FAILED.value)
-        ).all()
+        remaining = (
+            await Job.query()
+            .filter((F("queue_name") == "dead_letters") & (F("status") == JobStatus.FAILED.value))
+            .all()
+        )
         assert len(remaining) == 0
 
     async def test_dlq_jobs_not_claimed_by_normal_workers(self, dlq_queue):
         """Workers listening to 'default' do NOT claim DLQ jobs."""
         job = await dlq_queue.enqueue("my.task", queue_name="default", max_retries=0)
         claimed = await dlq_queue.claim_job("w1", ["default"])
-        await dlq_queue.fail_job(claimed, "w1", ValueError("fail"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("fail"), failure_kind=FailureKind.EXCEPTION
+        )
 
         # Verify job is in DLQ
         updated = await Job.query().filter(F("ulid") == job.ulid).first()
@@ -564,7 +603,9 @@ class TestDLQStress:
         # First failure → DLQ
         job = await dlq_queue.enqueue("my.task", queue_name="default", max_retries=0)
         claimed = await dlq_queue.claim_job("w1", ["default"])
-        await dlq_queue.fail_job(claimed, "w1", ValueError("first"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("first"), failure_kind=FailureKind.EXCEPTION
+        )
 
         dlq_job = await Job.query().filter(F("ulid") == job.ulid).first()
         assert dlq_job.queue_name == "dead_letters"
@@ -578,7 +619,9 @@ class TestDLQStress:
         claimed2 = await dlq_queue.claim_job("w1", ["default"])
         assert claimed2 is not None
         assert claimed2.ulid == job.ulid
-        await dlq_queue.fail_job(claimed2, "w1", ValueError("second"), failure_kind=FailureKind.EXCEPTION)
+        await dlq_queue.fail_job(
+            claimed2, "w1", ValueError("second"), failure_kind=FailureKind.EXCEPTION
+        )
 
         final = await Job.query().filter(F("ulid") == job.ulid).first()
         assert final.queue_name == "dead_letters"

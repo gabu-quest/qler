@@ -233,9 +233,7 @@ class TestImmediateTaskResolution:
             await imm_queue.enqueue("some.nonexistent.task", args=(1, 2))
 
         # Job should be FAILED, not left as a ghost RUNNING record
-        jobs = await Job.query().filter(
-            F("task") == "some.nonexistent.task"
-        ).all()
+        jobs = await Job.query().filter(F("task") == "some.nonexistent.task").all()
         assert len(jobs) == 1
         assert jobs[0].status == JobStatus.FAILED.value
         assert jobs[0].last_failure_kind == FailureKind.TASK_NOT_FOUND.value
@@ -268,9 +266,7 @@ class TestImmediateAttemptRecord:
         wrapper = imm_queue._tasks[f"{__name__}.greet_task"]
         job = await wrapper.enqueue("world")
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
 
         assert len(attempts) == 1
         attempt = attempts[0]
@@ -284,9 +280,7 @@ class TestImmediateAttemptRecord:
         wrapper = imm_queue._tasks[f"{__name__}.fail_oops_task"]
         job = await wrapper.enqueue()
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
 
         assert len(attempts) == 1
         attempt = attempts[0]
@@ -308,9 +302,7 @@ class TestImmediateCorrelation:
         assert job.correlation_id == "req-abc-123"
         assert job.status == JobStatus.COMPLETED.value
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.COMPLETED.value
         assert attempts[0].worker_id == "__immediate__"
@@ -432,9 +424,7 @@ class TestImmediateTimeout:
         wrapped = task(imm_timeout_queue, timeout=1)(imm_timeout_slow_task)
         job = await wrapped.enqueue()
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert "timed out" in attempts[0].error
@@ -463,9 +453,7 @@ class TestImmediateRepeatedKeyInBatch:
     """A key repeated in one batch is one job: run once, every entry is the executed job."""
 
     @pytest.mark.parametrize("key_field", ["unique_key", "idempotency_key"])
-    async def test_repeated_key_runs_once_and_both_entries_are_executed(
-        self, imm_queue, key_field
-    ):
+    async def test_repeated_key_runs_once_and_both_entries_are_executed(self, imm_queue, key_field):
         global _call_count
         _call_count = 0
         path = f"{__name__}.counted_task"

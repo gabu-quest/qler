@@ -19,6 +19,7 @@ from qler.worker import Worker
 # Helper: shut down worker cleanly
 # ---------------------------------------------------------------------------
 
+
 async def _stop_worker(w, w_task):
     """Stop a Worker the same way existing tests do."""
     w._running = False
@@ -146,9 +147,7 @@ class TestWaitNotification:
         try:
             # poll_interval=10s proves we're NOT polling —
             # if Event didn't work, this would take 10+ seconds
-            result = await asyncio.wait_for(
-                job.wait(poll_interval=10.0), timeout=5.0
-            )
+            result = await asyncio.wait_for(job.wait(poll_interval=10.0), timeout=5.0)
             assert result.status == JobStatus.COMPLETED.value
             assert result.ulid == job.ulid
             assert result.result == {"x": 42}
@@ -164,9 +163,7 @@ class TestWaitNotification:
         w_task = asyncio.create_task(w.run())
         try:
             with pytest.raises(JobFailedError) as exc_info:
-                await asyncio.wait_for(
-                    job.wait(poll_interval=10.0), timeout=5.0
-                )
+                await asyncio.wait_for(job.wait(poll_interval=10.0), timeout=5.0)
             assert exc_info.value.ulid == job.ulid
             assert exc_info.value.failure_kind is not None
             assert job.ulid not in _registry
@@ -182,9 +179,7 @@ class TestWaitNotification:
         assert cancelled is True
 
         with pytest.raises(JobCancelledError) as exc_info:
-            await asyncio.wait_for(
-                job.wait(poll_interval=10.0), timeout=2.0
-            )
+            await asyncio.wait_for(job.wait(poll_interval=10.0), timeout=2.0)
         assert exc_info.value.ulid == job.ulid
         assert job.ulid not in _registry
 
@@ -197,9 +192,7 @@ class TestWaitNotification:
         assert cancelled is True
 
         with pytest.raises(JobCancelledError) as exc_info:
-            await asyncio.wait_for(
-                job.wait(poll_interval=10.0), timeout=2.0
-            )
+            await asyncio.wait_for(job.wait(poll_interval=10.0), timeout=2.0)
         assert exc_info.value.ulid == job.ulid
         assert job.ulid not in _registry
 
@@ -306,9 +299,7 @@ class TestWaitNotification:
         w_task = asyncio.create_task(w.run())
         try:
             # Wait for job to complete (retry succeeds on attempt 2)
-            result = await asyncio.wait_for(
-                job.wait(poll_interval=0.1), timeout=5.0
-            )
+            result = await asyncio.wait_for(job.wait(poll_interval=0.1), timeout=5.0)
             assert result.status == JobStatus.COMPLETED.value
             assert result.result == {"attempt": 2}
             # The event should be set by completion, but the key point is
@@ -323,9 +314,7 @@ class TestWaitNotification:
         t = task(queue)(instant_task)
 
         # Enqueue parent + child with dependency
-        parent = await queue.enqueue(
-            "tests.test_notify.instant_task", queue_name="default"
-        )
+        parent = await queue.enqueue("tests.test_notify.instant_task", queue_name="default")
         child = await queue.enqueue(
             "tests.test_notify.instant_task",
             queue_name="default",
@@ -338,9 +327,7 @@ class TestWaitNotification:
 
         # Child waiter should wake instantly (poll_interval=10s proves Event path)
         with pytest.raises(JobCancelledError) as exc_info:
-            await asyncio.wait_for(
-                child.wait(poll_interval=10.0), timeout=2.0
-            )
+            await asyncio.wait_for(child.wait(poll_interval=10.0), timeout=2.0)
         assert exc_info.value.ulid == child.ulid
         assert child.ulid not in _registry
 
@@ -362,9 +349,7 @@ class TestWaitNotification:
 
             # Now call wait() — fire already happened, but register() ensures
             # the first refresh() in wait() catches the terminal state
-            result = await asyncio.wait_for(
-                job.wait(poll_interval=10.0), timeout=2.0
-            )
+            result = await asyncio.wait_for(job.wait(poll_interval=10.0), timeout=2.0)
             assert result.status == JobStatus.COMPLETED.value
             assert result.result == {"x": 99}
         finally:

@@ -82,9 +82,7 @@ class Queue:
             self._owns_db = False
 
         if default_retry_delay < 1:
-            raise ConfigurationError(
-                f"default_retry_delay must be >= 1, got {default_retry_delay}"
-            )
+            raise ConfigurationError(f"default_retry_delay must be >= 1, got {default_retry_delay}")
 
         self.immediate = immediate
         self.default_lease_duration = default_lease_duration
@@ -384,9 +382,7 @@ class Queue:
                 )
                 await db.drop_index(spec.legacy_name)
                 return
-            await Job.add_index(
-                spec.field, name=spec.legacy_name, where=spec.legacy_where, db=db
-            )
+            await Job.add_index(spec.field, name=spec.legacy_name, where=spec.legacy_where, db=db)
         keys = sorted(str(row[spec.field]) for row in dups)
         shown = ", ".join(keys[:_MAX_KEYS_LOGGED])
         rest = len(keys) - _MAX_KEYS_LOGGED
@@ -395,7 +391,12 @@ class Queue:
             "qler_jobs holds %d %ss that each name more than one %s job: %s%s. "
             "The unique index %s is not made, so the database does not refuse a second "
             "job with such a key; cancel or remove the extra jobs and start again.",
-            len(keys), spec.label, spec.scope, shown, more, spec.name,
+            len(keys),
+            spec.label,
+            spec.scope,
+            shown,
+            more,
+            spec.name,
         )
 
     # ------------------------------------------------------------------
@@ -427,12 +428,21 @@ class Queue:
         it is instead, and is not run in immediate mode.
         """
         spec = {
-            "task_path": task_path, "args": args, "kwargs": kwargs,
-            "queue_name": queue_name, "delay": delay, "eta": eta, "priority": priority,
-            "max_retries": max_retries, "retry_delay": retry_delay,
-            "lease_duration": lease_duration, "idempotency_key": idempotency_key,
-            "correlation_id": correlation_id, "depends_on": depends_on,
-            "timeout": timeout, "unique_key": unique_key,
+            "task_path": task_path,
+            "args": args,
+            "kwargs": kwargs,
+            "queue_name": queue_name,
+            "delay": delay,
+            "eta": eta,
+            "priority": priority,
+            "max_retries": max_retries,
+            "retry_delay": retry_delay,
+            "lease_duration": lease_duration,
+            "idempotency_key": idempotency_key,
+            "correlation_id": correlation_id,
+            "depends_on": depends_on,
+            "timeout": timeout,
+            "unique_key": unique_key,
         }
         return (await self._enqueue_specs([spec], batch=False))[0]
 
@@ -571,7 +581,10 @@ class Queue:
                                     dependency_ulid=dep_ulid,
                                 )
                         for dep_job in dep_jobs:
-                            if dep_job.status in (JobStatus.FAILED.value, JobStatus.CANCELLED.value):
+                            if dep_job.status in (
+                                JobStatus.FAILED.value,
+                                JobStatus.CANCELLED.value,
+                            ):
                                 raise DependencyError(
                                     f"{dep_word} {dep_job.ulid} is {dep_job.status}",
                                     dependency_ulid=dep_job.ulid,
@@ -595,9 +608,15 @@ class Queue:
                     eta=eta if eta is not None else now + delay if delay is not None else now,
                     task=spec["task_path"],
                     payload_json=payloads[i],
-                    max_retries=max_retries if max_retries is not None else self.default_max_retries,
-                    retry_delay=retry_delay if retry_delay is not None else self.default_retry_delay,
-                    lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
+                    max_retries=max_retries
+                    if max_retries is not None
+                    else self.default_max_retries,
+                    retry_delay=retry_delay
+                    if retry_delay is not None
+                    else self.default_retry_delay,
+                    lease_duration=lease_duration
+                    if lease_duration is not None
+                    else self.default_lease_duration,
                     correlation_id=spec.get("correlation_id") or "",
                     idempotency_key=idempotency_key,
                     unique_key=unique_key,
@@ -633,9 +652,13 @@ class Queue:
         extra = {"batch": True} if batch else {}
         for job in new_jobs:
             _lifecycle(
-                "job.enqueued", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                priority=job.priority, **extra,
+                "job.enqueued",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                priority=job.priority,
+                **extra,
             )
             if self._metrics:
                 self._metrics.inc_enqueued(job.queue_name, job.task)
@@ -662,14 +685,16 @@ class Queue:
         attempt_id = generate_ulid()
 
         # Transition PENDING → RUNNING
-        claimed = await Job.using(self._db, "qler_jobs").filter(
-            (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
-        ).update_one(
-            status=JobStatus.RUNNING.value,
-            worker_id=worker_id,
-            attempts=F("attempts") + 1,
-            last_attempt_id=attempt_id,
-            updated_at=now,
+        claimed = (
+            await Job.using(self._db, "qler_jobs")
+            .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value))
+            .update_one(
+                status=JobStatus.RUNNING.value,
+                worker_id=worker_id,
+                attempts=F("attempts") + 1,
+                last_attempt_id=attempt_id,
+                updated_at=now,
+            )
         )
         if claimed is None:
             # Job was already claimed (e.g. idempotency returned existing)
@@ -726,17 +751,13 @@ class Queue:
                 if task_wrapper.sync:
                     # Sync tasks run in threads that can't be cancelled.
                     # Shield prevents wait_for from blocking on cancellation.
-                    result = await asyncio.wait_for(
-                        asyncio.shield(coro), timeout=timeout
-                    )
+                    result = await asyncio.wait_for(asyncio.shield(coro), timeout=timeout)
                 else:
                     result = await asyncio.wait_for(coro, timeout=timeout)
             else:
                 result = await coro
         except TimeoutError:
-            task_exc = TimeoutError(
-                f"Task {job.task} timed out after {timeout}s"
-            )
+            task_exc = TimeoutError(f"Task {job.task} timed out after {timeout}s")
             failure_kind = FailureKind.TIMEOUT
         except asyncio.CancelledError:
             await self.fail_job(job, worker_id, failure_kind=FailureKind.CANCELLED)
@@ -749,9 +770,7 @@ class Queue:
         if task_exc is not None:
             # fail_job is one write: if it raises, nothing was written and the error
             # reaches the caller, as it does for complete_job below.
-            await self.fail_job(
-                job, worker_id, task_exc, failure_kind=failure_kind
-            )
+            await self.fail_job(job, worker_id, task_exc, failure_kind=failure_kind)
         else:
             await self.complete_job(job, worker_id, result=result)
 
@@ -835,8 +854,7 @@ class Queue:
                     # takes one more update.
                     attempt_id = generate_ulid()
                     await jobs_table.filter(
-                        (F("ulid") == job.ulid)
-                        & (F("status") == JobStatus.RUNNING.value)
+                        (F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value)
                     ).update_one(last_attempt_id=attempt_id, updated_at=now_ts)
                     # Keep in-memory object in sync for _terminalize_attempt
                     job.last_attempt_id = attempt_id
@@ -868,9 +886,13 @@ class Queue:
         # Events and metrics only for the jobs the committed claim returns.
         for job in claimed:
             _lifecycle(
-                "job.claimed", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                worker_id=worker_id, attempt=job.attempts,
+                "job.claimed",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                worker_id=worker_id,
+                attempt=job.attempts,
             )
 
             if self._metrics:
@@ -878,20 +900,20 @@ class Queue:
 
         return claimed
 
-    async def _poison_pill(
-        self, job: Job, worker_id: str, attempt_id: str, now_ts: int
-    ) -> None:
+    async def _poison_pill(self, job: Job, worker_id: str, attempt_id: str, now_ts: int) -> None:
         """Handle a job with an unparseable payload (inside the claim's transaction)."""
-        await Job.using(self._db, "qler_jobs").filter(
-            (F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value)
-        ).update_one(
-            status=JobStatus.FAILED.value,
-            last_error="Payload is not valid JSON",
-            last_failure_kind=FailureKind.PAYLOAD_INVALID.value,
-            finished_at=now_ts,
-            updated_at=now_ts,
-            worker_id="",
-            lease_expires_at=None,
+        await (
+            Job.using(self._db, "qler_jobs")
+            .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value))
+            .update_one(
+                status=JobStatus.FAILED.value,
+                last_error="Payload is not valid JSON",
+                last_failure_kind=FailureKind.PAYLOAD_INVALID.value,
+                finished_at=now_ts,
+                updated_at=now_ts,
+                worker_id="",
+                lease_expires_at=None,
+            )
         )
 
         attempt = JobAttempt(
@@ -956,17 +978,21 @@ class Queue:
         # nothing will lower again. The outside world hears only of a committed completion.
         now = now_epoch()
         async with self._db.transaction():
-            updated = await Job.using(self._db, "qler_jobs").filter(
-                (F("ulid") == job.ulid)
-                & (F("status") == JobStatus.RUNNING.value)
-                & (F("worker_id") == worker_id)
-            ).update_one(
-                status=JobStatus.COMPLETED.value,
-                result_json=result_json,
-                finished_at=now,
-                updated_at=now,
-                worker_id="",
-                lease_expires_at=None,
+            updated = (
+                await Job.using(self._db, "qler_jobs")
+                .filter(
+                    (F("ulid") == job.ulid)
+                    & (F("status") == JobStatus.RUNNING.value)
+                    & (F("worker_id") == worker_id)
+                )
+                .update_one(
+                    status=JobStatus.COMPLETED.value,
+                    result_json=result_json,
+                    finished_at=now,
+                    updated_at=now,
+                    worker_id="",
+                    lease_expires_at=None,
+                )
             )
 
             if updated is None:
@@ -975,13 +1001,14 @@ class Queue:
             # Resolve dependencies: unblock dependent jobs
             await self._resolve_dependencies(job.ulid)
 
-            await self._terminalize_attempt(
-                job.last_attempt_id, AttemptStatus.COMPLETED.value, now
-            )
+            await self._terminalize_attempt(job.last_attempt_id, AttemptStatus.COMPLETED.value, now)
 
         _lifecycle(
-            "job.completed", job_id=job.ulid, queue=job.queue_name,
-            task=job.task, correlation_id=job.correlation_id,
+            "job.completed",
+            job_id=job.ulid,
+            queue=job.queue_name,
+            task=job.task,
+            correlation_id=job.correlation_id,
         )
 
         if self._metrics:
@@ -1007,10 +1034,7 @@ class Queue:
         follow the commit.
         """
         now = now_epoch()
-        can_retry = (
-            failure_kind in RETRYABLE_FAILURES
-            and job.retry_count < job.max_retries
-        )
+        can_retry = failure_kind in RETRYABLE_FAILURES and job.retry_count < job.max_retries
 
         error_msg = str(exc)[:_MAX_ERROR_LENGTH] if exc else None
         error_tb = tb_module.format_exception(exc) if exc else None
@@ -1043,11 +1067,15 @@ class Queue:
         # neither run nor be cancelled. The outside world hears only of what committed.
         cancelled: list[str] = []
         async with self._db.transaction():
-            updated = await Job.using(self._db, "qler_jobs").filter(
-                (F("ulid") == job.ulid)
-                & (F("status") == JobStatus.RUNNING.value)
-                & (F("worker_id") == worker_id)
-            ).update_one(**update_fields)
+            updated = (
+                await Job.using(self._db, "qler_jobs")
+                .filter(
+                    (F("ulid") == job.ulid)
+                    & (F("status") == JobStatus.RUNNING.value)
+                    & (F("worker_id") == worker_id)
+                )
+                .update_one(**update_fields)
+            )
 
             if updated is None:
                 return  # Lost ownership: nothing written, nothing told
@@ -1067,16 +1095,24 @@ class Queue:
 
         if can_retry:
             _lifecycle(
-                "job.retried", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                failure_kind=failure_kind.value, retry_count=job.retry_count + 1,
+                "job.retried",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                failure_kind=failure_kind.value,
+                retry_count=job.retry_count + 1,
                 error=error_msg or "",
             )
         else:
             _lifecycle(
-                "job.failed", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                failure_kind=failure_kind.value, error=error_msg or "",
+                "job.failed",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                failure_kind=failure_kind.value,
+                error=error_msg or "",
             )
 
         if self._metrics:
@@ -1113,16 +1149,20 @@ class Queue:
             # or not at all, so a stop between them cannot leave a pending job whose
             # last attempt still says running. An error at one job keeps those before it.
             async with self._db.transaction():
-                job = await Job.using(self._db, "qler_jobs").filter(
-                    (F("status") == JobStatus.RUNNING.value)
-                    & (F("lease_expires_at") <= now)
-                ).order_by("lease_expires_at").update_one(
-                    status=JobStatus.PENDING.value,
-                    worker_id="",
-                    lease_expires_at=None,
-                    updated_at=now,
-                    progress=None,
-                    progress_message="",
+                job = (
+                    await Job.using(self._db, "qler_jobs")
+                    .filter(
+                        (F("status") == JobStatus.RUNNING.value) & (F("lease_expires_at") <= now)
+                    )
+                    .order_by("lease_expires_at")
+                    .update_one(
+                        status=JobStatus.PENDING.value,
+                        worker_id="",
+                        lease_expires_at=None,
+                        updated_at=now,
+                        progress=None,
+                        progress_message="",
+                    )
                 )
                 if job is None:
                     break
@@ -1138,8 +1178,11 @@ class Queue:
 
             # Told only after the commit
             _lifecycle(
-                "job.lease_recovered", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
+                "job.lease_recovered",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
             )
             recovered += 1
 
@@ -1161,9 +1204,13 @@ class Queue:
         (under SQLite's 999-variable limit); builds no model."""
         children: dict[str, set[str]] = {}
         for off in range(0, len(parents), 900):
-            for edge in await self._dependency_edges.filter(
-                F("parent_ulid").in_list(parents[off : off + 900])
-            ).select("parent_ulid", "child_ulid").as_dicts():
+            for edge in (
+                await self._dependency_edges.filter(
+                    F("parent_ulid").in_list(parents[off : off + 900])
+                )
+                .select("parent_ulid", "child_ulid")
+                .as_dicts()
+            ):
                 children.setdefault(edge["parent_ulid"], set()).add(edge["child_ulid"])
         return {parent: sorted(kids) for parent, kids in children.items()}
 
@@ -1213,8 +1260,7 @@ class Queue:
                             continue
                         tried.add(child_ulid)
                         updated = await jobs.filter(
-                            (F("ulid") == child_ulid)
-                            & (F("status") == JobStatus.PENDING.value)
+                            (F("ulid") == child_ulid) & (F("status") == JobStatus.PENDING.value)
                         ).update_one(
                             status=JobStatus.CANCELLED.value,
                             last_error=f"Dependency {parent_ulid} failed/cancelled",
@@ -1236,12 +1282,14 @@ class Queue:
         """
         now = now_epoch()
         async with self._db.transaction():
-            updated = await Job.using(self._db, "qler_jobs").filter(
-                (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.CANCELLED.value,
-                finished_at=now,
-                updated_at=now,
+            updated = (
+                await Job.using(self._db, "qler_jobs")
+                .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.CANCELLED.value,
+                    finished_at=now,
+                    updated_at=now,
+                )
             )
             cancelled = (
                 await self._cascade_cancel_dependents(job.ulid) if updated is not None else []
@@ -1257,9 +1305,7 @@ class Queue:
             _notify_fire(child_ulid)
         return True
 
-    async def replay_job(
-        self, job: Job, *, queue_name: str | None = None
-    ) -> Job | None:
+    async def replay_job(self, job: Job, *, queue_name: str | None = None) -> Job | None:
         """Replay a FAILED DLQ job back to its original queue.
 
         Resets the job to PENDING with retry_count=0 and clears the DLQ fields.
@@ -1277,10 +1323,10 @@ class Queue:
 
         now = now_epoch()
         try:
-            updated = await Job.using(self._db, "qler_jobs").filter(
-                (F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value)
-            ).update_one(
-                **failed_to_pending_fields(now, target_queue=target_queue)
+            updated = (
+                await Job.using(self._db, "qler_jobs")
+                .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value))
+                .update_one(**failed_to_pending_fields(now, target_queue=target_queue))
             )
         except UniqueConstraintError as err:
             raise await unique_key_conflict(job, err) from err
@@ -1290,9 +1336,7 @@ class Queue:
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _check_rate_limits(
-        self, job: Job, worker_id: str, now_ts: int
-    ) -> bool:
+    async def _check_rate_limits(self, job: Job, worker_id: str, now_ts: int) -> bool:
         """Check rate limits for a claimed job. Returns True if rate-limited.
 
         Checks queue-level rate limit first, then task-level. If either limit
@@ -1301,9 +1345,7 @@ class Queue:
         # Queue-level rate limit
         queue_rate = self._rate_limits.get(job.queue_name)
         if queue_rate is not None:
-            allowed = await try_acquire(
-                f"queue:{job.queue_name}", queue_rate, db=self._db
-            )
+            allowed = await try_acquire(f"queue:{job.queue_name}", queue_rate, db=self._db)
             if not allowed:
                 await self._requeue_rate_limited(job, worker_id, queue_rate, now_ts)
                 return True
@@ -1311,13 +1353,9 @@ class Queue:
         # Task-level rate limit
         task_wrapper = self._tasks.get(job.task)
         if task_wrapper is not None and task_wrapper.rate_spec is not None:
-            allowed = await try_acquire(
-                f"task:{job.task}", task_wrapper.rate_spec, db=self._db
-            )
+            allowed = await try_acquire(f"task:{job.task}", task_wrapper.rate_spec, db=self._db)
             if not allowed:
-                await self._requeue_rate_limited(
-                    job, worker_id, task_wrapper.rate_spec, now_ts
-                )
+                await self._requeue_rate_limited(job, worker_id, task_wrapper.rate_spec, now_ts)
                 return True
 
         return False
@@ -1327,18 +1365,22 @@ class Queue:
     ) -> None:
         """Requeue a rate-limited job back to PENDING with a delayed ETA."""
         delay = max(1, int(1.0 / rate.refill_rate)) if rate.refill_rate > 0 else 1
-        await Job.using(self._db, "qler_jobs").filter(
-            (F("ulid") == job.ulid)
-            & (F("status") == JobStatus.RUNNING.value)
-            & (F("worker_id") == worker_id)
-        ).update_one(
-            status=JobStatus.PENDING.value,
-            eta=now_ts + delay,
-            worker_id="",
-            lease_expires_at=None,
-            # Don't increment retry_count — rate limiting is not a failure
-            attempts=F("attempts") - 1,  # Undo the increment from claim
-            updated_at=now_ts,
+        await (
+            Job.using(self._db, "qler_jobs")
+            .filter(
+                (F("ulid") == job.ulid)
+                & (F("status") == JobStatus.RUNNING.value)
+                & (F("worker_id") == worker_id)
+            )
+            .update_one(
+                status=JobStatus.PENDING.value,
+                eta=now_ts + delay,
+                worker_id="",
+                lease_expires_at=None,
+                # Don't increment retry_count — rate limiting is not a failure
+                attempts=F("attempts") - 1,  # Undo the increment from claim
+                updated_at=now_ts,
+            )
         )
 
     async def _terminalize_attempt(
@@ -1366,9 +1408,11 @@ class Queue:
         if failure_kind is not None:
             update_fields["failure_kind"] = failure_kind
 
-        await JobAttempt.using(self._db, "qler_job_attempts").filter(
-            (F("ulid") == attempt_id) & (F("status") == AttemptStatus.RUNNING.value)
-        ).update_one(**update_fields)
+        await (
+            JobAttempt.using(self._db, "qler_job_attempts")
+            .filter((F("ulid") == attempt_id) & (F("status") == AttemptStatus.RUNNING.value))
+            .update_one(**update_fields)
+        )
 
     async def _lazy_init(self) -> None:
         """Ensure init_db has been called."""
@@ -1380,9 +1424,7 @@ class Queue:
         if self._db is None:
             return []
         try:
-            groups = (
-                await Job.using(self._db, "qler_jobs").group_by("queue_name", "status").count()
-            )
+            groups = await Job.using(self._db, "qler_jobs").group_by("queue_name", "status").count()
             return [(g["queue_name"], g["status"], g["count"]) for g in groups]
         except Exception:
             # A scrape must not fail, but the reason it came back empty is logged.
@@ -1405,8 +1447,7 @@ class Queue:
 
         # A job with no finished_at reads NULL, and NULL < threshold matches nothing.
         archivable = self.jobs.filter(
-            F("status").in_list(list(self._TERMINAL_STATUSES))
-            & (F("finished_at") < threshold)
+            F("status").in_list(list(self._TERMINAL_STATUSES)) & (F("finished_at") < threshold)
         )
 
         async with self._db.transaction():
@@ -1485,7 +1526,7 @@ class Queue:
 def _calculate_retry_eta(job: Job) -> int:
     """Calculate the next retry ETA with exponential backoff + jitter."""
     base_delay = job.retry_delay
-    delay = min(base_delay * (2 ** job.retry_count), _MAX_RETRY_DELAY)
+    delay = min(base_delay * (2**job.retry_count), _MAX_RETRY_DELAY)
     # Add 10% jitter (non-cryptographic, intentional)
     jitter = delay * 0.1 * random.random()
     return now_epoch() + int(delay + jitter)

@@ -14,8 +14,7 @@ def enforce_iterations(n: int) -> int:
     """Raise floor on iteration count; warn if caller requested fewer."""
     if n < MIN_ITERATIONS:
         warnings.warn(
-            f"Requested {n} iterations, minimum is {MIN_ITERATIONS}. "
-            f"Using {MIN_ITERATIONS}.",
+            f"Requested {n} iterations, minimum is {MIN_ITERATIONS}. Using {MIN_ITERATIONS}.",
             stacklevel=2,
         )
         return MIN_ITERATIONS
@@ -26,8 +25,7 @@ def enforce_warmup(n: int) -> int:
     """Raise floor on warmup count; warn if caller requested fewer."""
     if n < MIN_WARMUP:
         warnings.warn(
-            f"Requested {n} warmup rounds, minimum is {MIN_WARMUP}. "
-            f"Using {MIN_WARMUP}.",
+            f"Requested {n} warmup rounds, minimum is {MIN_WARMUP}. Using {MIN_WARMUP}.",
             stacklevel=2,
         )
         return MIN_WARMUP

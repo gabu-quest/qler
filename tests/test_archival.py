@@ -19,6 +19,7 @@ from qler.worker import Worker
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 async def _complete_job(queue: Queue, task_path: str = "my_task") -> Job:
     """Enqueue -> claim -> complete a job. Returns the completed job."""
     job = await queue.enqueue(task_path)
@@ -48,17 +49,15 @@ async def _cancel_job(queue: Queue, task_path: str = "my_task") -> Job:
 async def _backdate_finished_at(job: Job, seconds_ago: int) -> None:
     """Set a job's finished_at to N seconds in the past."""
     old_ts = now_epoch() - seconds_ago
-    await Job.query().filter(F("ulid") == job.ulid).update_one(
-        finished_at=old_ts
-    )
+    await Job.query().filter(F("ulid") == job.ulid).update_one(finished_at=old_ts)
 
 
 # ---------------------------------------------------------------------------
 # Archive table creation
 # ---------------------------------------------------------------------------
 
-class TestArchiveTableCreation:
 
+class TestArchiveTableCreation:
     async def test_archive_table_created(self, queue):
         """init_db() creates the qler_jobs_archive table."""
         cur = await queue.db.adapter.execute(
@@ -85,8 +84,8 @@ class TestArchiveTableCreation:
 # archive_jobs()
 # ---------------------------------------------------------------------------
 
-class TestArchiveJobs:
 
+class TestArchiveJobs:
     async def test_archive_completed_jobs(self, queue):
         """Completed jobs older than threshold are moved to archive."""
         job = await _complete_job(queue)
@@ -175,9 +174,7 @@ class TestArchiveJobs:
 
         assert count == 3
         assert await queue.archive_count() == 3
-        remaining = await Job.query().filter(
-            F("status") == JobStatus.COMPLETED.value
-        ).all()
+        remaining = await Job.query().filter(F("status") == JobStatus.COMPLETED.value).all()
         assert len(remaining) == 1
         assert remaining[0].ulid == recent.ulid
 
@@ -230,8 +227,8 @@ class TestArchiveJobs:
 # archived_jobs() query
 # ---------------------------------------------------------------------------
 
-class TestArchivedJobsQuery:
 
+class TestArchivedJobsQuery:
     async def test_archived_jobs_returns_job_instances(self, queue):
         """archived_jobs() returns proper Job objects with all fields."""
         job = await _complete_job(queue)
@@ -322,8 +319,8 @@ class TestArchivedJobsQuery:
 # archive_count()
 # ---------------------------------------------------------------------------
 
-class TestArchiveCount:
 
+class TestArchiveCount:
     async def test_archive_count_zero(self, queue):
         """archive_count() returns 0 when archive is empty."""
         assert await queue.archive_count() == 0
@@ -342,8 +339,8 @@ class TestArchiveCount:
 # Lifecycle event
 # ---------------------------------------------------------------------------
 
-class TestArchivalLifecycleEvent:
 
+class TestArchivalLifecycleEvent:
     async def test_lifecycle_event_emitted(self, queue, caplog):
         """job.archived lifecycle event fires with correct structured data."""
         job = await _complete_job(queue)
@@ -372,8 +369,8 @@ class TestArchivalLifecycleEvent:
 # Auto-archival in Worker
 # ---------------------------------------------------------------------------
 
-class TestAutoArchival:
 
+class TestAutoArchival:
     async def test_worker_accepts_archive_params(self, queue):
         """Worker can be created with archive_interval and archive_after."""
         w = Worker(queue, archive_interval=60.0, archive_after=120)
@@ -428,8 +425,8 @@ class TestAutoArchival:
 # CLI: qler archive
 # ---------------------------------------------------------------------------
 
-class TestCLIArchive:
 
+class TestCLIArchive:
     @pytest.fixture
     def runner(self):
         return CliRunner()
@@ -474,7 +471,9 @@ class TestCLIArchive:
 
     def test_archive_json(self, runner, populated_db):
         """qler archive --json outputs correct structure."""
-        result = runner.invoke(cli, ["archive", "--db", populated_db, "--older-than", "5m", "--json"])
+        result = runner.invoke(
+            cli, ["archive", "--db", populated_db, "--older-than", "5m", "--json"]
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data == {"archived": 2}
@@ -499,7 +498,6 @@ class TestCLIArchive:
 
 
 class TestCLIStatusIncludeArchive:
-
     @pytest.fixture
     def runner(self):
         return CliRunner()
@@ -545,9 +543,16 @@ class TestCLIStatusIncludeArchive:
 
     def test_status_with_archive_json(self, runner, db_with_archive):
         """qler status --include-archive --json includes archived counts."""
-        result = runner.invoke(cli, [
-            "status", "--db", db_with_archive, "--include-archive", "--json",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "status",
+                "--db",
+                db_with_archive,
+                "--include-archive",
+                "--json",
+            ],
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert "archived" in data
@@ -555,7 +560,6 @@ class TestCLIStatusIncludeArchive:
 
 
 class TestCLIJobsIncludeArchive:
-
     @pytest.fixture
     def runner(self):
         return CliRunner()
@@ -603,9 +607,16 @@ class TestCLIJobsIncludeArchive:
 
     def test_jobs_with_archive_json(self, runner, db_with_archive):
         """qler jobs --include-archive --json marks archived jobs."""
-        result = runner.invoke(cli, [
-            "jobs", "--db", db_with_archive, "--include-archive", "--json",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "jobs",
+                "--db",
+                db_with_archive,
+                "--include-archive",
+                "--json",
+            ],
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert len(data) == 2

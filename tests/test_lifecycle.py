@@ -58,9 +58,7 @@ class TestHappyPath:
         assert claimed.lease_expires_at is None
 
         # Verify attempt history
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == "completed"
         assert attempts[0].attempt_number == 1
@@ -99,9 +97,7 @@ class TestRetryFlow:
         assert reclaimed.result == "done"
 
         # Verify attempt history — 2 attempts
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).order_by("ulid").all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).order_by("ulid").all()
         assert len(attempts) == 2
         assert attempts[0].status == "failed"
         assert attempts[0].worker_id == "worker-1"
@@ -249,9 +245,7 @@ class TestAttemptHistory:
         await queue.complete_job(claimed, "worker-3", result="success")
 
         # Verify 3 attempt records
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).order_by("ulid").all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).order_by("ulid").all()
         assert len(attempts) == 3
 
         assert attempts[0].status == "failed"
@@ -298,10 +292,7 @@ class TestAttemptHistory:
         assert claimed.attempts == 3
         assert claimed.retry_count == 2  # unchanged on complete
 
-
-    async def test_complete_and_attempt_end_are_one_write(
-        self, queue, raise_on_nth_update
-    ):
+    async def test_complete_and_attempt_end_are_one_write(self, queue, raise_on_nth_update):
         """The attempt's end fails once: the job stays running, the attempt too."""
         job = await queue.enqueue("my_task")
         claimed = await queue.claim_job("worker-1", ["default"])
@@ -315,7 +306,11 @@ class TestAttemptHistory:
             await queue.complete_job(claimed, "worker-1", result={"n": 1})
 
         stored = await Job.query().filter(F("ulid") == job.ulid).first()
-        assert (stored.status, stored.worker_id, stored.result_json) == ("running", "worker-1", None)
+        assert (stored.status, stored.worker_id, stored.result_json) == (
+            "running",
+            "worker-1",
+            None,
+        )
         attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert [a.status for a in attempts] == ["running"]
 

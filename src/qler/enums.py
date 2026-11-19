@@ -28,6 +28,4 @@ class FailureKind(str, Enum):
     TIMEOUT = "timeout"
 
 
-RETRYABLE_FAILURES: frozenset[FailureKind] = frozenset(
-    {FailureKind.EXCEPTION, FailureKind.TIMEOUT}
-)
+RETRYABLE_FAILURES: frozenset[FailureKind] = frozenset({FailureKind.EXCEPTION, FailureKind.TIMEOUT})

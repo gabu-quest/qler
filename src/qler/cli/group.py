@@ -8,6 +8,7 @@ import click
 # CLI Group
 # ---------------------------------------------------------------------------
 
+
 @click.group(name="qler")
 @click.version_option(package_name="qler")
 def cli():

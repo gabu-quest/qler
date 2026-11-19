@@ -58,10 +58,7 @@ def _find_comparison_results(results_dir: Path) -> dict | None:
     latest = results_dir / "latest.json"
     if latest.exists():
         data = json.loads(latest.read_text())
-        comparison_results = [
-            r for r in data.get("results", [])
-            if r.get("suite") == "comparison"
-        ]
+        comparison_results = [r for r in data.get("results", []) if r.get("suite") == "comparison"]
         if comparison_results:
             data["results"] = comparison_results
             return data
@@ -70,10 +67,7 @@ def _find_comparison_results(results_dir: Path) -> dict | None:
     json_files = sorted(results_dir.glob("bench_*.json"), reverse=True)
     for path in json_files:
         data = json.loads(path.read_text())
-        comparison_results = [
-            r for r in data.get("results", [])
-            if r.get("suite") == "comparison"
-        ]
+        comparison_results = [r for r in data.get("results", []) if r.get("suite") == "comparison"]
         if comparison_results:
             data["results"] = comparison_results
             return data
@@ -123,7 +117,7 @@ def _speedup(qler_ms: float, celery_ms: float) -> str:
     ratio = celery_ms / qler_ms
     if ratio >= 1:
         return f"{ratio:.1f}x faster"
-    return f"{1/ratio:.1f}x slower"
+    return f"{1 / ratio:.1f}x slower"
 
 
 SCENARIO_DESCRIPTIONS = {
@@ -189,25 +183,31 @@ def generate_report(data: dict) -> str:
     lines.append(f"- **Python**: {system.get('python_version', 'unknown')}")
     lines.append(f"- **qler**: {system.get('qler_version', 'unknown')}")
     lines.append(f"- **SQLite**: {system.get('sqlite_version', 'unknown')}")
-    lines.append(f"- **Platform**: {system.get('platform_system', '')} "
-                 f"{system.get('platform_machine', '')} "
-                 f"({system.get('cpu_count', '?')} cores)")
+    lines.append(
+        f"- **Platform**: {system.get('platform_system', '')} "
+        f"{system.get('platform_machine', '')} "
+        f"({system.get('cpu_count', '?')} cores)"
+    )
 
     # Celery/Redis versions (best-effort)
     try:
         import celery
+
         lines.append(f"- **Celery**: {celery.__version__}")
     except ImportError:
         lines.append("- **Celery**: unknown")
     try:
         import redis as redis_mod
+
         lines.append(f"- **redis-py**: {redis_mod.__version__}")
     except ImportError:
         lines.append("- **redis-py**: unknown")
 
-    lines.append(f"- **Scale**: {config.get('scale', 'unknown')} "
-                 f"(warmup={config.get('warmup', '?')}, "
-                 f"iterations={config.get('iterations', '?')})")
+    lines.append(
+        f"- **Scale**: {config.get('scale', 'unknown')} "
+        f"(warmup={config.get('warmup', '?')}, "
+        f"iterations={config.get('iterations', '?')})"
+    )
     lines.append(f"- **Generated**: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("")
 
@@ -219,29 +219,26 @@ def generate_report(data: dict) -> str:
     lines.append("")
 
     for scenario_key in [
-        "enqueue_latency", "batch_enqueue",
-        "raw_api_round_trip", "raw_api_throughput",
-        "worker_round_trip", "worker_throughput",
+        "enqueue_latency",
+        "batch_enqueue",
+        "raw_api_round_trip",
+        "raw_api_throughput",
+        "worker_round_trip",
+        "worker_throughput",
         "cold_start",
     ]:
         if scenario_key not in paired:
             continue
 
-        title, desc = SCENARIO_DESCRIPTIONS.get(
-            scenario_key, (scenario_key, "")
-        )
+        title, desc = SCENARIO_DESCRIPTIONS.get(scenario_key, (scenario_key, ""))
         lines.append(f"### {title}")
         lines.append("")
         lines.append(desc)
         lines.append("")
 
         # Table header
-        lines.append(
-            "| Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |"
-        )
-        lines.append(
-            "|-----:|--------|------------:|---------:|-------------------:|---|"
-        )
+        lines.append("| Jobs | System | Median (ms) | P95 (ms) | Throughput (ops/s) | Δ |")
+        lines.append("|-----:|--------|------------:|---------:|-------------------:|---|")
 
         for value in sorted(paired[scenario_key], key=lambda v: _sort_key(v)):
             pair = paired[scenario_key][value]
@@ -350,7 +347,7 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
         elif winner == "celery":
             parts.append(
                 f"**Enqueue latency**: Celery's `apply_async()` outperforms qler's "
-                f"`enqueue()` at most scale points (~{1/ratio:.1f}x average). "
+                f"`enqueue()` at most scale points (~{1 / ratio:.1f}x average). "
                 f"Redis's in-memory writes overcome the TCP overhead."
             )
         else:
@@ -371,13 +368,11 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
         elif winner == "celery":
             parts.append(
                 f"**Batch enqueue**: Celery's `group()` outperforms qler's `enqueue_many()` "
-                f"(~{1/ratio:.1f}x average). Redis pipelining scales better than SQLite "
+                f"(~{1 / ratio:.1f}x average). Redis pipelining scales better than SQLite "
                 f"batch inserts at these sizes."
             )
         else:
-            parts.append(
-                "**Batch enqueue**: Both systems show similar batch performance."
-            )
+            parts.append("**Batch enqueue**: Both systems show similar batch performance.")
 
     # Raw API round-trip analysis
     if "raw_api_round_trip" in paired:
@@ -392,7 +387,7 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
         elif winner == "celery":
             parts.append(
                 f"**Raw API round-trip**: Celery wins even against qler's raw API "
-                f"(~{1/ratio:.1f}x average). Redis's in-memory broker outpaces "
+                f"(~{1 / ratio:.1f}x average). Redis's in-memory broker outpaces "
                 f"SQLite's 3-write cycle (enqueue + claim + complete)."
             )
         else:
@@ -412,13 +407,11 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
         elif winner == "celery":
             parts.append(
                 f"**Raw API throughput**: Celery sustains higher throughput even against "
-                f"qler's raw API (~{1/ratio:.1f}x average). SQLite's disk-backed writes "
+                f"qler's raw API (~{1 / ratio:.1f}x average). SQLite's disk-backed writes "
                 f"can't match Redis's in-memory operations at sustained load."
             )
         else:
-            parts.append(
-                "**Raw API throughput**: Both systems show similar raw throughput."
-            )
+            parts.append("**Raw API throughput**: Both systems show similar raw throughput.")
 
     # Worker round-trip analysis
     if "worker_round_trip" in paired:
@@ -432,13 +425,12 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
         elif winner == "celery":
             parts.append(
                 f"**Worker round-trip**: With real Workers on both sides, Celery is "
-                f"~{1/ratio:.1f}x faster. Redis's in-memory broker + optimized message "
+                f"~{1 / ratio:.1f}x faster. Redis's in-memory broker + optimized message "
                 f"serialization outperforms qler's SQLite polling loop."
             )
         else:
             parts.append(
-                "**Worker round-trip**: Both systems show similar real-world "
-                "round-trip latency."
+                "**Worker round-trip**: Both systems show similar real-world round-trip latency."
             )
 
     # Worker throughput analysis
@@ -453,14 +445,13 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
         elif winner == "celery":
             parts.append(
                 f"**Worker throughput**: Through real Workers, Celery sustains "
-                f"~{1/ratio:.1f}x higher throughput. Redis's in-memory pub/sub scales "
+                f"~{1 / ratio:.1f}x higher throughput. Redis's in-memory pub/sub scales "
                 f"better than SQLite polling under sustained load. With `prefork` pool "
                 f"(not tested), the gap widens."
             )
         else:
             parts.append(
-                "**Worker throughput**: Both systems show similar sustained "
-                "worker throughput."
+                "**Worker throughput**: Both systems show similar sustained worker throughput."
             )
 
     # Cold start analysis
@@ -474,14 +465,12 @@ def _generate_analysis(paired: dict[str, dict[str, dict]]) -> str:
             )
         elif winner == "celery":
             parts.append(
-                f"**Cold start**: Celery initializes ~{1/ratio:.1f}x faster — surprising "
+                f"**Cold start**: Celery initializes ~{1 / ratio:.1f}x faster — surprising "
                 f"given the subprocess overhead. Redis's fast connection may offset "
                 f"the fork cost."
             )
         else:
-            parts.append(
-                "**Cold start**: Both systems show similar initialization time."
-            )
+            parts.append("**Cold start**: Both systems show similar initialization time.")
 
     if not parts:
         return "No comparison data available for analysis."
@@ -503,7 +492,9 @@ def main() -> None:
     report = generate_report(data)
     OUTPUT_PATH.write_text(report)
     print(f"\n  Comparison report written to {OUTPUT_PATH}")
-    print(f"  ({len(data['results'])} measurements from {len(set(r['scenario'] for r in data['results']))} scenarios)")
+    print(
+        f"  ({len(data['results'])} measurements from {len(set(r['scenario'] for r in data['results']))} scenarios)"
+    )
 
 
 if __name__ == "__main__":
