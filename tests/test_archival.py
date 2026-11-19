@@ -385,6 +385,43 @@ class TestAutoArchival:
         assert w.archive_interval is None
         assert w.archive_after == 300
 
+    async def test_running_worker_archives_a_finished_job(self, queue, monkeypatch):
+        """The worker's loop moves a completed job to the archive."""
+        job = await _complete_job(queue)
+        assert await queue.archive_count() == 0
+
+        real_archive = Queue.archive_jobs
+        archived_by_loop = asyncio.Event()
+
+        async def archive_and_note(self, *args, **kwargs):
+            count = await real_archive(self, *args, **kwargs)
+            if count:
+                archived_by_loop.set()
+            return count
+
+        monkeypatch.setattr(Queue, "archive_jobs", archive_and_note)
+
+        w = Worker(
+            queue,
+            queues=["other"],
+            poll_interval=0.01,
+            archive_interval=1.0,
+            archive_after=0,
+            shutdown_timeout=2.0,
+        )
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.wait_for(archived_by_loop.wait(), timeout=10.0)
+        finally:
+            w._running = False
+            await asyncio.wait_for(worker_task, timeout=10.0)
+
+        assert await Job.query().filter(F("ulid") == job.ulid).count() == 0
+        assert await queue.archive_count() == 1
+        archived = await queue.archived_jobs()
+        assert [j.ulid for j in archived] == [job.ulid]
+        assert archived[0].status == JobStatus.COMPLETED.value
+
 
 # ---------------------------------------------------------------------------
 # CLI: qler archive
