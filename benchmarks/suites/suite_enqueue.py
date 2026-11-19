@@ -19,6 +19,7 @@ TASK_PATH = "bench.noop"
 def _make_queue(db_path: str):
     """Create a Queue pointing at the given DB file."""
     from qler import Queue
+
     return Queue(db=db_path)
 
 
@@ -57,12 +58,17 @@ class EnqueueScaling:
             stats = await timer.async_measure(do_enqueue)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                )
+            )
 
         return results
 
@@ -109,12 +115,17 @@ class EnqueueBatchScaling:
             stats = await timer.async_measure(do_batch)
             throughput = batch_size / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="batch_size", value=batch_size,
-                timing=stats, rows=batch_size,
-                throughput=round(throughput, 1),
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="batch_size",
+                    value=batch_size,
+                    timing=stats,
+                    rows=batch_size,
+                    throughput=round(throughput, 1),
+                )
+            )
 
         return results
 
@@ -169,12 +180,17 @@ class EnqueueSingleVsBatch:
             single_stats = await timer.async_measure(do_single)
             single_tp = n / (single_stats.median_ms / 1000) if single_stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="method", value=f"single_{n}",
-                timing=single_stats, rows=n,
-                throughput=round(single_tp, 1),
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="method",
+                    value=f"single_{n}",
+                    timing=single_stats,
+                    rows=n,
+                    throughput=round(single_tp, 1),
+                )
+            )
 
             # Batch enqueue
             async def do_batch(specs=specs):
@@ -189,12 +205,17 @@ class EnqueueSingleVsBatch:
             batch_stats = await timer.async_measure(do_batch)
             batch_tp = n / (batch_stats.median_ms / 1000) if batch_stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="method", value=f"batch_{n}",
-                timing=batch_stats, rows=n,
-                throughput=round(batch_tp, 1),
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="method",
+                    value=f"batch_{n}",
+                    timing=batch_stats,
+                    rows=n,
+                    throughput=round(batch_tp, 1),
+                )
+            )
 
         return results
 
@@ -245,13 +266,18 @@ class PayloadSizeImpact:
             stats = await timer.async_measure(do_enqueue)
             throughput = job_count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="profile", value=profile,
-                timing=stats, rows=job_count,
-                throughput=round(throughput, 1),
-                metadata={"avg_payload_bytes": avg_bytes},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="profile",
+                    value=profile,
+                    timing=stats,
+                    rows=job_count,
+                    throughput=round(throughput, 1),
+                    metadata={"avg_payload_bytes": avg_bytes},
+                )
+            )
 
         return results
 

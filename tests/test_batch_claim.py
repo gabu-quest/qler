@@ -42,6 +42,7 @@ async def limited_batch_task(name):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest_asyncio.fixture
 async def db():
     _db = AsyncSQLerDB.in_memory(shared=False)
@@ -61,6 +62,7 @@ async def queue(db):
 # TestClaimJobs
 # ---------------------------------------------------------------------------
 
+
 class TestClaimJobs:
     """Verify Queue.claim_jobs batch claiming."""
 
@@ -70,9 +72,7 @@ class TestClaimJobs:
         jobs = await queue.claim_jobs("w1", ["default"], n=3)
         assert len(jobs) == 3
         # 2 remaining pending
-        pending = await Job.query().filter(
-            F("status") == JobStatus.PENDING.value
-        ).count()
+        pending = await Job.query().filter(F("status") == JobStatus.PENDING.value).count()
         assert pending == 2
 
     async def test_empty_queue_returns_empty(self, queue):
@@ -97,9 +97,7 @@ class TestClaimJobs:
         assert len(jobs) == 2
 
         for job in jobs:
-            attempts = await JobAttempt.query().filter(
-                F("job_ulid") == job.ulid
-            ).all()
+            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
             assert len(attempts) == 1
             assert attempts[0].status == AttemptStatus.RUNNING.value
             assert attempts[0].worker_id == "w1"
@@ -134,9 +132,7 @@ class TestClaimJobs:
 
         # The id names the job's one running attempt
         for job in jobs:
-            attempts = await JobAttempt.query().filter(
-                F("job_ulid") == job.ulid
-            ).all()
+            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
             assert len(attempts) == 1
             assert attempts[0].ulid == job.last_attempt_id
             assert attempts[0].worker_id == "w1"
@@ -165,6 +161,7 @@ class TestClaimJobs:
         await queue.enqueue("valid_task", queue_name="default")
 
         from qler._time import generate_ulid
+
         bad_ulid = generate_ulid()
         bad_job = Job(
             ulid=bad_ulid,
@@ -230,9 +227,7 @@ class TestClaimJobs:
         assert jobs[0].task == "t1"
 
         # The second job should be back to pending (requeued)
-        pending = await Job.query().filter(
-            F("status") == JobStatus.PENDING.value
-        ).count()
+        pending = await Job.query().filter(F("status") == JobStatus.PENDING.value).count()
         assert pending == 1
 
 
@@ -240,7 +235,9 @@ class TestClaimJobsIsOneWrite:
     """A batch claim is one transaction, and leases each job for its own lease."""
 
     async def test_third_attempt_save_failure_rolls_the_whole_batch_back(
-        self, queue, monkeypatch,
+        self,
+        queue,
+        monkeypatch,
     ):
         enqueued = [(await queue.enqueue(f"t{i}")).ulid for i in range(5)]
         original_save = JobAttempt.save
@@ -273,7 +270,8 @@ class TestClaimJobsIsOneWrite:
         assert await JobAttempt.query().count() == 5
 
     async def test_rate_limited_job_in_a_batch_is_requeued_and_the_rest_returned(
-        self, queue,
+        self,
+        queue,
     ):
         limited = task(queue, rate_limit="1/m")(limited_batch_task)
         a = await queue.enqueue("plain_a")
@@ -339,6 +337,7 @@ class TestClaimJobsIsOneWrite:
 # ---------------------------------------------------------------------------
 # TestWorkerBatchDispatch
 # ---------------------------------------------------------------------------
+
 
 class TestWorkerBatchDispatch:
     """Verify Worker uses batch claiming to dispatch multiple jobs."""

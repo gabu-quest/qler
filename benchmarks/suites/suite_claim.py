@@ -19,6 +19,7 @@ WORKER_ID = "bench-worker-001"
 def _make_queue(db_path: str):
     """Create a Queue pointing at the given DB file."""
     from qler import Queue
+
     return Queue(db=db_path)
 
 
@@ -28,11 +29,8 @@ async def _prefill_queue(q, count: int, gen: PayloadGenerator) -> None:
     # Use batch enqueue for speed when prefilling
     batch_size = 500
     for start in range(0, count, batch_size):
-        batch = payloads[start:start + batch_size]
-        specs = [
-            {"task_path": TASK_PATH, "args": args, "kwargs": kwargs}
-            for args, kwargs in batch
-        ]
+        batch = payloads[start : start + batch_size]
+        specs = [{"task_path": TASK_PATH, "args": args, "kwargs": kwargs} for args, kwargs in batch]
         await q.enqueue_many(specs)
 
 
@@ -76,6 +74,7 @@ class ClaimFromDepth:
             # For this scenario, we do manual timing since each iteration
             # needs its own pre-filled queue
             import time
+
             timings_ms: list[float] = []
 
             # Warmup
@@ -100,13 +99,18 @@ class ClaimFromDepth:
 
             stats = timer._compute_stats(timings_ms)
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="queue_depth", value=depth,
-                timing=stats, rows=1,
-                throughput=round(1000 / stats.median_ms, 1) if stats.median_ms > 0 else 0,
-                metadata={"operation": "single_claim"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="queue_depth",
+                    value=depth,
+                    timing=stats,
+                    rows=1,
+                    throughput=round(1000 / stats.median_ms, 1) if stats.median_ms > 0 else 0,
+                    metadata={"operation": "single_claim"},
+                )
+            )
 
         return results
 
@@ -137,6 +141,7 @@ class ClaimBatchScaling:
 
         for batch_size in config.scale.batch_sizes:
             import time
+
             timings_ms: list[float] = []
 
             # Warmup
@@ -170,12 +175,17 @@ class ClaimBatchScaling:
             actual_claimed = min(batch_size, prefill_depth)
             throughput = actual_claimed / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="batch_size", value=batch_size,
-                timing=stats, rows=actual_claimed,
-                throughput=round(throughput, 1),
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="batch_size",
+                    value=batch_size,
+                    timing=stats,
+                    rows=actual_claimed,
+                    throughput=round(throughput, 1),
+                )
+            )
 
         return results
 
@@ -204,6 +214,7 @@ class ClaimWithDeps:
 
         for depth in config.scale.queue_depths:
             import time
+
             timings_ms: list[float] = []
 
             for phase in range(config.warmup + config.iterations):
@@ -234,7 +245,9 @@ class ClaimWithDeps:
                     blocked_payloads = gen.generate("small", blocked_count)
                     for args, kwargs in blocked_payloads:
                         await q.enqueue(
-                            TASK_PATH, args=args, kwargs=kwargs,
+                            TASK_PATH,
+                            args=args,
+                            kwargs=kwargs,
                             depends_on=[parent_jobs[0].ulid],
                         )
 
@@ -250,13 +263,18 @@ class ClaimWithDeps:
                 await q.close()
 
             stats = timer._compute_stats(timings_ms)
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="queue_depth", value=depth,
-                timing=stats, rows=1,
-                throughput=round(1000 / stats.median_ms, 1) if stats.median_ms > 0 else 0,
-                metadata={"ready_fraction": 0.5},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="queue_depth",
+                    value=depth,
+                    timing=stats,
+                    rows=1,
+                    throughput=round(1000 / stats.median_ms, 1) if stats.median_ms > 0 else 0,
+                    metadata={"ready_fraction": 0.5},
+                )
+            )
 
         return results
 
@@ -287,6 +305,7 @@ class ClaimContested:
 
         for n_workers in worker_counts:
             import time
+
             timings_ms: list[float] = []
 
             for phase in range(config.warmup + config.iterations):
@@ -314,13 +333,18 @@ class ClaimContested:
             stats = timer._compute_stats(timings_ms)
             throughput = n_workers / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="workers", value=n_workers,
-                timing=stats, rows=n_workers,
-                throughput=round(throughput, 1),
-                metadata={"queue_depth": prefill_depth},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="workers",
+                    value=n_workers,
+                    timing=stats,
+                    rows=n_workers,
+                    throughput=round(throughput, 1),
+                    metadata={"queue_depth": prefill_depth},
+                )
+            )
 
         return results
 

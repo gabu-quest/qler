@@ -14,6 +14,7 @@ from qler.task import TaskWrapper, task
 
 # ---- helpers: module-level async functions for @task ----
 
+
 async def _unique_noop():
     pass
 
@@ -48,9 +49,7 @@ class TestUniqueJobs:
     async def test_unique_returns_existing_running(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(
-            status=JobStatus.RUNNING.value
-        )
+        await Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.RUNNING.value)
         job2 = await tw.enqueue()
         assert job1.ulid == job2.ulid
         assert job2.status == JobStatus.RUNNING.value
@@ -60,8 +59,8 @@ class TestUniqueJobs:
     async def test_unique_allows_after_completed(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(
-            status=JobStatus.COMPLETED.value
+        await (
+            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
         )
         job2 = await tw.enqueue()
         assert job1.ulid != job2.ulid
@@ -70,9 +69,7 @@ class TestUniqueJobs:
     async def test_unique_allows_after_failed(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(
-            status=JobStatus.FAILED.value
-        )
+        await Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.FAILED.value)
         job2 = await tw.enqueue()
         assert job1.ulid != job2.ulid
         assert job2.status == JobStatus.PENDING.value
@@ -80,8 +77,8 @@ class TestUniqueJobs:
     async def test_unique_allows_after_cancelled(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(
-            status=JobStatus.CANCELLED.value
+        await (
+            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.CANCELLED.value)
         )
         job2 = await tw.enqueue()
         assert job1.ulid != job2.ulid
@@ -107,7 +104,8 @@ class TestUniqueKeyFunction:
 
     async def test_unique_key_scoped_by_key(self, queue):
         tw = TaskWrapper(
-            _keyed_noop, queue,
+            _keyed_noop,
+            queue,
             unique_key=lambda order_id: f"sync:{order_id}",
         )
         job1 = await tw.enqueue("order-1")
@@ -118,7 +116,8 @@ class TestUniqueKeyFunction:
 
     async def test_unique_key_same_key_returns_existing(self, queue):
         tw = TaskWrapper(
-            _keyed_noop, queue,
+            _keyed_noop,
+            queue,
             unique_key=lambda order_id: f"sync:{order_id}",
         )
         job1 = await tw.enqueue("order-1")
@@ -130,12 +129,13 @@ class TestUniqueKeyFunction:
     async def test_unique_key_allows_after_terminal(self, queue):
         """unique_key jobs can be re-enqueued after reaching terminal state."""
         tw = TaskWrapper(
-            _keyed_noop, queue,
+            _keyed_noop,
+            queue,
             unique_key=lambda order_id: f"sync:{order_id}",
         )
         job1 = await tw.enqueue("order-1")
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(
-            status=JobStatus.COMPLETED.value
+        await (
+            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
         )
         job2 = await tw.enqueue("order-1")
         assert job1.ulid != job2.ulid
@@ -148,7 +148,8 @@ class TestUniqueKeyFunction:
 
     async def test_unique_key_validates_return_type(self, queue):
         tw = TaskWrapper(
-            _keyed_noop, queue,
+            _keyed_noop,
+            queue,
             unique_key=lambda order_id: 42,
         )
         with pytest.raises(TypeError, match="unique_key function must return str"):
@@ -156,7 +157,8 @@ class TestUniqueKeyFunction:
 
     async def test_unique_key_validates_return_type_in_batch(self, queue):
         tw = TaskWrapper(
-            _keyed_noop, queue,
+            _keyed_noop,
+            queue,
             unique_key=lambda order_id: 42,
         )
         with pytest.raises(TypeError, match="unique_key function must return str"):
@@ -174,14 +176,15 @@ class TestUniqueWithOtherFeatures:
     async def test_unique_with_idempotency_precedence(self, queue):
         """Idempotency check runs first and takes precedence."""
         tw = TaskWrapper(
-            _keyed_noop, queue,
+            _keyed_noop,
+            queue,
             unique_key=lambda order_id: f"sync:{order_id}",
         )
         # Enqueue with both idempotency key and unique key
         job1 = await tw.enqueue("order-1", _idempotency_key="idem-1")
         # Complete the job so uniqueness wouldn't block
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(
-            status=JobStatus.COMPLETED.value
+        await (
+            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
         )
         # Re-enqueue with same idempotency key — should return existing (completed)
         # because idempotency checks all non-cancelled states
@@ -191,16 +194,19 @@ class TestUniqueWithOtherFeatures:
     async def test_batch_respects_uniqueness_with_key_fn(self, queue):
         """enqueue_many with unique_key=fn checks uniqueness per-job."""
         tw = TaskWrapper(
-            _keyed_noop, queue,
+            _keyed_noop,
+            queue,
             unique_key=lambda order_id: f"sync:{order_id}",
         )
         # Create an existing job
         job1 = await tw.enqueue("order-1")
         # Batch enqueue: order-1 should return existing, order-2 should be new
-        results = await tw.enqueue_many([
-            {"args": ("order-1",)},
-            {"args": ("order-2",)},
-        ])
+        results = await tw.enqueue_many(
+            [
+                {"args": ("order-1",)},
+                {"args": ("order-2",)},
+            ]
+        )
         assert len(results) == 2
         assert results[0].ulid == job1.ulid  # existing
         assert results[1].ulid != job1.ulid  # new
@@ -294,9 +300,7 @@ class TestUniqueKeyMakesOneJob:
     """A unique key makes one active job, also when enqueues run at the same time."""
 
     async def test_eight_concurrent_enqueues_make_one_job(self, disk_queue):
-        jobs = await asyncio.gather(
-            *[disk_queue.enqueue("t", unique_key="u1") for _ in range(8)]
-        )
+        jobs = await asyncio.gather(*[disk_queue.enqueue("t", unique_key="u1") for _ in range(8)])
         assert len({j.ulid for j in jobs}) == 1
         assert await _unique_rows("u1") == 1
 
@@ -306,13 +310,9 @@ class TestUniqueKeyMakesOneJob:
         await q1.init_db()
         await q2.init_db()
         try:
-            jobs = await asyncio.gather(
-                *[q.enqueue("t", unique_key="u2") for q in (q1, q2) * 4]
-            )
+            jobs = await asyncio.gather(*[q.enqueue("t", unique_key="u2") for q in (q1, q2) * 4])
             assert len({j.ulid for j in jobs}) == 1
-            assert await Job.using(q1.db, "qler_jobs").filter(
-                F("unique_key") == "u2"
-            ).count() == 1
+            assert await Job.using(q1.db, "qler_jobs").filter(F("unique_key") == "u2").count() == 1
         finally:
             await q1.close()
             await q2.close()
@@ -320,9 +320,7 @@ class TestUniqueKeyMakesOneJob:
     async def test_two_enqueue_many_with_overlapping_keys(self, disk_queue):
         first = [{"task_path": "t", "unique_key": f"m{i}"} for i in range(0, 10)]
         second = [{"task_path": "t", "unique_key": f"m{i}"} for i in range(5, 15)]
-        a, b = await asyncio.gather(
-            disk_queue.enqueue_many(first), disk_queue.enqueue_many(second)
-        )
+        a, b = await asyncio.gather(disk_queue.enqueue_many(first), disk_queue.enqueue_many(second))
         for i in range(15):
             assert await _unique_rows(f"m{i}") == 1
         assert [j.ulid for j in a[5:]] == [j.ulid for j in b[:5]]
@@ -355,8 +353,11 @@ class TestUniqueKeyMakesOneJob:
         await old.db.drop_index("idx_qler_jobs_unique_uq")
         first = await old.enqueue("t", unique_key="dup-u")
         second = Job(
-            ulid="01ZZZZZZZZZZZZZZZZZZZZZZZZ", task="t", unique_key="dup-u",
-            created_at=first.created_at, updated_at=first.created_at,
+            ulid="01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+            task="t",
+            unique_key="dup-u",
+            created_at=first.created_at,
+            updated_at=first.created_at,
         )
         await second.save()
         await old.close()
@@ -447,19 +448,23 @@ class TestUniqueKeyInOneBatch:
     """Two specs of one enqueue_many call with one unique key are one job."""
 
     async def test_two_specs_one_key(self, queue):
-        a, b = await queue.enqueue_many([
-            {"task_path": "t", "unique_key": "k1"},
-            {"task_path": "t", "unique_key": "k1"},
-        ])
+        a, b = await queue.enqueue_many(
+            [
+                {"task_path": "t", "unique_key": "k1"},
+                {"task_path": "t", "unique_key": "k1"},
+            ]
+        )
         assert a.ulid == b.ulid
         assert await _unique_rows("k1") == 1
 
     async def test_keys_a_b_a(self, queue):
-        res = await queue.enqueue_many([
-            {"task_path": "t", "unique_key": "a"},
-            {"task_path": "t", "unique_key": "b"},
-            {"task_path": "t", "unique_key": "a"},
-        ])
+        res = await queue.enqueue_many(
+            [
+                {"task_path": "t", "unique_key": "a"},
+                {"task_path": "t", "unique_key": "b"},
+                {"task_path": "t", "unique_key": "a"},
+            ]
+        )
         assert len(res) == 3
         assert res[0].ulid == res[2].ulid
         assert res[0].ulid != res[1].ulid
@@ -493,8 +498,7 @@ class TestKeyIndexText:
         finally:
             await q.close()
         assert indexes["idx_qler_jobs_idempotency_uq"].endswith(
-            " WHERE json_extract(data, '$.idempotency_key') IS NOT NULL "
-            "AND status != 'cancelled'"
+            " WHERE json_extract(data, '$.idempotency_key') IS NOT NULL AND status != 'cancelled'"
         )
         assert indexes["idx_qler_jobs_unique_uq"].endswith(
             " WHERE json_extract(data, '$.unique_key') IS NOT NULL "

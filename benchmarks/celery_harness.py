@@ -59,16 +59,23 @@ class CeleryWorkerContext:
         # Started once, before anything is timed; nothing else runs on the loop yet.
         self._proc = subprocess.Popen(  # noqa: ASYNC220
             [
-                sys.executable, "-m", "celery",
-                "-A", "benchmarks.celery_app",
+                sys.executable,
+                "-m",
+                "celery",
+                "-A",
+                "benchmarks.celery_app",
                 "worker",
-                "--pool", "solo",
-                "--concurrency", str(self.concurrency),
+                "--pool",
+                "solo",
+                "--concurrency",
+                str(self.concurrency),
                 "--without-heartbeat",
                 "--without-mingle",
                 "--without-gossip",
-                "--loglevel", "WARNING",
-                "-Q", "celery",
+                "--loglevel",
+                "WARNING",
+                "-Q",
+                "celery",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -107,6 +114,4 @@ class CeleryWorkerContext:
                 pass
             await asyncio.sleep(0.3)
 
-        raise TimeoutError(
-            f"Celery worker not ready after {WORKER_STARTUP_TIMEOUT}s"
-        )
+        raise TimeoutError(f"Celery worker not ready after {WORKER_STARTUP_TIMEOUT}s")

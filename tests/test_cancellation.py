@@ -55,9 +55,11 @@ async def cancel_queue(cancel_db):
 
 async def _transition_to_running(job: Job) -> Job:
     """Helper: atomically transition a PENDING job to RUNNING."""
-    updated = await Job.query().filter(
-        (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
-    ).update_one(status=JobStatus.RUNNING.value, worker_id="test-worker")
+    updated = (
+        await Job.query()
+        .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value))
+        .update_one(status=JobStatus.RUNNING.value, worker_id="test-worker")
+    )
     assert updated is not None
     job._sync_from(updated)
     return job
@@ -114,9 +116,11 @@ class TestRequestCancel:
 
         # Transition to FAILED
         now = now_epoch()
-        updated = await Job.query().filter(
-            (F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value)
-        ).update_one(status=JobStatus.FAILED.value, finished_at=now)
+        updated = (
+            await Job.query()
+            .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value))
+            .update_one(status=JobStatus.FAILED.value, finished_at=now)
+        )
         job._sync_from(updated)
 
         ok = await job.request_cancel()
@@ -226,9 +230,7 @@ class TestIsCancellationRequested:
         try:
             # Delete the job from DB
             adapter = cancel_queue.db.adapter
-            cur = await adapter.execute(
-                "DELETE FROM qler_jobs WHERE ulid = ?", [job.ulid]
-            )
+            cur = await adapter.execute("DELETE FROM qler_jobs WHERE ulid = ?", [job.ulid])
             await cur.close()
             await adapter.auto_commit()
 
@@ -244,9 +246,13 @@ class TestIsCancellationRequested:
         await _transition_to_running(job)
 
         # Set cancel_requested AND change worker_id (simulating reclaim)
-        await Job.query().filter(F("ulid") == job.ulid).update_one(
-            cancel_requested=True,
-            worker_id="other-worker",
+        await (
+            Job.query()
+            .filter(F("ulid") == job.ulid)
+            .update_one(
+                cancel_requested=True,
+                worker_id="other-worker",
+            )
         )
 
         token = _current_job.set(job)
@@ -290,9 +296,7 @@ class TestTaskCancellationCheck:
         assert job.status == JobStatus.PENDING.value
 
         # Pre-set cancel_requested on the PENDING job
-        await Job.query().filter(F("ulid") == job.ulid).update_one(
-            cancel_requested=True
-        )
+        await Job.query().filter(F("ulid") == job.ulid).update_one(cancel_requested=True)
 
         # Execute via immediate mode
         result_job = await imm_q._execute_immediate(job)
@@ -325,12 +329,14 @@ class TestCliCancelRunning:
             j = await q.enqueue("myapp.tasks.long_running")
             # Transition to RUNNING
             now = now_epoch()
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.RUNNING.value,
-                worker_id="worker-1",
-                updated_at=now,
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.RUNNING.value,
+                    worker_id="worker-1",
+                    updated_at=now,
+                )
             )
             await q.close()
             return j.ulid
@@ -350,9 +356,11 @@ class TestCliCancelRunning:
             q = Queue(db_path)
             await q.init_db()
             j = await q.enqueue("myapp.tasks.long_running")
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(status=JobStatus.RUNNING.value, worker_id="w-1")
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(status=JobStatus.RUNNING.value, worker_id="w-1")
+            )
             await q.close()
             return j.ulid
 
@@ -373,15 +381,15 @@ class TestCliCancelRunning:
             await q.enqueue("myapp.tasks.p2")
             # 1 RUNNING
             j = await q.enqueue("myapp.tasks.r1")
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(status=JobStatus.RUNNING.value, worker_id="w-1")
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(status=JobStatus.RUNNING.value, worker_id="w-1")
+            )
             await q.close()
 
         asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "cancel", "--all", "--running", "--db", db_path, "--json"
-        ])
+        result = runner.invoke(cli, ["cancel", "--all", "--running", "--db", db_path, "--json"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["cancelled"] == 2
@@ -395,15 +403,15 @@ class TestCliCancelRunning:
             await q.init_db()
             await q.enqueue("myapp.tasks.p1")
             j = await q.enqueue("myapp.tasks.r1")
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(status=JobStatus.RUNNING.value, worker_id="w-1")
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(status=JobStatus.RUNNING.value, worker_id="w-1")
+            )
             await q.close()
 
         asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "cancel", "--all", "--db", db_path, "--json"
-        ])
+        result = runner.invoke(cli, ["cancel", "--all", "--db", db_path, "--json"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["cancelled"] == 1

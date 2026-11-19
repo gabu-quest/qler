@@ -51,9 +51,7 @@ def parse_rate(spec: str) -> RateSpec:
         )
     limit = int(match.group(1))
     if limit < 1:
-        raise ConfigurationError(
-            f"Rate limit must be >= 1, got {limit}"
-        )
+        raise ConfigurationError(f"Rate limit must be >= 1, got {limit}")
     unit = match.group(2)
     return RateSpec(limit=limit, window_seconds=_UNIT_SECONDS[unit])
 
@@ -114,9 +112,7 @@ async def _take_token(
 
     # A clock that went back refills nothing and leaves the refill mark where it was.
     elapsed = max(0, now - bucket.last_refill_at)
-    new_tokens = min(
-        bucket.tokens + elapsed * rate.refill_rate, float(rate.limit)
-    )
+    new_tokens = min(bucket.tokens + elapsed * rate.refill_rate, float(rate.limit))
     bucket.max_tokens = rate.limit
     bucket.refill_rate = rate.refill_rate
     allowed = new_tokens >= 1.0
