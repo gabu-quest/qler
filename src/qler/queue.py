@@ -1341,7 +1341,9 @@ class Queue:
         # Queue-level rate limit
         queue_rate = self._rate_limits.get(job.queue_name)
         if queue_rate is not None:
-            allowed = await try_acquire(f"queue:{job.queue_name}", queue_rate)
+            allowed = await try_acquire(
+                f"queue:{job.queue_name}", queue_rate, db=self._db
+            )
             if not allowed:
                 await self._requeue_rate_limited(job, worker_id, queue_rate, now_ts)
                 return True
@@ -1349,7 +1351,9 @@ class Queue:
         # Task-level rate limit
         task_wrapper = self._tasks.get(job.task)
         if task_wrapper is not None and task_wrapper.rate_spec is not None:
-            allowed = await try_acquire(f"task:{job.task}", task_wrapper.rate_spec)
+            allowed = await try_acquire(
+                f"task:{job.task}", task_wrapper.rate_spec, db=self._db
+            )
             if not allowed:
                 await self._requeue_rate_limited(
                     job, worker_id, task_wrapper.rate_spec, now_ts
