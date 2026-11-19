@@ -696,7 +696,7 @@ wheels = [
 
 [[package]]
 name = "sqler"
-version = "1.2026.4.4"
+version = "1.2026.11.1"
 source = { editable = "../sqler" }
 dependencies = [
     { name = "aiosqlite" },
@@ -720,6 +720,7 @@ dev = [
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "marimo", specifier = ">=0.20" },
+    { name = "mypy", specifier = "==2.4.1" },
     { name = "pre-commit", specifier = ">=4.5.1" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
