@@ -11,7 +11,6 @@ from sqler import F
 
 from qler._time import now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
-from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
@@ -32,20 +31,12 @@ async def _make_running_job(queue, *, lease_offset: int = 300, worker_id: str = 
     # Force lease_expires_at to the desired value
     now = now_epoch()
     target_expiry = now + lease_offset
-    await (
-        Job.query()
-        .filter(F("ulid") == claimed.ulid)
-        .update_one(
-            lease_expires_at=target_expiry,
-        )
+    await queue.jobs.filter(F("ulid") == claimed.ulid).update_one(
+        lease_expires_at=target_expiry,
     )
     # Also update the attempt's lease_expires_at for consistency
-    await (
-        JobAttempt.query()
-        .filter(F("job_ulid") == claimed.ulid)
-        .update_one(
-            lease_expires_at=target_expiry,
-        )
+    await queue.attempts.filter(F("job_ulid") == claimed.ulid).update_one(
+        lease_expires_at=target_expiry,
     )
     await claimed.refresh()
     return claimed
@@ -76,7 +67,7 @@ class TestRecoverExpiredLeases:
         await queue.recover_expired_leases()
         after = now_epoch()
 
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.LEASE_EXPIRED.value
         assert attempts[0].failure_kind == FailureKind.LEASE_EXPIRED.value
@@ -101,7 +92,7 @@ class TestRecoverExpiredLeases:
         assert count == 3
 
         # Remaining 2 still running
-        remaining = await Job.query().filter(F("status") == JobStatus.RUNNING.value).all()
+        remaining = await queue.jobs.filter(F("status") == JobStatus.RUNNING.value).all()
         assert len(remaining) == 2
 
     async def test_recover_no_expired(self, queue):
@@ -139,14 +130,12 @@ class TestRecoverExpiredLeases:
         """Progress fields are cleared when a lease-expired job is recovered."""
         job = await _make_running_job(queue, lease_offset=-10)
         # Set progress on the running job
-        await (
-            Job.query()
-            .filter(F("ulid") == job.ulid)
-            .update_one(progress=75, progress_message="three quarters")
+        await queue.jobs.filter(F("ulid") == job.ulid).update_one(
+            progress=75, progress_message="three quarters"
         )
         recovered = await queue.recover_expired_leases()
         assert recovered == 1
-        refreshed = await Job.query().filter(F("ulid") == job.ulid).first()
+        refreshed = await queue.jobs.filter(F("ulid") == job.ulid).first()
         assert refreshed.status == JobStatus.PENDING.value
         assert refreshed.progress is None
         assert refreshed.progress_message == ""
@@ -170,19 +159,19 @@ class TestRecoverExpiredLeases:
             with pytest.raises(sqlite3.OperationalError, match="database is locked"):
                 await queue.recover_expired_leases()
 
-            stored = await Job.query().filter(F("ulid") == job.ulid).first()
+            stored = await queue.jobs.filter(F("ulid") == job.ulid).first()
             assert stored.status == JobStatus.RUNNING.value
             assert stored.worker_id == "worker-1"
             assert stored.lease_expires_at is not None
-            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+            attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
             assert [a.status for a in attempts] == [AttemptStatus.RUNNING.value]
             assert recovered_events() == []
 
             assert await queue.recover_expired_leases() == 1
 
-            stored = await Job.query().filter(F("ulid") == job.ulid).first()
+            stored = await queue.jobs.filter(F("ulid") == job.ulid).first()
             assert stored.status == JobStatus.PENDING.value
-            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+            attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
             assert [a.status for a in attempts] == [AttemptStatus.LEASE_EXPIRED.value]
             assert len(recovered_events()) == 1
 
@@ -221,12 +210,8 @@ class TestRenewLease:
         """Wrong worker → False."""
         job = await _make_running_job(queue, lease_offset=60)
         # Change worker_id to simulate ownership loss
-        await (
-            Job.query()
-            .filter(F("ulid") == job.ulid)
-            .update_one(
-                worker_id="other-worker",
-            )
+        await queue.jobs.filter(F("ulid") == job.ulid).update_one(
+            worker_id="other-worker",
         )
         await job.refresh()
         job.worker_id = "worker-1"  # pretend we still think we own it
@@ -318,11 +303,11 @@ class TestWorkerLeaseRenewal:
         worker_task = asyncio.create_task(w.run())
         try:
             await asyncio.wait_for(_renewal_started.wait(), timeout=5.0)
-            claimed = await Job.query().filter(F("ulid") == job.ulid).first()
+            claimed = await queue.jobs.filter(F("ulid") == job.ulid).first()
             claim_lease = claimed.lease_expires_at
             with caplog.at_level("WARNING", logger="qler.worker"):
                 await asyncio.wait_for(renewed_after_error.wait(), timeout=5.0)
-            row = await Job.query().filter(F("ulid") == job.ulid).first()
+            row = await queue.jobs.filter(F("ulid") == job.ulid).first()
         finally:
             _renewal_release.set()
             await _stop(w, worker_task)
@@ -372,10 +357,10 @@ class TestWorkerLeaseRenewal:
         # The start-up pass found nothing (the lease was still running); one loop pass recovered it.
         assert results[0] == 0
         assert [c for c in results if c] == [1]
-        row = await Job.query().filter(F("ulid") == job.ulid).first()
+        row = await queue.jobs.filter(F("ulid") == job.ulid).first()
         assert row.status == JobStatus.PENDING.value
         assert row.worker_id == ""
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert [a.status for a in attempts] == [AttemptStatus.LEASE_EXPIRED.value]
         events = [
             r
@@ -412,7 +397,7 @@ class TestWorkerLeaseRenewal:
         assert result.status == JobStatus.COMPLETED.value
         assert result.result == "first run"
         assert _renewal_runs == 1
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await q.attempts.filter(F("job_ulid") == job.ulid).all()
         assert [(a.status, a.worker_id) for a in attempts] == [
             (AttemptStatus.COMPLETED.value, w1.worker_id),
         ]

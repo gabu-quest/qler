@@ -4,7 +4,7 @@ All notable changes to qler will be documented in this file.
 
 ## [Unreleased]
 
-Requires `sqler>=1.2026.11.1`.
+Requires `sqler>=1.2026.11.2`.
 
 ### Upgrading from 0.5
 
@@ -23,7 +23,7 @@ Requires `sqler>=1.2026.11.1`.
 - **The rate limiter decides and writes in one transaction.** Concurrent calls for one bucket raised `StaleVersionError` after the job was already marked running, and a clock that stepped back stored a negative token count.
 - **A rate limit follows a changed rate.** A bucket kept the limit it was created with for as long as the database file lived.
 - **A read gives its connection back.** Four tasks that had each read the queue depth left the pool empty, and the next enqueue hung. The worker's `/metrics` handler reads the depth on every scrape.
-- **Two queues in one process keep their own jobs.** The worker's cancel check, cron's last-run lookup and every CLI command read the jobs of whichever queue was initialised last.
+- **Two queues in one process keep their own jobs.** The worker's cancel check, cron's last-run lookup and every CLI command read the jobs of whichever queue was initialised last. So did a job's own methods (`cancel`, `request_cancel`, `retry`, `renew_lease`, `wait_for_dependencies`) and `set_progress` and `is_cancellation_requested`: they now use the database the job was read from or saved to. `init_db()` no longer binds the model classes to its database, so sqler's `set_db()` deprecation warning is gone. A query on the class itself (`Job.query()`, `Job.from_id(...)`) therefore raises sqler's `NotBoundError`: read through `queue.jobs`, `queue.attempts` and `queue.archive`.
 - **A failed finish is logged.** A `complete_job` or `fail_job` that raised inside the worker was dropped silently.
 - **Enqueue refuses a bad payload before it waits for the write lock.**
 - `complete_job`, `fail_job`, `cancel_job` and `replay_job` called before `init_db()` raise `RuntimeError("Queue not initialized. Call init_db() first.")` where they raised an `AttributeError` or a `TypeError`.
@@ -34,6 +34,7 @@ Requires `sqler>=1.2026.11.1`.
 - **Immediate mode runs only the jobs the call created.** An enqueue that returns an existing job for its key does not run it again.
 - **One enqueue path and one claim path.** `enqueue` and `enqueue_many` share one implementation, as do `claim_job` and `claim_jobs`, so the single and the batch call check the same things in the same order. When one batch has a bad payload in one entry and a bad dependency in another, the payload error is the one raised.
 - **The dependency edges are a sqler model** (`JobDependency`, table `qler_job_dependencies`), and the archive moves rows through sqler. The queue sets its database up through sqler's public calls.
+- **A job with no database raises.** A `Job(...)` made in code and never enqueued, or a job that was pickled and loaded, raises sqler's `NotBoundError` from its methods, `set_progress` and `is_cancellation_requested`. Before, it used whichever queue was initialised last.
 - **The command line is a package**, `qler.cli`, one module per group of commands. The commands and their output are unchanged.
 
 ### Added

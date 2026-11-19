@@ -18,7 +18,6 @@ from qler._time import now_epoch
 from qler.enums import JobStatus
 from qler.exceptions import DependencyError, JobCancelledError, JobFailedError
 from qler.models.dependency import JobDependency
-from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 
@@ -92,14 +91,10 @@ class TestEnqueueWithDependencies:
         """If dep is already COMPLETED, pending_dep_count=0."""
         a = await queue.enqueue("my.task")
         # Manually complete A
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
@@ -111,14 +106,10 @@ class TestEnqueueWithDependencies:
         a = await queue.enqueue("my.task")
         b = await queue.enqueue("my.task")
         # Complete A
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
         c = await queue.enqueue("my.task", depends_on=[a.ulid, b.ulid])
 
@@ -134,14 +125,10 @@ class TestEnqueueWithDependencies:
     async def test_rejects_failed_dependency(self, queue):
         """Enqueue raises DependencyError if dep is FAILED."""
         a = await queue.enqueue("my.task")
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.FAILED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.FAILED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
         with pytest.raises(DependencyError, match="is failed") as exc_info:
             await queue.enqueue("my.task", depends_on=[a.ulid])
@@ -150,14 +137,10 @@ class TestEnqueueWithDependencies:
     async def test_rejects_cancelled_dependency(self, queue):
         """Enqueue raises DependencyError if dep is CANCELLED."""
         a = await queue.enqueue("my.task")
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.CANCELLED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.CANCELLED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
         with pytest.raises(DependencyError, match="is cancelled") as exc_info:
             await queue.enqueue("my.task", depends_on=[a.ulid])
@@ -201,14 +184,10 @@ class TestClaimWithDependencies:
         """Jobs with pending_dep_count=0 are claimable."""
         a = await queue.enqueue("my.task")
         # Complete A
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
@@ -269,7 +248,7 @@ class TestDependencyResolution:
         await queue.complete_job(claimed_a, "worker-1")
 
         # Check B's pending_dep_count
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_b.pending_dep_count == 0
 
     async def test_last_dep_makes_claimable(self, queue):
@@ -283,7 +262,7 @@ class TestDependencyResolution:
         claimed_a = await queue.claim_job("worker-1", ["default"])
         await queue.complete_job(claimed_a, "worker-1")
 
-        refreshed_c = await Job.query().filter(F("ulid") == c.ulid).first()
+        refreshed_c = await queue.jobs.filter(F("ulid") == c.ulid).first()
         assert refreshed_c.pending_dep_count == 1
 
         # C still not claimable
@@ -292,7 +271,7 @@ class TestDependencyResolution:
         assert claimed_b.ulid == b.ulid
         await queue.complete_job(claimed_b, "worker-1")
 
-        refreshed_c = await Job.query().filter(F("ulid") == c.ulid).first()
+        refreshed_c = await queue.jobs.filter(F("ulid") == c.ulid).first()
         assert refreshed_c.pending_dep_count == 0
 
         # Now C is claimable
@@ -332,8 +311,8 @@ class TestDependencyResolution:
         claimed_a = await queue.claim_job("worker-1", ["default"])
         await queue.complete_job(claimed_a, "worker-1")
 
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
-        refreshed_c = await Job.query().filter(F("ulid") == c.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
+        refreshed_c = await queue.jobs.filter(F("ulid") == c.ulid).first()
         assert refreshed_b.pending_dep_count == 0
         assert refreshed_c.pending_dep_count == 0
 
@@ -343,12 +322,12 @@ class TestDependencyResolution:
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
         await queue._resolve_dependencies(a.ulid)
-        refreshed = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed.pending_dep_count == 0
 
         # Second call — count is already 0, pending_dep_count > 0 guard prevents decrement
         await queue._resolve_dependencies(a.ulid)
-        refreshed = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed.pending_dep_count == 0
 
 
@@ -368,7 +347,7 @@ class TestCascadeCancel:
         claimed_a = await queue.claim_job("worker-1", ["default"])
         await queue.fail_job(claimed_a, "worker-1", ValueError("boom"))
 
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_b.status == JobStatus.CANCELLED.value
         assert refreshed_b.last_error == f"Dependency {a.ulid} failed/cancelled"
 
@@ -381,8 +360,8 @@ class TestCascadeCancel:
         claimed_a = await queue.claim_job("worker-1", ["default"])
         await queue.fail_job(claimed_a, "worker-1", ValueError("boom"))
 
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
-        refreshed_c = await Job.query().filter(F("ulid") == c.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
+        refreshed_c = await queue.jobs.filter(F("ulid") == c.ulid).first()
         assert refreshed_b.status == JobStatus.CANCELLED.value
         assert refreshed_c.status == JobStatus.CANCELLED.value
 
@@ -394,14 +373,10 @@ class TestCascadeCancel:
 
         # B is independent (no deps on A), leave it as PENDING
         # Complete B to make it COMPLETED
-        await (
-            Job.query()
-            .filter(F("ulid") == b.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == b.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
 
         # Fail A
@@ -409,11 +384,11 @@ class TestCascadeCancel:
         await queue.fail_job(claimed_a, "worker-1", ValueError("boom"))
 
         # C should be cancelled (depends on A)
-        refreshed_c = await Job.query().filter(F("ulid") == c.ulid).first()
+        refreshed_c = await queue.jobs.filter(F("ulid") == c.ulid).first()
         assert refreshed_c.status == JobStatus.CANCELLED.value
 
         # B should remain COMPLETED (not affected)
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_b.status == JobStatus.COMPLETED.value
 
     async def test_sets_error_message(self, queue):
@@ -424,7 +399,7 @@ class TestCascadeCancel:
         claimed_a = await queue.claim_job("worker-1", ["default"])
         await queue.fail_job(claimed_a, "worker-1", ValueError("boom"))
 
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_b.last_error == f"Dependency {a.ulid} failed/cancelled"
 
     async def test_cancel_via_queue_cascades(self, queue):
@@ -435,8 +410,8 @@ class TestCascadeCancel:
         ok = await queue.cancel_job(a)
         assert ok is True
 
-        refreshed_a = await Job.query().filter(F("ulid") == a.ulid).first()
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_a = await queue.jobs.filter(F("ulid") == a.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_a.status == JobStatus.CANCELLED.value
         assert refreshed_b.status == JobStatus.CANCELLED.value
 
@@ -449,8 +424,8 @@ class TestCascadeCancel:
         await queue.fail_job(claimed_a, "worker-1", ValueError("transient"))
 
         # A should be back to PENDING (retrying), B still PENDING (not cancelled)
-        refreshed_a = await Job.query().filter(F("ulid") == a.ulid).first()
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_a = await queue.jobs.filter(F("ulid") == a.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_a.status == JobStatus.PENDING.value
         assert refreshed_b.status == JobStatus.PENDING.value
 
@@ -461,23 +436,15 @@ class TestCascadeCancel:
         c = await queue.enqueue("my.task", depends_on=[a.ulid, b.ulid])
 
         # Complete B so C becomes claimable (pending_dep_count=1 from A only)
-        await (
-            Job.query()
-            .filter(F("ulid") == b.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == b.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
         # Manually set C to RUNNING (simulating it was already claimed)
-        await (
-            Job.query()
-            .filter(F("ulid") == c.ulid)
-            .update_one(
-                status=JobStatus.RUNNING.value,
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == c.ulid).update_one(
+            status=JobStatus.RUNNING.value,
+            updated_at=now_epoch(),
         )
 
         # Fail A — cascade should skip C since it's RUNNING
@@ -485,7 +452,7 @@ class TestCascadeCancel:
         assert claimed_a.ulid == a.ulid
         await queue.fail_job(claimed_a, "worker-1", ValueError("boom"))
 
-        refreshed_c = await Job.query().filter(F("ulid") == c.ulid).first()
+        refreshed_c = await queue.jobs.filter(F("ulid") == c.ulid).first()
         assert refreshed_c.status == JobStatus.RUNNING.value
 
     async def test_cancel_completed_returns_false(self, queue):
@@ -494,22 +461,18 @@ class TestCascadeCancel:
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
         # Complete A
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
-        refreshed_a = await Job.query().filter(F("ulid") == a.ulid).first()
+        refreshed_a = await queue.jobs.filter(F("ulid") == a.ulid).first()
 
         ok = await queue.cancel_job(refreshed_a)
         assert ok is False
 
         # B should remain PENDING (not cascade-cancelled)
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_b.status == JobStatus.PENDING.value
 
     async def test_wide_fan_out_resolution(self, queue):
@@ -526,7 +489,7 @@ class TestCascadeCancel:
         await queue.complete_job(claimed, "worker-1")
 
         for child in children:
-            refreshed = await Job.query().filter(F("ulid") == child.ulid).first()
+            refreshed = await queue.jobs.filter(F("ulid") == child.ulid).first()
             assert refreshed.pending_dep_count == 0
 
 
@@ -568,7 +531,7 @@ class TestCascadeReadsALevelAtATime:
         assert cancelled == [_u("A"), _u("B"), _u("C"), _u("E"), _u("D")]
         named = {
             j.ulid: j.last_error
-            for j in await Job.query().filter(F("status") == JobStatus.CANCELLED.value).all()
+            for j in await queue.jobs.filter(F("status") == JobStatus.CANCELLED.value).all()
         }
         assert named == {
             _u("A"): f"Dependency {_u('P')} failed/cancelled",
@@ -592,7 +555,7 @@ class TestCascadeReadsALevelAtATime:
 
         # Levels [P], [A, B], [C, E, D]: three reads (one per job would be six).
         assert reads["n"] == 3
-        statuses = [j.status for j in await Job.query().order_by("ulid").all()]
+        statuses = [j.status for j in await queue.jobs.order_by("ulid").all()]
         assert statuses == [JobStatus.CANCELLED.value] * 5 + [JobStatus.FAILED.value]
 
 
@@ -619,18 +582,14 @@ class TestWaitForDependencies:
         assert b.dependencies == [a.ulid]
 
         # Complete A
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
 
         await b.wait_for_dependencies(timeout=2.0)
-        refreshed_a = await Job.query().filter(F("ulid") == a.ulid).first()
+        refreshed_a = await queue.jobs.filter(F("ulid") == a.ulid).first()
         assert refreshed_a.status == JobStatus.COMPLETED.value
 
     async def test_raises_on_failed_dep(self, queue):
@@ -639,15 +598,11 @@ class TestWaitForDependencies:
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
         # Fail A
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.FAILED.value,
-                last_error="boom",
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.FAILED.value,
+            last_error="boom",
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
 
         with pytest.raises(JobFailedError, match="failed"):
@@ -659,14 +614,10 @@ class TestWaitForDependencies:
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
         # Cancel A
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.CANCELLED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.CANCELLED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
 
         with pytest.raises(JobCancelledError, match="cancelled"):
@@ -686,7 +637,7 @@ class TestWaitForDependencies:
         b = await queue.enqueue("my.task", depends_on=[a.ulid])
 
         # Delete A
-        await Job.query().filter(F("ulid") == a.ulid).delete_all()
+        await queue.jobs.filter(F("ulid") == a.ulid).delete_all()
 
         with pytest.raises(JobFailedError, match="not found"):
             await b.wait_for_dependencies(timeout=2.0)
@@ -698,24 +649,16 @@ class TestWaitForDependencies:
         c = await queue.enqueue("my.task", depends_on=[a.ulid, b.ulid])
 
         # Complete A, fail B
-        await (
-            Job.query()
-            .filter(F("ulid") == a.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
-        await (
-            Job.query()
-            .filter(F("ulid") == b.ulid)
-            .update_one(
-                status=JobStatus.FAILED.value,
-                last_error="something broke",
-                finished_at=now_epoch(),
-                updated_at=now_epoch(),
-            )
+        await queue.jobs.filter(F("ulid") == b.ulid).update_one(
+            status=JobStatus.FAILED.value,
+            last_error="something broke",
+            finished_at=now_epoch(),
+            updated_at=now_epoch(),
         )
 
         with pytest.raises(JobFailedError, match="failed"):
@@ -755,7 +698,7 @@ class TestImmediateModeDependencies:
             f"{noop_task.__module__}.{noop_task.__qualname__}",
         )
         # A was executed immediately and completed
-        refreshed_a = await Job.query().filter(F("ulid") == a.ulid).first()
+        refreshed_a = await imm_queue.jobs.filter(F("ulid") == a.ulid).first()
         assert refreshed_a.status == JobStatus.COMPLETED.value
 
         # Now enqueue B depending on A — it should have pending_dep_count=0
@@ -763,7 +706,7 @@ class TestImmediateModeDependencies:
             f"{noop_task.__module__}.{noop_task.__qualname__}",
             depends_on=[a.ulid],
         )
-        refreshed_b = await Job.query().filter(F("ulid") == b_job.ulid).first()
+        refreshed_b = await imm_queue.jobs.filter(F("ulid") == b_job.ulid).first()
         assert refreshed_b.status == JobStatus.COMPLETED.value
         assert refreshed_b.pending_dep_count == 0
 
@@ -814,8 +757,8 @@ class TestDependencyStress:
         assert claimed.ulid == a.ulid
         await queue.complete_job(claimed, "w1")
 
-        rc = await Job.query().filter(F("ulid") == c.ulid).first()
-        rd = await Job.query().filter(F("ulid") == d.ulid).first()
+        rc = await queue.jobs.filter(F("ulid") == c.ulid).first()
+        rd = await queue.jobs.filter(F("ulid") == d.ulid).first()
         assert rc.pending_dep_count == 1
         assert rd.pending_dep_count == 1
 
@@ -824,8 +767,8 @@ class TestDependencyStress:
         assert claimed.ulid == b.ulid
         await queue.complete_job(claimed, "w1")
 
-        rc = await Job.query().filter(F("ulid") == c.ulid).first()
-        rd = await Job.query().filter(F("ulid") == d.ulid).first()
+        rc = await queue.jobs.filter(F("ulid") == c.ulid).first()
+        rd = await queue.jobs.filter(F("ulid") == d.ulid).first()
         assert rc.pending_dep_count == 0
         assert rd.pending_dep_count == 0
 
@@ -855,11 +798,11 @@ class TestDependencyStress:
         await queue.fail_job(claimed, "w1", ValueError("root failure"))
 
         for ulid in [b.ulid, c.ulid, d.ulid]:
-            job = await Job.query().filter(F("ulid") == ulid).first()
+            job = await queue.jobs.filter(F("ulid") == ulid).first()
             assert job.status == JobStatus.CANCELLED.value
 
         # D's error message references whichever parent was cancelled first
-        rd = await Job.query().filter(F("ulid") == d.ulid).first()
+        rd = await queue.jobs.filter(F("ulid") == d.ulid).first()
         assert "failed/cancelled" in rd.last_error
 
     # -- Deep chains: recursion depth --
@@ -894,7 +837,7 @@ class TestDependencyStress:
         await queue.fail_job(claimed, "w1", ValueError("root dies"))
 
         for i, job_ref in enumerate(chain[1:], 1):
-            job = await Job.query().filter(F("ulid") == job_ref.ulid).first()
+            job = await queue.jobs.filter(F("ulid") == job_ref.ulid).first()
             assert job.status == JobStatus.CANCELLED.value, f"Job at depth {i} not cancelled"
 
     # -- Self-dependency: deadlock detection --
@@ -913,7 +856,7 @@ class TestDependencyStress:
         await queue.complete_job(claimed_a, "w1")
 
         # B should now be unblocked (dep resolved)
-        refreshed_b = await Job.query().filter(F("ulid") == b.ulid).first()
+        refreshed_b = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert refreshed_b.pending_dep_count == 0
 
         claimed_b = await queue.claim_job("w1", ["default"])
@@ -944,7 +887,7 @@ class TestDependencyStress:
         # Cancel A breaks the deadlock — B gets cascade-cancelled
         await queue.cancel_job(a)
 
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.status == JobStatus.CANCELLED.value
 
     # -- Cross-queue dependencies --
@@ -961,7 +904,7 @@ class TestDependencyStress:
         await queue.complete_job(claimed, "w1")
 
         # B should be unblocked now
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.pending_dep_count == 0
 
         # Worker listens to 'emails' — claims B
@@ -984,7 +927,7 @@ class TestDependencyStress:
 
         # Complete A, B should unblock
         await queue.complete_job(claimed_a, "w1")
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.pending_dep_count == 0
 
     # -- Retry exhaustion then cascade --
@@ -1001,14 +944,14 @@ class TestDependencyStress:
         claimed = await queue.claim_job("w1", ["default"])
         assert claimed.ulid == a.ulid
         await queue.fail_job(claimed, "w1", ValueError("attempt 1"))
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.status == JobStatus.PENDING.value
 
         # Fail #2: retryable, no cascade
         claimed = await queue.claim_job("w1", ["default"])
         assert claimed.ulid == a.ulid
         await queue.fail_job(claimed, "w1", ValueError("attempt 2"))
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.status == JobStatus.PENDING.value
 
         # Fail #3: terminal — retries exhausted, cascade fires
@@ -1016,10 +959,10 @@ class TestDependencyStress:
         assert claimed.ulid == a.ulid
         await queue.fail_job(claimed, "w1", ValueError("attempt 3"))
 
-        ra = await Job.query().filter(F("ulid") == a.ulid).first()
+        ra = await queue.jobs.filter(F("ulid") == a.ulid).first()
         assert ra.status == JobStatus.FAILED.value
 
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.status == JobStatus.CANCELLED.value
         assert rb.last_error == f"Dependency {a.ulid} failed/cancelled"
 
@@ -1041,7 +984,7 @@ class TestDependencyStress:
             assert claimed.ulid == parents[i].ulid
             await queue.complete_job(claimed, "w1")
 
-        rc = await Job.query().filter(F("ulid") == child.ulid).first()
+        rc = await queue.jobs.filter(F("ulid") == child.ulid).first()
         assert rc.pending_dep_count == 1
 
         # Complete the last parent — child unblocks
@@ -1049,7 +992,7 @@ class TestDependencyStress:
         assert claimed.ulid == parents[9].ulid
         await queue.complete_job(claimed, "w1")
 
-        rc = await Job.query().filter(F("ulid") == child.ulid).first()
+        rc = await queue.jobs.filter(F("ulid") == child.ulid).first()
         assert rc.pending_dep_count == 0
 
         # Child is claimable
@@ -1074,7 +1017,7 @@ class TestDependencyStress:
         assert claimed.ulid in {p.ulid for p in parents}
         await queue.fail_job(claimed, "w1", ValueError("one bad apple"))
 
-        rc = await Job.query().filter(F("ulid") == child.ulid).first()
+        rc = await queue.jobs.filter(F("ulid") == child.ulid).first()
         assert rc.status == JobStatus.CANCELLED.value
 
     # -- Empty depends_on --
@@ -1129,7 +1072,7 @@ class TestDependencyStress:
         await queue.complete_job(cx, "w1")
 
         # Y's count unchanged
-        ry = await Job.query().filter(F("ulid") == y.ulid).first()
+        ry = await queue.jobs.filter(F("ulid") == y.ulid).first()
         assert ry.pending_dep_count == 1
 
     # -- Complete parent, then try to cancel it --
@@ -1144,16 +1087,16 @@ class TestDependencyStress:
         await queue.complete_job(claimed, "w1")
 
         # B should have pending_dep_count=0
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.pending_dep_count == 0
 
         # Try to cancel A (already completed)
-        ra = await Job.query().filter(F("ulid") == a.ulid).first()
+        ra = await queue.jobs.filter(F("ulid") == a.ulid).first()
         ok = await queue.cancel_job(ra)
         assert ok is False
 
         # B still PENDING, not cascade-cancelled
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.status == JobStatus.PENDING.value
 
     # -- Middle-of-chain cancellation --
@@ -1168,9 +1111,9 @@ class TestDependencyStress:
         ok = await queue.cancel_job(b)
         assert ok is True
 
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
-        rc = await Job.query().filter(F("ulid") == c.ulid).first()
-        ra = await Job.query().filter(F("ulid") == a.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
+        rc = await queue.jobs.filter(F("ulid") == c.ulid).first()
+        ra = await queue.jobs.filter(F("ulid") == a.ulid).first()
 
         assert rb.status == JobStatus.CANCELLED.value
         assert rc.status == JobStatus.CANCELLED.value
@@ -1195,12 +1138,12 @@ class TestDependencyStress:
         assert claimed.ulid == a.ulid
         await queue.fail_job(claimed, "w1", ValueError("chain 1 dies"))
 
-        rb = await Job.query().filter(F("ulid") == b.ulid).first()
+        rb = await queue.jobs.filter(F("ulid") == b.ulid).first()
         assert rb.status == JobStatus.CANCELLED.value
 
         # Chain 2 completely unaffected
-        rx = await Job.query().filter(F("ulid") == x.ulid).first()
-        ry = await Job.query().filter(F("ulid") == y.ulid).first()
+        rx = await queue.jobs.filter(F("ulid") == x.ulid).first()
+        ry = await queue.jobs.filter(F("ulid") == y.ulid).first()
         assert rx.status == JobStatus.PENDING.value
         assert ry.status == JobStatus.PENDING.value
         assert ry.pending_dep_count == 1
@@ -1224,8 +1167,8 @@ def _is_cascade_cancel(fields):
     return fields.get("status") == JobStatus.CANCELLED.value and "last_error" in fields
 
 
-async def _job(ulid):
-    return await Job.query().filter(F("ulid") == ulid).first()
+async def _job(queue, ulid):
+    return await queue.jobs.filter(F("ulid") == ulid).first()
 
 
 class TestFinishIsOneWrite:
@@ -1241,16 +1184,16 @@ class TestFinishIsOneWrite:
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await queue.complete_job(claimed, "worker-1")
 
-        p = await _job(parent.ulid)
+        p = await _job(queue, parent.ulid)
         assert p.status == JobStatus.RUNNING.value
         assert p.worker_id == "worker-1"
-        assert [(await _job(c.ulid)).pending_dep_count for c in children] == [1, 1, 1]
+        assert [(await _job(queue, c.ulid)).pending_dep_count for c in children] == [1, 1, 1]
 
         await queue.complete_job(claimed, "worker-1")
 
-        p = await _job(parent.ulid)
+        p = await _job(queue, parent.ulid)
         assert p.status == JobStatus.COMPLETED.value
-        assert [(await _job(c.ulid)).pending_dep_count for c in children] == [0, 0, 0]
+        assert [(await _job(queue, c.ulid)).pending_dep_count for c in children] == [0, 0, 0]
         nxt = await queue.claim_job("worker-1", ["default"])
         assert nxt.ulid == children[0].ulid
 
@@ -1265,16 +1208,20 @@ class TestFinishIsOneWrite:
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await queue.fail_job(claimed, "worker-1", ValueError("boom"))
 
-        p = await _job(parent.ulid)
+        p = await _job(queue, parent.ulid)
         assert p.status == JobStatus.RUNNING.value
         assert p.worker_id == "worker-1"
         dependents = [*children, grandchild]
-        assert [(await _job(j.ulid)).status for j in dependents] == [JobStatus.PENDING.value] * 4
+        assert [(await _job(queue, j.ulid)).status for j in dependents] == [
+            JobStatus.PENDING.value
+        ] * 4
 
         await queue.fail_job(claimed, "worker-1", ValueError("boom"))
 
-        assert (await _job(parent.ulid)).status == JobStatus.FAILED.value
-        assert [(await _job(j.ulid)).status for j in dependents] == [JobStatus.CANCELLED.value] * 4
+        assert (await _job(queue, parent.ulid)).status == JobStatus.FAILED.value
+        assert [(await _job(queue, j.ulid)).status for j in dependents] == [
+            JobStatus.CANCELLED.value
+        ] * 4
 
     async def test_no_event_for_a_rolled_back_finish(
         self, queue, monkeypatch, raise_on_nth_update, caplog
@@ -1315,7 +1262,7 @@ class TestFinishIsOneWrite:
             await queue.fail_job(claimed_failed, "worker-1", ValueError("boom"))
             assert lifecycle_events() == ["job.failed"]
             assert sorted(fired) == sorted([failed.ulid, *(c.ulid for c in failed_children)])
-        assert [(await _job(c.ulid)).pending_dep_count for c in done_children] == [0, 0, 0]
+        assert [(await _job(queue, c.ulid)).pending_dep_count for c in done_children] == [0, 0, 0]
 
     async def test_child_enqueued_during_complete_ends_claimable(self, queue, monkeypatch):
         """Pin: the child's enqueue starts while the parent's completion is in flight."""
@@ -1349,7 +1296,7 @@ class TestFinishIsOneWrite:
         await complete
         child = await enqueue
 
-        assert (await _job(child.ulid)).pending_dep_count == 0
+        assert (await _job(queue, child.ulid)).pending_dep_count == 0
         nxt = await queue.claim_job("worker-1", ["default"])
         assert nxt.ulid == child.ulid
 
@@ -1370,8 +1317,8 @@ class TestFinishIsOneWrite:
         enqueued.set()
         await complete
 
-        assert (await _job(parent.ulid)).status == JobStatus.COMPLETED.value
-        assert (await _job(child.ulid)).pending_dep_count == 0
+        assert (await _job(queue, parent.ulid)).status == JobStatus.COMPLETED.value
+        assert (await _job(queue, child.ulid)).pending_dep_count == 0
         nxt = await queue.claim_job("worker-1", ["default"])
         assert nxt.ulid == child.ulid
 
@@ -1420,8 +1367,8 @@ class TestFinishIsOneWrite:
         release.set()
         await asyncio.gather(first, second)
 
-        assert (await _job(parent.ulid)).status == JobStatus.COMPLETED.value
-        assert [(await _job(c.ulid)).pending_dep_count for c in children] == [1, 1, 1]
+        assert (await _job(queue, parent.ulid)).status == JobStatus.COMPLETED.value
+        assert [(await _job(queue, c.ulid)).pending_dep_count for c in children] == [1, 1, 1]
 
 
 # ---------------------------------------------------------------------------

@@ -14,11 +14,10 @@ import pytest_asyncio
 from conftest import make_worker, run_worker_until_done
 from sqler import AsyncSQLerDB, F
 
-from qler._context import current_job
+from qler._context import current_job, current_queue
 from qler._time import generate_ulid, now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import ConfigurationError, JobFailedError
-from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
@@ -145,7 +144,7 @@ async def draining_task():
         return "second run"
     _held_started.set()
     await _drain_release.wait()
-    row = await Job.query().filter(F("ulid") == current_job().ulid).first()
+    row = await current_queue().jobs.filter(F("ulid") == current_job().ulid).first()
     _lease_at_finish.append((row.lease_expires_at, now_epoch()))
     return "first run"
 
@@ -417,7 +416,7 @@ class TestWorkerExecution:
         w = make_worker(worker_queue)
         await run_worker_until_done(w, job)
 
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await worker_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.COMPLETED.value
         assert attempts[0].worker_id == w.worker_id
@@ -650,11 +649,11 @@ class TestShutdownTimeout:
         w._running = False
         await asyncio.wait_for(worker_task, timeout=5.0)
 
-    async def _row(self, job):
-        return await Job.query().filter(F("ulid") == job.ulid).first()
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
 
-    async def _attempts(self, job):
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+    async def _attempts(self, queue, job):
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         return sorted(attempts, key=lambda a: a.attempt_number)
 
     async def test_user_cancel_during_shutdown_still_fails_cancelled(self, worker_db, caplog):
@@ -671,11 +670,11 @@ class TestShutdownTimeout:
         with caplog.at_level("WARNING", logger="qler.worker"):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert row.status == JobStatus.FAILED.value
         assert row.last_failure_kind == FailureKind.CANCELLED.value
         assert row.retry_count == 0
-        attempts = await self._attempts(job)
+        attempts = await self._attempts(q, job)
         assert [(a.status, a.failure_kind) for a in attempts] == [
             (AttemptStatus.FAILED.value, FailureKind.CANCELLED.value),
         ]
@@ -721,11 +720,11 @@ class TestShutdownTimeout:
         gate.set()
         await asyncio.wait_for(worker_task, timeout=5.0)
 
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert row.status == JobStatus.COMPLETED.value
         assert row.result == {"sum": 2}
         assert calls == [job.ulid]
-        attempts = await self._attempts(job)
+        attempts = await self._attempts(q, job)
         assert [a.status for a in attempts] == [AttemptStatus.COMPLETED.value]
 
     async def test_task_swallowing_the_cancel_completes_once(self, worker_db):
@@ -738,10 +737,10 @@ class TestShutdownTimeout:
         w = make_worker(q, shutdown_timeout=0.2)
         await self._shut_down(w, await self._start(w))
 
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert row.status == JobStatus.COMPLETED.value
         assert row.result == "swallowed"
-        attempts = await self._attempts(job)
+        attempts = await self._attempts(q, job)
         assert [a.status for a in attempts] == [AttemptStatus.COMPLETED.value]
         assert w._left_for_recovery == []
 
@@ -773,11 +772,11 @@ class TestShutdownRelease:
         yield
         _thread_go.set()  # never leave a test's thread blocked
 
-    async def _row(self, job):
-        return await Job.query().filter(F("ulid") == job.ulid).first()
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
 
-    async def _attempt_rows(self, job):
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+    async def _attempt_rows(self, queue, job):
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         return [
             (a.status, a.failure_kind, a.error, a.worker_id)
             for a in sorted(attempts, key=lambda a: a.attempt_number)
@@ -796,7 +795,7 @@ class TestShutdownRelease:
         w1 = make_worker(q, shutdown_timeout=0.2)
         w1_task = asyncio.create_task(w1.run())
         await asyncio.wait_for(_held_started.wait(), timeout=5.0)
-        lease_end = (await self._row(job)).lease_expires_at
+        lease_end = (await self._row(q, job)).lease_expires_at
         w1._running = False
         await asyncio.wait_for(w1_task, timeout=5.0)
 
@@ -807,7 +806,7 @@ class TestShutdownRelease:
         assert result.result == "second run"
         assert result.retry_count == 0
         assert _held_runs == 2
-        assert await self._attempt_rows(job) == [
+        assert await self._attempt_rows(q, job) == [
             (
                 AttemptStatus.LEASE_EXPIRED.value,
                 FailureKind.LEASE_EXPIRED.value,
@@ -849,11 +848,11 @@ class TestShutdownRelease:
                 row.last_error,
             )
 
-        a, b = await self._row(released), await self._row(recovered)
+        a, b = await self._row(q, released), await self._row(q, recovered)
         assert state(a) == (JobStatus.PENDING.value, 0, "", None, None, "", None, None)
         assert state(a) == state(b)
-        rows_a = [r[:3] for r in await self._attempt_rows(released)]
-        rows_b = [r[:3] for r in await self._attempt_rows(recovered)]
+        rows_a = [r[:3] for r in await self._attempt_rows(q, released)]
+        rows_b = [r[:3] for r in await self._attempt_rows(q, recovered)]
         assert rows_a == [
             (AttemptStatus.LEASE_EXPIRED.value, FailureKind.LEASE_EXPIRED.value, "Lease expired")
         ]
@@ -871,13 +870,13 @@ class TestShutdownRelease:
         w_task = asyncio.create_task(w.run())
         await asyncio.wait_for(_ignore_started.wait(), timeout=5.0)
         stuck = set(w._active_tasks)
-        before = await self._row(job)
+        before = await self._row(q, job)
         try:
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.3)
                 w._running = False
                 await asyncio.wait_for(asyncio.shield(w_task), timeout=5.0)
-            after = await self._row(job)
+            after = await self._row(q, job)
             other = await q.claim_job("other-worker", ["default"])
         finally:
             _ignore_release.set()
@@ -905,12 +904,12 @@ class TestShutdownRelease:
         w_task = asyncio.create_task(w.run())
         try:
             assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
-            before = await self._row(job)
+            before = await self._row(q, job)
             with caplog.at_level("WARNING", logger="qler.worker"):
                 w._running = False
                 await asyncio.wait_for(w_task, timeout=5.0)
             thread_returned_at_exit = _thread_returned.is_set()
-            after = await self._row(job)
+            after = await self._row(q, job)
             other = await q.claim_job("other-worker", ["default"])
         finally:
             # End the thread here: the loop's teardown would wait for it.
@@ -946,7 +945,7 @@ class TestShutdownRelease:
         w._running = False
         await asyncio.wait_for(w_task, timeout=5.0)
 
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert _thread_returned.is_set() is True
         assert (row.status, row.worker_id, row.lease_expires_at, row.retry_count) == (
             JobStatus.PENDING.value,
@@ -974,9 +973,9 @@ class TestShutdownRelease:
         with caplog.at_level("WARNING", logger="qler.worker"):
             await asyncio.wait_for(w_task, timeout=5.0)
 
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, "other-worker")
-        assert [(r[0], r[3]) for r in await self._attempt_rows(job)] == [
+        assert [(r[0], r[3]) for r in await self._attempt_rows(q, job)] == [
             (AttemptStatus.LEASE_EXPIRED.value, w.worker_id),
             (AttemptStatus.RUNNING.value, "other-worker"),
         ]
@@ -1012,11 +1011,11 @@ class TestShutdownRelease:
             f"Could not release job {job.ulid} after the shutdown cut; "
             "left it running for lease recovery"
         ]
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
         await self._end_lease_now(q, job)
         assert await q.recover_expired_leases() == 1
-        assert (await self._row(job)).status == JobStatus.PENDING.value
+        assert (await self._row(q, job)).status == JobStatus.PENDING.value
 
     async def test_hanging_release_does_not_hold_the_shutdown(self, worker_db, monkeypatch, caplog):
         """A release that never returns is given up at the drain's bound."""
@@ -1046,7 +1045,7 @@ class TestShutdownRelease:
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1
         assert job.ulid in errors[0]
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
 
     async def test_two_jobs_cut_one_released_one_kept(self, worker_db, monkeypatch, caplog):
@@ -1068,7 +1067,7 @@ class TestShutdownRelease:
             with caplog.at_level("WARNING", logger="qler.worker"):
                 w._running = False
                 await asyncio.wait_for(asyncio.shield(w_task), timeout=5.0)
-            row_h, row_i = await self._row(honoured), await self._row(ignored)
+            row_h, row_i = await self._row(q, honoured), await self._row(q, ignored)
         finally:
             _ignore_release.set()
             await asyncio.gather(*stuck, return_exceptions=True)
@@ -1112,7 +1111,7 @@ class TestShutdownRelease:
             w._running = False
             await asyncio.wait_for(run, timeout=5.0)
 
-        row = await self._row(second)
+        row = await self._row(q, second)
         assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
         assert (
             "with 1 job(s) unfinished: released 1 to be claimed at once, "
@@ -1151,7 +1150,7 @@ class TestMalformedPayload:
             updated_at=now,
             eta=now,
         )
-        await job.save()
+        await job.save(db=q.db)
 
         w = make_worker(q)
         with pytest.raises(JobFailedError) as exc_info:
@@ -1182,7 +1181,7 @@ class TestMalformedPayload:
             updated_at=now,
             eta=now,
         )
-        await job.save()
+        await job.save(db=q.db)
 
         w = make_worker(q)
         with pytest.raises(JobFailedError) as exc_info:
@@ -1227,7 +1226,7 @@ class TestRetryExhaustion:
         assert job.last_error == "boom"
 
         # Verify both attempt records
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).order_by("ulid").all()
+        attempts = await q.attempts.filter(F("job_ulid") == job.ulid).order_by("ulid").all()
         assert len(attempts) == 2
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert attempts[0].attempt_number == 1
@@ -1601,7 +1600,7 @@ class TestTimeout:
                 await worker_task
 
         await job.refresh()
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await worker_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert "timed out" in attempts[0].error
@@ -1629,7 +1628,7 @@ class TestTimeout:
         assert job.status == JobStatus.FAILED.value
         assert job.last_failure_kind == FailureKind.TIMEOUT.value
         assert "timed out" in job.last_error
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await worker_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert attempts[0].failure_kind == FailureKind.TIMEOUT.value
@@ -1648,8 +1647,8 @@ class TestShutdownBounds:
         _lease_at_finish = []
         yield
 
-    async def _row(self, job):
-        return await Job.query().filter(F("ulid") == job.ulid).first()
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
 
     async def test_lease_is_renewed_through_a_long_drain(self, worker_db):
         """A drain longer than the job's lease: the lease stays ahead, one completion."""
@@ -1665,7 +1664,7 @@ class TestShutdownBounds:
         w2_task = asyncio.create_task(w2.run())
         try:
             w1._running = False  # the drain starts here
-            claim_lease = (await self._row(job)).lease_expires_at
+            claim_lease = (await self._row(q, job)).lease_expires_at
             # Hold the drain until the claim lease and one lease length after it
             # are over (the clock has no event to wait on).
             while now_epoch() <= claim_lease + 2:  # noqa: ASYNC110 - waits on the wall clock, no event exists
@@ -1683,10 +1682,10 @@ class TestShutdownBounds:
         lease, clock = _lease_at_finish[0]
         assert lease > clock
         assert _held_runs == 1
-        row = await self._row(job)
+        row = await self._row(q, job)
         assert row.status == JobStatus.COMPLETED.value
         assert row.result == "first run"
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await q.attempts.filter(F("job_ulid") == job.ulid).all()
         assert [(a.status, a.worker_id) for a in attempts] == [
             (AttemptStatus.COMPLETED.value, w1.worker_id),
         ]
@@ -1713,7 +1712,7 @@ class TestShutdownBounds:
                 w._running = False
                 await asyncio.wait_for(asyncio.shield(worker_task), timeout=5.0)
                 elapsed = asyncio.get_running_loop().time() - started
-            row = await self._row(job)
+            row = await self._row(q, job)
         finally:
             for t in stuck:
                 t.cancel()
@@ -1805,11 +1804,11 @@ class TestFinishFailureIsLogged:
         assert "lease recovery" in message
         assert errors[0].exc_info[0] is sqlite3.OperationalError
 
-        stored = await Job.query().filter(F("ulid") == first.ulid).first()
+        stored = await worker_queue.jobs.filter(F("ulid") == first.ulid).first()
         assert stored.status == JobStatus.RUNNING.value
         assert stored.worker_id == w.worker_id
         assert stored.lease_expires_at is not None
-        other = await Job.query().filter(F("ulid") == second.ulid).first()
+        other = await worker_queue.jobs.filter(F("ulid") == second.ulid).first()
         assert other.status == JobStatus.COMPLETED.value
 
     async def test_fail_that_raises_is_logged_and_worker_goes_on(
@@ -1834,11 +1833,11 @@ class TestFinishFailureIsLogged:
         assert "fail" in message
         assert errors[0].exc_info[0] is sqlite3.OperationalError
 
-        stored = await Job.query().filter(F("ulid") == first.ulid).first()
+        stored = await worker_queue.jobs.filter(F("ulid") == first.ulid).first()
         assert stored.status == JobStatus.RUNNING.value
         assert stored.worker_id == w.worker_id
         assert stored.lease_expires_at is not None
-        other = await Job.query().filter(F("ulid") == second.ulid).first()
+        other = await worker_queue.jobs.filter(F("ulid") == second.ulid).first()
         assert other.status == JobStatus.COMPLETED.value
 
 

@@ -8,8 +8,9 @@ import time
 from typing import Any, ClassVar, NamedTuple
 
 from pydantic import Field
-from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, F, RebaseConfig
+from sqler import NO_REBASE_CONFIG, AsyncSQLerQuerySet, AsyncSQLerSafeModel, F, RebaseConfig
 from sqler.exceptions import UniqueConstraintError
+from sqler.models import as_ref
 
 from qler._notify import clear as _notify_clear
 from qler._notify import fire as _notify_fire
@@ -92,11 +93,12 @@ class Job(AsyncSQLerSafeModel):
         get a cooperative cancellation request.
 
         Returns True if cancelled or cancellation was requested, False otherwise.
+        Raises NotBoundError (sqler) for a job that was never enqueued or read.
         """
         # Try immediate cancellation (PENDING → CANCELLED)
         now = now_epoch()
         updated = (
-            await Job.query()
+            await Job.beside(self)
             .filter((F("ulid") == self.ulid) & (F("status") == JobStatus.PENDING.value))
             .update_one(
                 status=JobStatus.CANCELLED.value,
@@ -112,9 +114,12 @@ class Job(AsyncSQLerSafeModel):
         return await self.request_cancel()
 
     async def request_cancel(self) -> bool:
-        """Request cancellation of a RUNNING job. Returns True if request was recorded."""
+        """Request cancellation of a RUNNING job. Returns True if request was recorded.
+
+        Raises NotBoundError (sqler) for a job that was never enqueued or read.
+        """
         updated = (
-            await Job.query()
+            await Job.beside(self)
             .filter((F("ulid") == self.ulid) & (F("status") == JobStatus.RUNNING.value))
             .update_one(cancel_requested=True, updated_at=now_epoch())
         )
@@ -198,14 +203,16 @@ class Job(AsyncSQLerSafeModel):
             JobFailedError: If any dependency enters FAILED state.
             JobCancelledError: If any dependency enters CANCELLED state.
             TimeoutError: If timeout is reached before all deps complete.
+            NotBoundError: (sqler) the job was never enqueued or read.
         """
         if not self.dependencies:
             return
 
+        jobs = Job.beside(self)
         start = time.monotonic()
         interval = poll_interval
         while True:
-            deps = await Job.query().filter(F("ulid").in_list(self.dependencies)).all()
+            deps = await jobs.filter(F("ulid").in_list(self.dependencies)).all()
 
             # Check for missing deps (deleted)
             found_ulids = {d.ulid for d in deps}
@@ -253,23 +260,25 @@ class Job(AsyncSQLerSafeModel):
         Raises:
             UniqueKeyConflictError: another job with this job's ``unique_key`` is
                 pending or running; the job stays FAILED.
+            NotBoundError: (sqler) the job was never enqueued or read.
+
+        A job read from the archive is read-only: it is not reset and False is returned.
         """
-        current = await Job.query().filter(F("ulid") == self.ulid).first()
+        jobs = Job.beside(self)
+        if as_ref(self)["_table"] == ARCHIVE_TABLE:
+            return False
+        current = await jobs.filter(F("ulid") == self.ulid).first()
         if current is None:
             return False
         now = now_epoch()
         try:
-            updated = (
-                await Job.query()
-                .filter(
-                    (F("ulid") == self.ulid)
-                    & (F("status") == JobStatus.FAILED.value)
-                    & (F("original_queue") == current.original_queue)
-                )
-                .update_one(**failed_to_pending_fields(now, target_queue=current.original_queue))
-            )
+            updated = await jobs.filter(
+                (F("ulid") == self.ulid)
+                & (F("status") == JobStatus.FAILED.value)
+                & (F("original_queue") == current.original_queue)
+            ).update_one(**failed_to_pending_fields(now, target_queue=current.original_queue))
         except UniqueConstraintError as err:
-            raise await unique_key_conflict(current, err) from err
+            raise await unique_key_conflict(current, err, jobs) from err
         if updated is None:
             return False
         self._sync_from(updated)
@@ -286,11 +295,14 @@ class Job(AsyncSQLerSafeModel):
 
         Returns:
             True if renewed, False if ownership was lost.
+
+        Raises:
+            NotBoundError: (sqler) the job was never enqueued or read.
         """
         lease_seconds = duration if duration is not None else self.lease_duration
         now = now_epoch()
         updated = (
-            await Job.query()
+            await Job.beside(self)
             .filter(
                 (F("ulid") == self.ulid)
                 & (F("status") == JobStatus.RUNNING.value)
@@ -377,19 +389,20 @@ def key_active(field: str) -> Any:
     raise KeyError(field)
 
 
-async def unique_key_conflict(job: Job, err: UniqueConstraintError) -> UniqueKeyConflictError:
+async def unique_key_conflict(
+    job: Job, err: UniqueConstraintError, jobs: AsyncSQLerQuerySet[Job]
+) -> UniqueKeyConflictError:
     """The error for a move of ``job`` back to pending that the unique-key index refused.
 
-    Shared by ``Job.retry`` and ``Queue.replay_job``. Any other refusal is not this
-    one and goes on as it came.
+    Shared by ``Job.retry`` and ``Queue.replay_job``; ``jobs`` is the caller's jobs
+    table, where the active job is looked up. Any other refusal is not this one and
+    goes on as it came.
     """
     if err.index != UNIQUE_KEY_INDEX:
         raise err
-    active = (
-        await Job.query()
-        .filter((F("unique_key") == job.unique_key) & key_active("unique_key"))
-        .first()
-    )
+    active = await jobs.filter(
+        (F("unique_key") == job.unique_key) & key_active("unique_key")
+    ).first()
     active_ulid = active.ulid if active is not None else None
     return UniqueKeyConflictError(
         f"Job {job.ulid} stays failed: job {active_ulid} with unique key "

@@ -14,8 +14,6 @@ from conftest import assert_pool_healthy, make_worker
 from sqler import F
 
 from qler.enums import AttemptStatus, JobStatus
-from qler.models.attempt import JobAttempt
-from qler.models.job import Job
 from qler.task import task
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
@@ -167,13 +165,13 @@ class TestWorkerPoolHealth:
         assert set(_pool_log) == {f"e2e_{i}" for i in range(5)}
 
         # All jobs completed
-        completed = await Job.query().filter(F("status") == JobStatus.COMPLETED.value).count()
+        completed = await disk_queue.jobs.filter(F("status") == JobStatus.COMPLETED.value).count()
         assert completed == 5
 
         # All attempts finalized
-        running_attempts = (
-            await JobAttempt.query().filter(F("status") == AttemptStatus.RUNNING.value).count()
-        )
+        running_attempts = await disk_queue.attempts.filter(
+            F("status") == AttemptStatus.RUNNING.value
+        ).count()
         assert running_attempts == 0
 
         await assert_pool_healthy(disk_db)
@@ -312,16 +310,16 @@ class TestQueueReadsReleaseConnection:
             await disk_queue.enqueue("m.f", args=(i,))
         claimed = await disk_queue.claim_job("w-test", ["default"])
         await disk_queue.complete_job(claimed, "w-test", result="ok")
-        await Job.query().filter(F("ulid") == claimed.ulid).update_one(finished_at=1)
+        await disk_queue.jobs.filter(F("ulid") == claimed.ulid).update_one(finished_at=1)
         assert await disk_queue.archive_jobs(older_than_seconds=300) == 1
-        assert await Job.query().count() == 2
+        assert await disk_queue.jobs.count() == 2
 
         counts = []
         stop = asyncio.Event()
 
         async def counter():
             while not stop.is_set():
-                counts.append(await Job.query().count())
+                counts.append(await disk_queue.jobs.count())
                 await asyncio.sleep(0)
 
         t = asyncio.create_task(counter())
