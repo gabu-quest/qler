@@ -429,6 +429,20 @@ class TestQueueDepth:
         depths = _sample_values(reg, "qler_queue_depth")
         assert len(depths) == 0
 
+    async def test_queue_depth_failure_returns_empty_and_logs_one_warning(self, mq, caplog):
+        """A failing depth query still returns [] (a scrape must not fail) and says why."""
+        with (
+            patch.object(Job, "using", side_effect=RuntimeError("depth boom")),
+            caplog.at_level("WARNING", logger="qler.queue"),
+        ):
+            assert await mq._query_queue_depth() == []
+
+        records = [r for r in caplog.records if r.name == "qler.queue"]
+        assert len(records) == 1
+        assert records[0].levelname == "WARNING"
+        assert records[0].exc_info is not None
+        assert str(records[0].exc_info[1]) == "depth boom"
+
     async def test_update_depth_noop_when_not_wired(self):
         """update_depth returns silently when no query function is set."""
         reg = CollectorRegistry()
