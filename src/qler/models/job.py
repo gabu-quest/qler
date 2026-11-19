@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, NamedTuple, Optional
 
 from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, F, RebaseConfig
 from sqler.exceptions import UniqueConstraintError
@@ -308,8 +308,71 @@ class Job(AsyncSQLerSafeModel):
         self._version = other._version
 
 
-# The UNIQUE index over the unique key of pending and running jobs (Queue._create_indexes).
+# The UNIQUE index over the unique key of pending and running jobs, made from
+# KEY_INDEXES by Queue._create_key_index.
 UNIQUE_KEY_INDEX = "idx_qler_jobs_unique_uq"
+
+
+class KeyIndex(NamedTuple):
+    """The UNIQUE partial index over one job key, and the non-unique one it replaces."""
+
+    field: str
+    label: str  # how the error names the key
+    scope: str  # how the error names the jobs the index covers
+    name: str
+    where: str
+    active: Any  # the same set of jobs as ``where``, as a filter
+    legacy_name: str
+    legacy_where: str
+    # A plain index for the look-up, when the UNIQUE one cannot serve it: SQLite does not
+    # take a partial index whose WHERE has ``status IN (...)`` for a query that binds the
+    # statuses as parameters, so the look-up needs an index whose WHERE its ``key = ?`` implies.
+    lookup_name: Optional[str] = None
+    lookup_where: Optional[str] = None
+
+
+_UNIQUE_KEY_WHERE = (
+    "json_extract(data, '$.unique_key') IS NOT NULL "
+    "AND status IN ('pending', 'running')"
+)
+
+KEY_INDEXES = (
+    # An idempotency key names one job that is not cancelled.
+    KeyIndex(
+        field="idempotency_key",
+        label="idempotency key",
+        scope="non-cancelled",
+        name="idx_qler_jobs_idempotency_uq",
+        where=(
+            "json_extract(data, '$.idempotency_key') IS NOT NULL "
+            "AND status != 'cancelled'"
+        ),
+        active=F("status") != JobStatus.CANCELLED.value,
+        legacy_name="idx_qler_jobs_idempotency",
+        legacy_where="json_extract(data, '$.idempotency_key') IS NOT NULL",
+    ),
+    # A unique key names one job that is pending or running.
+    KeyIndex(
+        field="unique_key",
+        label="unique key",
+        scope="pending or running",
+        name=UNIQUE_KEY_INDEX,
+        where=_UNIQUE_KEY_WHERE,
+        active=F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value]),
+        legacy_name="idx_qler_jobs_unique",
+        legacy_where=_UNIQUE_KEY_WHERE,
+        lookup_name="idx_qler_jobs_unique_key",
+        lookup_where="json_extract(data, '$.unique_key') IS NOT NULL",
+    ),
+)
+
+
+def key_active(field: str) -> Any:
+    """The filter for the jobs that hold the ``field`` key, from its ``KEY_INDEXES`` entry."""
+    for spec in KEY_INDEXES:
+        if spec.field == field:
+            return spec.active
+    raise KeyError(field)
 
 
 async def unique_key_conflict(
@@ -323,8 +386,7 @@ async def unique_key_conflict(
     if err.index != UNIQUE_KEY_INDEX:
         raise err
     active = await Job.query().filter(
-        (F("unique_key") == job.unique_key)
-        & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
+        (F("unique_key") == job.unique_key) & key_active("unique_key")
     ).first()
     active_ulid = active.ulid if active is not None else None
     return UniqueKeyConflictError(

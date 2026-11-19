@@ -479,3 +479,23 @@ class TestUniqueKeyInOneBatch:
         assert a.ulid == b.ulid
         assert await _unique_rows("u1") == 1
         assert await Job.query().count() == 1
+
+
+class TestKeyIndexText:
+    """A database made by this code is recognised by the text of its key indexes."""
+
+    async def test_unique_index_where_text_is_unchanged(self, tmp_path):
+        q = Queue(str(tmp_path / "text.db"))
+        await q.init_db()
+        try:
+            indexes = {i["name"]: i["sql"] for i in await q.db.list_indexes("qler_jobs")}
+        finally:
+            await q.close()
+        assert indexes["idx_qler_jobs_idempotency_uq"].endswith(
+            " WHERE json_extract(data, '$.idempotency_key') IS NOT NULL "
+            "AND status != 'cancelled'"
+        )
+        assert indexes["idx_qler_jobs_unique_uq"].endswith(
+            " WHERE json_extract(data, '$.unique_key') IS NOT NULL "
+            "AND status IN ('pending', 'running')"
+        )

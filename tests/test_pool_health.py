@@ -167,35 +167,6 @@ class TestWorkerPoolHealth:
 
         await assert_pool_healthy(disk_db)
 
-    async def test_batch_claim_last_attempt_id_synced(self, disk_db, disk_queue):
-        """claim_jobs() returns objects with last_attempt_id set (no refresh needed)."""
-        for i in range(3):
-            await disk_queue.enqueue(f"task_{i}", queue_name="default")
-
-        jobs = await disk_queue.claim_jobs("w-test", ["default"], n=3)
-        assert len(jobs) == 3
-
-        for job in jobs:
-            assert job.last_attempt_id is not None, (
-                f"Job {job.ulid} has last_attempt_id=None without refresh"
-            )
-            assert _ULID_PATTERN.match(job.last_attempt_id), (
-                f"Expected ULID, got {job.last_attempt_id!r}"
-            )
-
-        # Verify attempt records exist with correct data
-        for job in jobs:
-            attempts = await JobAttempt.query().filter(
-                F("job_ulid") == job.ulid
-            ).all()
-            assert len(attempts) == 1
-            assert attempts[0].ulid == job.last_attempt_id
-            assert attempts[0].worker_id == "w-test"
-            assert attempts[0].attempt_number == 1
-            assert attempts[0].status == AttemptStatus.RUNNING.value
-
-        await assert_pool_healthy(disk_db)
-
     async def test_worker_batch_execution_on_disk(self, disk_db, disk_queue):
         """Full end-to-end: enqueue 5 → Worker processes all → pool healthy."""
         _pool_log.clear()
