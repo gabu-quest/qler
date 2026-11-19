@@ -176,3 +176,25 @@ class ConfigurationError(QlerError):
     """Raised when queue or task configuration is invalid."""
 
     pass
+
+
+class UniqueKeyConflictError(QlerError):
+    """Raised when moving a job back to pending would make a second active job with its unique key.
+
+    ``Job.retry`` and ``Queue.replay_job`` raise it, and change nothing, while another job with the
+    same ``unique_key`` is pending or running. ``active_ulid`` names that job.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ulid: Optional[str] = None,
+        unique_key: Optional[str] = None,
+        active_ulid: Optional[str] = None,
+        details: Optional[dict[str, Any]] = None,
+    ):
+        super().__init__(message, details=details)
+        self.ulid = ulid
+        self.unique_key = unique_key
+        self.active_ulid = active_ulid

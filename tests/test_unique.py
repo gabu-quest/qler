@@ -1,9 +1,13 @@
 """Tests for M20 — Unique Jobs."""
 
+import asyncio
+import logging
+
 import pytest
 from qler.enums import JobStatus
-from qler.exceptions import ConfigurationError
+from qler.exceptions import ConfigurationError, UniqueKeyConflictError
 from qler.models.job import Job
+from qler.queue import Queue
 from qler.task import TaskWrapper, task
 from sqler import F
 
@@ -262,3 +266,172 @@ class TestUniqueConfig:
         assert job1.ulid != job2.ulid
         assert job1.unique_key is None
         assert job2.unique_key is None
+
+
+# ======================================================================
+# TestUniqueKeyMakesOneJob — the key holds when enqueues run at once
+# ======================================================================
+
+
+async def _unique_rows(key: str) -> int:
+    return await Job.query().filter(F("unique_key") == key).count()
+
+
+async def _failed_job_with_key(q, key: str) -> Job:
+    """A job with ``key`` that a worker claimed and failed for good."""
+    job = await q.enqueue("t", unique_key=key)
+    claimed = await q.claim_job("w1", ["default"])
+    assert claimed is not None
+    assert claimed.ulid == job.ulid
+    await q.fail_job(claimed, "w1", RuntimeError("boom"))
+    await job.refresh()
+    assert job.status == JobStatus.FAILED.value
+    return job
+
+
+class TestUniqueKeyMakesOneJob:
+    """A unique key makes one active job, also when enqueues run at the same time."""
+
+    async def test_eight_concurrent_enqueues_make_one_job(self, disk_queue):
+        jobs = await asyncio.gather(
+            *[disk_queue.enqueue("t", unique_key="u1") for _ in range(8)]
+        )
+        assert len({j.ulid for j in jobs}) == 1
+        assert await _unique_rows("u1") == 1
+
+    async def test_two_queues_on_one_file_make_one_job(self, tmp_path):
+        path = str(tmp_path / "two.db")
+        q1, q2 = Queue(path), Queue(path)
+        await q1.init_db()
+        await q2.init_db()
+        try:
+            jobs = await asyncio.gather(
+                *[q.enqueue("t", unique_key="u2") for q in (q1, q2) * 4]
+            )
+            assert len({j.ulid for j in jobs}) == 1
+            assert await Job.using(q1.db, "qler_jobs").filter(
+                F("unique_key") == "u2"
+            ).count() == 1
+        finally:
+            await q1.close()
+            await q2.close()
+
+    async def test_two_enqueue_many_with_overlapping_keys(self, disk_queue):
+        first = [{"task_path": "t", "unique_key": f"m{i}"} for i in range(0, 10)]
+        second = [{"task_path": "t", "unique_key": f"m{i}"} for i in range(5, 15)]
+        a, b = await asyncio.gather(
+            disk_queue.enqueue_many(first), disk_queue.enqueue_many(second)
+        )
+        for i in range(15):
+            assert await _unique_rows(f"m{i}") == 1
+        assert [j.ulid for j in a[5:]] == [j.ulid for j in b[:5]]
+
+    async def test_enqueue_and_enqueue_many_at_once(self, disk_queue):
+        one, many = await asyncio.gather(
+            disk_queue.enqueue("t", unique_key="mix"),
+            disk_queue.enqueue_many([{"task_path": "t", "unique_key": "mix"}]),
+        )
+        assert await _unique_rows("mix") == 1
+        assert many[0].ulid == one.ulid
+
+    async def test_completed_key_can_be_used_again_with_index(self, disk_queue):
+        job1 = await disk_queue.enqueue("t", unique_key="again")
+        claimed = await disk_queue.claim_job("w1", ["default"])
+        assert claimed is not None
+        assert claimed.ulid == job1.ulid
+        await disk_queue.complete_job(claimed, "w1", result=None)
+        job2 = await disk_queue.enqueue("t", unique_key="again")
+        assert job2.ulid != job1.ulid
+        assert await _unique_rows("again") == 2
+        names = {i["name"] for i in await disk_queue.db.list_indexes("qler_jobs")}
+        assert "idx_qler_jobs_unique_uq" in names
+
+    async def test_start_with_duplicate_keys(self, tmp_path, caplog):
+        path = str(tmp_path / "dups.db")
+        old = Queue(path)
+        await old.init_db()
+        # An older qler had no unique index: drop it and write two active jobs with one key.
+        await old.db.drop_index("idx_qler_jobs_unique_uq")
+        first = await old.enqueue("t", unique_key="dup-u")
+        second = Job(
+            ulid="01ZZZZZZZZZZZZZZZZZZZZZZZZ", task="t", unique_key="dup-u",
+            created_at=first.created_at, updated_at=first.created_at,
+        )
+        await second.save()
+        await old.close()
+
+        caplog.set_level(logging.ERROR, logger="qler.queue")
+        q = Queue(path)
+        await q.init_db()
+        try:
+            errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+            assert len(errors) == 1
+            assert "unique" in errors[0].getMessage()
+            assert "dup-u" in errors[0].getMessage()
+            names = {i["name"] for i in await q.db.list_indexes("qler_jobs")}
+            assert "idx_qler_jobs_unique_uq" not in names
+            assert "idx_qler_jobs_unique" in names
+
+            again = await q.enqueue("t", unique_key="dup-u")
+            assert again.ulid == first.ulid
+            assert await _unique_rows("dup-u") == 2
+
+            assert await q.cancel_job(second) is True
+        finally:
+            await q.close()
+
+        q = Queue(path)
+        await q.init_db()
+        try:
+            indexes = {i["name"]: i for i in await q.db.list_indexes("qler_jobs")}
+            # sqler's "unique" flag reads UNIQUE anywhere in the text: check the head.
+            assert indexes["idx_qler_jobs_unique_uq"]["sql"].startswith("CREATE UNIQUE INDEX ")
+            assert "idx_qler_jobs_unique" not in indexes
+        finally:
+            await q.close()
+
+    async def test_error_lists_twenty_keys_and_the_rest(self, tmp_path, caplog):
+        path = str(tmp_path / "many.db")
+        old = Queue(path)
+        await old.init_db()
+        await old.db.drop_index("idx_qler_jobs_unique_uq")
+        for i in range(23):
+            for n in range(2):
+                await Job(ulid=f"01H{i:02d}{n}" + "0" * 20, task="t", unique_key=f"k{i:02d}").save()
+        await old.close()
+
+        caplog.set_level(logging.ERROR, logger="qler.queue")
+        q = Queue(path)
+        await q.init_db()
+        await q.close()
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert "23 unique keys" in message
+        assert ", ".join(f"k{i:02d}" for i in range(20)) in message
+        assert "k20" not in message
+        assert "and 3 more" in message
+
+    async def test_retry_into_an_active_key_raises(self, disk_queue):
+        failed = await _failed_job_with_key(disk_queue, "busy")
+        active = await disk_queue.enqueue("t", unique_key="busy")
+        assert active.ulid != failed.ulid
+        with pytest.raises(UniqueKeyConflictError, match="busy") as info:
+            await failed.retry()
+        assert info.value.unique_key == "busy"
+        assert info.value.active_ulid == active.ulid
+        assert active.ulid in info.value.message
+        row = await Job.query().filter(F("ulid") == failed.ulid).first()
+        assert row is not None
+        assert row.status == JobStatus.FAILED.value
+
+    async def test_replay_into_an_active_key_raises(self, disk_queue):
+        failed = await _failed_job_with_key(disk_queue, "busy2")
+        active = await disk_queue.enqueue("t", unique_key="busy2")
+        with pytest.raises(UniqueKeyConflictError, match="busy2") as info:
+            await disk_queue.replay_job(failed)
+        assert info.value.unique_key == "busy2"
+        assert info.value.active_ulid == active.ulid
+        row = await Job.query().filter(F("ulid") == failed.ulid).first()
+        assert row is not None
+        assert row.status == JobStatus.FAILED.value

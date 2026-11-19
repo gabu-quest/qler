@@ -1,5 +1,7 @@
 """Tests for Queue — init, enqueue, claim, complete, fail operations."""
 
+import asyncio
+import logging
 import re
 import time
 from unittest.mock import patch
@@ -185,6 +187,141 @@ class TestEnqueueIdempotency:
         await job1.cancel()
         job2 = await queue.enqueue("my_task", idempotency_key="key-cancel")
         assert job1.ulid != job2.ulid
+
+
+async def _idem_rows(key: str) -> int:
+    return await Job.query().filter(F("idempotency_key") == key).count()
+
+
+def _raise_once_on_dep_edges(adapter):
+    """Wrap ``adapter.execute`` so the first insert into qler_job_deps raises."""
+    real = adapter.execute
+    state = {"raised": False}
+
+    async def execute(sql, *args, **kwargs):
+        if "qler_job_deps" in sql and sql.lstrip().startswith("INSERT") and not state["raised"]:
+            state["raised"] = True
+            raise RuntimeError("edge insert failed")
+        return await real(sql, *args, **kwargs)
+
+    return execute
+
+
+class TestEnqueueOneJobPerIdempotencyKey:
+    """An idempotency key makes one job, also when enqueues run at the same time."""
+
+    async def test_eight_concurrent_enqueues_make_one_job(self, disk_queue):
+        jobs = await asyncio.gather(
+            *[disk_queue.enqueue("my_task", idempotency_key="k1") for _ in range(8)]
+        )
+        assert len({j.ulid for j in jobs}) == 1
+        assert await _idem_rows("k1") == 1
+
+    async def test_two_queues_on_one_file_make_one_job(self, tmp_path):
+        path = str(tmp_path / "two.db")
+        q1, q2 = Queue(path), Queue(path)
+        await q1.init_db()
+        await q2.init_db()
+        try:
+            jobs = await asyncio.gather(
+                *[q.enqueue("my_task", idempotency_key="k2") for q in (q1, q2) * 4]
+            )
+            assert len({j.ulid for j in jobs}) == 1
+            assert await Job.using(q1.db, "qler_jobs").filter(
+                F("idempotency_key") == "k2"
+            ).count() == 1
+        finally:
+            await q1.close()
+            await q2.close()
+
+    async def test_two_enqueue_many_with_overlapping_keys(self, disk_queue):
+        first = [{"task_path": "t", "idempotency_key": f"m{i}"} for i in range(0, 10)]
+        second = [{"task_path": "t", "idempotency_key": f"m{i}"} for i in range(5, 15)]
+        a, b = await asyncio.gather(
+            disk_queue.enqueue_many(first), disk_queue.enqueue_many(second)
+        )
+        for i in range(15):
+            assert await _idem_rows(f"m{i}") == 1
+        assert [j.ulid for j in a[5:]] == [j.ulid for j in b[:5]]
+
+    async def test_enqueue_and_enqueue_many_at_once(self, disk_queue):
+        one, many = await asyncio.gather(
+            disk_queue.enqueue("t", idempotency_key="mix"),
+            disk_queue.enqueue_many([{"task_path": "t", "idempotency_key": "mix"}]),
+        )
+        assert await _idem_rows("mix") == 1
+        assert many[0].ulid == one.ulid
+
+    async def test_cancelled_key_can_be_used_again_with_index(self, disk_queue):
+        job1 = await disk_queue.enqueue("t", idempotency_key="again")
+        assert await disk_queue.cancel_job(job1) is True
+        job2 = await disk_queue.enqueue("t", idempotency_key="again")
+        assert job2.ulid != job1.ulid
+        assert await _idem_rows("again") == 2
+        names = {i["name"] for i in await disk_queue.db.list_indexes("qler_jobs")}
+        assert "idx_qler_jobs_idempotency_uq" in names
+
+    async def test_failed_edge_insert_leaves_no_job(self, disk_queue):
+        parent = await disk_queue.enqueue("parent")
+        adapter = disk_queue.db.adapter
+        with patch.object(adapter, "execute", _raise_once_on_dep_edges(adapter)):
+            with pytest.raises(RuntimeError, match="edge insert failed"):
+                await disk_queue.enqueue("child", depends_on=[parent.ulid])
+        assert await Job.query().count() == 1
+
+    async def test_failed_edge_insert_in_enqueue_many_leaves_no_job(self, disk_queue):
+        parent = await disk_queue.enqueue("parent")
+        adapter = disk_queue.db.adapter
+        with patch.object(adapter, "execute", _raise_once_on_dep_edges(adapter)):
+            with pytest.raises(RuntimeError, match="edge insert failed"):
+                await disk_queue.enqueue_many(
+                    [{"task_path": "child", "depends_on": [parent.ulid]}]
+                )
+        assert await Job.query().count() == 1
+
+    async def test_start_with_duplicate_keys(self, tmp_path, caplog):
+        path = str(tmp_path / "dups.db")
+        old = Queue(path)
+        await old.init_db()
+        # An older qler had no unique index: drop it and write two jobs with one key.
+        await old.db.drop_index("idx_qler_jobs_idempotency_uq")
+        first = await old.enqueue("t", idempotency_key="dup-a")
+        second = Job(
+            ulid="01ZZZZZZZZZZZZZZZZZZZZZZZZ", task="t", idempotency_key="dup-a",
+            created_at=first.created_at, updated_at=first.created_at,
+        )
+        await second.save()
+        await old.close()
+
+        caplog.set_level(logging.ERROR, logger="qler.queue")
+        q = Queue(path)
+        await q.init_db()
+        try:
+            errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+            assert len(errors) == 1
+            assert "idempotency" in errors[0].getMessage()
+            assert "dup-a" in errors[0].getMessage()
+            names = {i["name"] for i in await q.db.list_indexes("qler_jobs")}
+            assert "idx_qler_jobs_idempotency_uq" not in names
+            assert "idx_qler_jobs_idempotency" in names
+
+            again = await q.enqueue("t", idempotency_key="dup-a")
+            assert again.ulid == first.ulid
+            assert await _idem_rows("dup-a") == 2
+
+            assert await q.cancel_job(second) is True
+        finally:
+            await q.close()
+
+        q = Queue(path)
+        await q.init_db()
+        try:
+            indexes = {i["name"]: i for i in await q.db.list_indexes("qler_jobs")}
+            # sqler's "unique" flag reads UNIQUE anywhere in the text: check the head.
+            assert indexes["idx_qler_jobs_idempotency_uq"]["sql"].startswith("CREATE UNIQUE INDEX ")
+            assert "idx_qler_jobs_idempotency" not in indexes
+        finally:
+            await q.close()
 
 
 class TestEnqueuePayloadValidation:
