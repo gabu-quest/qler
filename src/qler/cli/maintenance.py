@@ -11,7 +11,6 @@ import click
 from qler._time import now_epoch
 from qler.cli.group import cli
 from qler.cli.helpers import (
-    TERMINAL_STATUSES,
     _echo_json,
     _get_queue,
     _import_modules,
@@ -19,7 +18,9 @@ from qler.cli.helpers import (
     _parse_since_to_seconds,
     _run,
 )
-from qler.enums import JobStatus
+from qler.enums import TERMINAL_STATUSES, JobStatus
+from qler.models.attempt import JobAttempt
+from qler.models.job import Job
 
 # ---------------------------------------------------------------------------
 # qler archive
@@ -62,7 +63,7 @@ def archive(db: str, older_than: str, output_json: bool) -> None:
 @click.option(
     "--status",
     "filter_status",
-    type=click.Choice(["completed", "failed", "cancelled"], case_sensitive=False),
+    type=click.Choice(list(TERMINAL_STATUSES), case_sensitive=False),
     help="Only purge this status (default: all terminal)",
 )
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
@@ -127,17 +128,17 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
                     row["name"]
                     for row in await q.db.execute_sql(
                         "SELECT name FROM sqlite_master WHERE type='table' "
-                        "AND name IN ('qler_jobs', 'qler_job_attempts')"
+                        f"AND name IN ('{Job.__tablename__}', '{JobAttempt.__tablename__}')"
                     )
                 ]
-                has_jobs = "qler_jobs" in tables
-                has_attempts = "qler_job_attempts" in tables
+                has_jobs = Job.__tablename__ in tables
+                has_attempts = JobAttempt.__tablename__ in tables
                 checks.append(
                     {
                         "check": "schema",
                         "ok": has_jobs and has_attempts,
-                        "detail": f"qler_jobs={'ok' if has_jobs else 'MISSING'}, "
-                        f"qler_job_attempts={'ok' if has_attempts else 'MISSING'}",
+                        "detail": f"{Job.__tablename__}={'ok' if has_jobs else 'MISSING'}, "
+                        f"{JobAttempt.__tablename__}={'ok' if has_attempts else 'MISSING'}",
                     }
                 )
             except Exception as exc:
