@@ -84,6 +84,27 @@ $ qler attempts 01M7S9R2C6VJGT3S4GN330N00T --db jobs.db
 
 `qler job <ULID>` prints the payload, the last error and its kind, the retry count and the lease. Every command takes `--json`. When the cause is fixed: `qler retry <ULID> --db jobs.db`.
 
+The same records can be read from Python. A queue has three read properties, `queue.jobs`, `queue.attempts` and `queue.archive` (jobs moved out by `qler archive`); each is a [sqler](https://github.com/gabu-quest/sqler) query on that queue's own table:
+
+```python
+# report.py
+import asyncio
+from sqler import F
+from tasks import queue
+
+async def main():
+    await queue.init_db()
+    for job in await queue.jobs.filter(F("status") == "failed").all():
+        tries = await queue.attempts.filter(F("job_ulid") == job.ulid).count()
+        print(job.ulid, job.task, tries)
+    print("archived:", await queue.archive.count())
+    await queue.close()
+
+asyncio.run(main())
+```
+
+They are for reading. To change a job, call its own methods (`cancel`, `retry`) instead of writing through these queries.
+
 ## What qler guarantees
 
 - **A job runs at least once.** A worker holds a lease on the job it runs (300 seconds by default) and renews it while the job runs. If the worker dies, the lease runs out and another worker picks the job up again. So a job can run more than once: write tasks that are safe to repeat.
