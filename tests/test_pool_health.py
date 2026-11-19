@@ -315,20 +315,19 @@ class TestQueueReadsReleaseConnection:
         self, disk_db, disk_queue, read
     ):
         hold = asyncio.Event()
-        done = []
+        have_read = [asyncio.Event() for _ in range(4)]
 
-        async def reader():
+        async def reader(mine):
             await read(disk_queue)
-            done.append(1)
+            mine.set()
             await hold.wait()
 
-        tasks = [asyncio.create_task(reader()) for _ in range(4)]
+        tasks = [asyncio.create_task(reader(e)) for e in have_read]
         try:
-            for _ in range(200):
-                if len(done) == 4:
-                    break
-                await asyncio.sleep(0.01)
-            assert len(done) == 4
+            # Each reader says when its read has returned; no polling.
+            await asyncio.wait_for(
+                asyncio.gather(*(e.wait() for e in have_read)), 30
+            )
 
             job = await asyncio.wait_for(disk_queue.enqueue("m.f"), 2)
             assert job.status == JobStatus.PENDING.value
