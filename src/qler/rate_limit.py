@@ -76,7 +76,10 @@ async def try_acquire(key: str, rate: RateSpec, *, db: AsyncSQLerDB) -> bool:
     so it can neither hand out a token twice nor drive the count below zero.
 
     When the write lock cannot be had within the database's busy timeout, the limiter
-    cannot decide and answers False (deny, try later); nothing is written.
+    cannot decide and answers False (deny, try later); nothing is written. That applies
+    when this call opens the transaction. Called inside a caller's transaction (a claim),
+    it is a savepoint under a lock the caller already holds, and a busy database raises
+    where the caller began.
     """
     from qler.models.bucket import RateLimitBucket
 
