@@ -33,7 +33,6 @@ from qler.exceptions import (
 )
 from qler.lifecycle import emit as _lifecycle
 from qler.models.attempt import JobAttempt
-from qler.models.bucket import RateLimitBucket
 from qler.models.dependency import JobDependency
 from qler.models.job import (
     ARCHIVE_TABLE,
@@ -164,13 +163,7 @@ class Queue:
             self._db = AsyncSQLerDB.on_disk(self._db_path)
             await self._db.connect()
 
-        db = self.db
-
-        Job.set_db(db, Job.__tablename__)
-        JobAttempt.set_db(db, JobAttempt.__tablename__)
-        RateLimitBucket.set_db(db, RateLimitBucket.__tablename__)
-
-        await ensure_schema(db)
+        await ensure_schema(self.db)
 
         # Wire up queue depth query for Prometheus scrapes
         if self._metrics is not None:
@@ -487,7 +480,7 @@ class Queue:
             worker_id=worker_id,
             started_at=now,
         )
-        await attempt.save()
+        await attempt.save(db=self.db)
 
         # Resolve task
         task_wrapper = self._tasks.get(job.task)
@@ -1118,7 +1111,7 @@ class Queue:
                 (F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value)
             ).update_one(**failed_to_pending_fields(now, target_queue=target_queue))
         except UniqueConstraintError as err:
-            raise await unique_key_conflict(job, err) from err
+            raise await unique_key_conflict(job, err, self.jobs) from err
         return updated
 
     # ------------------------------------------------------------------

@@ -13,7 +13,6 @@ from qler._time import now_epoch
 from qler.enums import FailureKind
 from qler.lifecycle import emit
 from qler.lifecycle import logger as lifecycle_logger
-from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
@@ -325,7 +324,7 @@ class TestFailEvents:
         )
 
         # Reset ETA so we can reclaim
-        await Job.query().filter(F("ulid") == claimed.ulid).update_one(eta=now_epoch())
+        await queue.jobs.filter(F("ulid") == claimed.ulid).update_one(eta=now_epoch())
 
         # Second failure → exhausted → failed
         claimed = await queue.claim_job("worker-1", ["default"])
@@ -346,12 +345,8 @@ class TestLeaseRecoveryEvents:
 
         claimed = await queue.claim_job("worker-1", ["default"])
         now = now_epoch()
-        await (
-            Job.query()
-            .filter(F("ulid") == claimed.ulid)
-            .update_one(
-                lease_expires_at=now - 100,
-            )
+        await queue.jobs.filter(F("ulid") == claimed.ulid).update_one(
+            lease_expires_at=now - 100,
         )
         capture.clear()
 

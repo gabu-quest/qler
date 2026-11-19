@@ -72,7 +72,7 @@ class TestClaimJobs:
         jobs = await queue.claim_jobs("w1", ["default"], n=3)
         assert len(jobs) == 3
         # 2 remaining pending
-        pending = await Job.query().filter(F("status") == JobStatus.PENDING.value).count()
+        pending = await queue.jobs.filter(F("status") == JobStatus.PENDING.value).count()
         assert pending == 2
 
     async def test_empty_queue_returns_empty(self, queue):
@@ -97,7 +97,7 @@ class TestClaimJobs:
         assert len(jobs) == 2
 
         for job in jobs:
-            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+            attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
             assert len(attempts) == 1
             assert attempts[0].status == AttemptStatus.RUNNING.value
             assert attempts[0].worker_id == "w1"
@@ -132,7 +132,7 @@ class TestClaimJobs:
 
         # The id names the job's one running attempt
         for job in jobs:
-            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+            attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
             assert len(attempts) == 1
             assert attempts[0].ulid == job.last_attempt_id
             assert attempts[0].worker_id == "w1"
@@ -171,13 +171,13 @@ class TestClaimJobs:
             payload_json="not valid json {{{",
             priority=100,  # higher priority so it gets claimed first
         )
-        await bad_job.save()
+        await bad_job.save(db=queue.db)
 
         jobs = await queue.claim_jobs("w1", ["default"], n=2)
         assert len(jobs) == 1
         assert jobs[0].task == "valid_task"
 
-        bad = await Job.query().filter(F("ulid") == bad_ulid).first()
+        bad = await queue.jobs.filter(F("ulid") == bad_ulid).first()
         assert bad.status == JobStatus.FAILED.value
 
     async def test_rejects_empty_queues(self, queue):
@@ -227,7 +227,7 @@ class TestClaimJobs:
         assert jobs[0].task == "t1"
 
         # The second job should be back to pending (requeued)
-        pending = await Job.query().filter(F("status") == JobStatus.PENDING.value).count()
+        pending = await q.jobs.filter(F("status") == JobStatus.PENDING.value).count()
         assert pending == 1
 
 
@@ -255,7 +255,7 @@ class TestClaimJobsIsOneWrite:
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await queue.claim_jobs("w1", ["default"], n=5)
 
-        jobs = await Job.query().filter(F("ulid").in_list(enqueued)).all()
+        jobs = await queue.jobs.filter(F("ulid").in_list(enqueued)).all()
         assert len(jobs) == 5
         for job in jobs:
             assert job.status == JobStatus.PENDING.value
@@ -263,11 +263,11 @@ class TestClaimJobsIsOneWrite:
             assert job.worker_id == ""
             assert job.lease_expires_at is None
             assert job.last_attempt_id is None
-        assert await JobAttempt.query().count() == 0
+        assert await queue.attempts.count() == 0
 
         claimed = await queue.claim_jobs("w1", ["default"], n=5)
         assert [j.ulid for j in claimed] == enqueued
-        assert await JobAttempt.query().count() == 5
+        assert await queue.attempts.count() == 5
 
     async def test_rate_limited_job_in_a_batch_is_requeued_and_the_rest_returned(
         self,
@@ -288,8 +288,8 @@ class TestClaimJobsIsOneWrite:
         assert c.worker_id == ""
         assert c.lease_expires_at is None
         assert c.eta > a.eta
-        assert await JobAttempt.query().filter(F("job_ulid") == c.ulid).count() == 0
-        assert await JobAttempt.query().count() == 3
+        assert await queue.attempts.filter(F("job_ulid") == c.ulid).count() == 0
+        assert await queue.attempts.count() == 3
 
     @pytest.mark.parametrize("lease_duration", [600, 30])
     async def test_batch_claim_leases_for_each_jobs_own_lease(self, db, lease_duration):
@@ -304,9 +304,9 @@ class TestClaimJobsIsOneWrite:
         assert [j.ulid for j in claimed] == [job.ulid, default_job.ulid]
         assert claimed[0].lease_expires_at - fixed_now == lease_duration
         assert claimed[1].lease_expires_at - fixed_now == 300
-        stored = await Job.query().filter(F("ulid") == job.ulid).first()
+        stored = await q.jobs.filter(F("ulid") == job.ulid).first()
         assert stored.lease_expires_at - fixed_now == lease_duration
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await q.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].lease_expires_at - fixed_now == lease_duration
 

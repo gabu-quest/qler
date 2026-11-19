@@ -43,25 +43,23 @@ class TestUniqueJobs:
         assert job1.ulid == job2.ulid == job3.ulid
         assert job1.status == JobStatus.PENDING.value
         # DB-level proof: only one row exists
-        count = await Job.query().filter(F("unique_key") == tw.task_path).count()
+        count = await queue.jobs.filter(F("unique_key") == tw.task_path).count()
         assert count == 1
 
     async def test_unique_returns_existing_running(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.RUNNING.value)
+        await queue.jobs.filter(F("ulid") == job1.ulid).update_one(status=JobStatus.RUNNING.value)
         job2 = await tw.enqueue()
         assert job1.ulid == job2.ulid
         assert job2.status == JobStatus.RUNNING.value
-        count = await Job.query().filter(F("unique_key") == tw.task_path).count()
+        count = await queue.jobs.filter(F("unique_key") == tw.task_path).count()
         assert count == 1
 
     async def test_unique_allows_after_completed(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await (
-            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
-        )
+        await queue.jobs.filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
         job2 = await tw.enqueue()
         assert job1.ulid != job2.ulid
         assert job2.status == JobStatus.PENDING.value
@@ -69,7 +67,7 @@ class TestUniqueJobs:
     async def test_unique_allows_after_failed(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.FAILED.value)
+        await queue.jobs.filter(F("ulid") == job1.ulid).update_one(status=JobStatus.FAILED.value)
         job2 = await tw.enqueue()
         assert job1.ulid != job2.ulid
         assert job2.status == JobStatus.PENDING.value
@@ -77,9 +75,7 @@ class TestUniqueJobs:
     async def test_unique_allows_after_cancelled(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         job1 = await tw.enqueue()
-        await (
-            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.CANCELLED.value)
-        )
+        await queue.jobs.filter(F("ulid") == job1.ulid).update_one(status=JobStatus.CANCELLED.value)
         job2 = await tw.enqueue()
         assert job1.ulid != job2.ulid
         assert job2.status == JobStatus.PENDING.value
@@ -123,7 +119,7 @@ class TestUniqueKeyFunction:
         job1 = await tw.enqueue("order-1")
         job2 = await tw.enqueue("order-1")
         assert job1.ulid == job2.ulid
-        count = await Job.query().filter(F("unique_key") == "sync:order-1").count()
+        count = await queue.jobs.filter(F("unique_key") == "sync:order-1").count()
         assert count == 1
 
     async def test_unique_key_allows_after_terminal(self, queue):
@@ -134,9 +130,7 @@ class TestUniqueKeyFunction:
             unique_key=lambda order_id: f"sync:{order_id}",
         )
         job1 = await tw.enqueue("order-1")
-        await (
-            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
-        )
+        await queue.jobs.filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
         job2 = await tw.enqueue("order-1")
         assert job1.ulid != job2.ulid
         assert job2.status == JobStatus.PENDING.value
@@ -183,9 +177,7 @@ class TestUniqueWithOtherFeatures:
         # Enqueue with both idempotency key and unique key
         job1 = await tw.enqueue("order-1", _idempotency_key="idem-1")
         # Complete the job so uniqueness wouldn't block
-        await (
-            Job.query().filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
-        )
+        await queue.jobs.filter(F("ulid") == job1.ulid).update_one(status=JobStatus.COMPLETED.value)
         # Re-enqueue with same idempotency key — should return existing (completed)
         # because idempotency checks all non-cancelled states
         job2 = await tw.enqueue("order-1", _idempotency_key="idem-1")
@@ -220,7 +212,7 @@ class TestUniqueWithOtherFeatures:
         assert len(results) == 2
         assert results[0].ulid == job1.ulid
         assert results[1].ulid == job1.ulid
-        count = await Job.query().filter(F("unique_key") == tw.task_path).count()
+        count = await queue.jobs.filter(F("unique_key") == tw.task_path).count()
         assert count == 1
 
 
@@ -246,7 +238,7 @@ class TestUniqueConfig:
         assert job.unique_key == tw.task_path
 
         # Reload from DB
-        reloaded = await Job.query().filter(F("ulid") == job.ulid).first()
+        reloaded = await queue.jobs.filter(F("ulid") == job.ulid).first()
         assert reloaded is not None
         assert reloaded.ulid == job.ulid
         assert reloaded.unique_key == tw.task_path
@@ -280,8 +272,8 @@ class TestUniqueConfig:
 # ======================================================================
 
 
-async def _unique_rows(key: str) -> int:
-    return await Job.query().filter(F("unique_key") == key).count()
+async def _unique_rows(queue: Queue, key: str) -> int:
+    return await queue.jobs.filter(F("unique_key") == key).count()
 
 
 async def _failed_job_with_key(q, key: str) -> Job:
@@ -302,7 +294,7 @@ class TestUniqueKeyMakesOneJob:
     async def test_eight_concurrent_enqueues_make_one_job(self, disk_queue):
         jobs = await asyncio.gather(*[disk_queue.enqueue("t", unique_key="u1") for _ in range(8)])
         assert len({j.ulid for j in jobs}) == 1
-        assert await _unique_rows("u1") == 1
+        assert await _unique_rows(disk_queue, "u1") == 1
 
     async def test_two_queues_on_one_file_make_one_job(self, tmp_path):
         path = str(tmp_path / "two.db")
@@ -322,7 +314,7 @@ class TestUniqueKeyMakesOneJob:
         second = [{"task_path": "t", "unique_key": f"m{i}"} for i in range(5, 15)]
         a, b = await asyncio.gather(disk_queue.enqueue_many(first), disk_queue.enqueue_many(second))
         for i in range(15):
-            assert await _unique_rows(f"m{i}") == 1
+            assert await _unique_rows(disk_queue, f"m{i}") == 1
         assert [j.ulid for j in a[5:]] == [j.ulid for j in b[:5]]
 
     async def test_enqueue_and_enqueue_many_at_once(self, disk_queue):
@@ -330,7 +322,7 @@ class TestUniqueKeyMakesOneJob:
             disk_queue.enqueue("t", unique_key="mix"),
             disk_queue.enqueue_many([{"task_path": "t", "unique_key": "mix"}]),
         )
-        assert await _unique_rows("mix") == 1
+        assert await _unique_rows(disk_queue, "mix") == 1
         assert many[0].ulid == one.ulid
 
     async def test_completed_key_can_be_used_again_with_index(self, disk_queue):
@@ -341,7 +333,7 @@ class TestUniqueKeyMakesOneJob:
         await disk_queue.complete_job(claimed, "w1", result=None)
         job2 = await disk_queue.enqueue("t", unique_key="again")
         assert job2.ulid != job1.ulid
-        assert await _unique_rows("again") == 2
+        assert await _unique_rows(disk_queue, "again") == 2
         names = {i["name"] for i in await disk_queue.db.list_indexes("qler_jobs")}
         assert "idx_qler_jobs_unique_uq" in names
 
@@ -359,7 +351,7 @@ class TestUniqueKeyMakesOneJob:
             created_at=first.created_at,
             updated_at=first.created_at,
         )
-        await second.save()
+        await second.save(db=old.db)
         await old.close()
 
         caplog.set_level(logging.ERROR, logger="qler.queue")
@@ -376,7 +368,7 @@ class TestUniqueKeyMakesOneJob:
 
             again = await q.enqueue("t", unique_key="dup-u")
             assert again.ulid == first.ulid
-            assert await _unique_rows("dup-u") == 2
+            assert await _unique_rows(q, "dup-u") == 2
 
             assert await q.cancel_job(second) is True
         finally:
@@ -399,7 +391,9 @@ class TestUniqueKeyMakesOneJob:
         await old.db.drop_index("idx_qler_jobs_unique_uq")
         for i in range(23):
             for n in range(2):
-                await Job(ulid=f"01H{i:02d}{n}" + "0" * 20, task="t", unique_key=f"k{i:02d}").save()
+                await Job(ulid=f"01H{i:02d}{n}" + "0" * 20, task="t", unique_key=f"k{i:02d}").save(
+                    db=old.db
+                )
         await old.close()
 
         caplog.set_level(logging.ERROR, logger="qler.queue")
@@ -423,7 +417,7 @@ class TestUniqueKeyMakesOneJob:
         assert info.value.unique_key == "busy"
         assert info.value.active_ulid == active.ulid
         assert active.ulid in info.value.message
-        row = await Job.query().filter(F("ulid") == failed.ulid).first()
+        row = await disk_queue.jobs.filter(F("ulid") == failed.ulid).first()
         assert row is not None
         assert row.status == JobStatus.FAILED.value
 
@@ -434,7 +428,7 @@ class TestUniqueKeyMakesOneJob:
             await disk_queue.replay_job(failed)
         assert info.value.unique_key == "busy2"
         assert info.value.active_ulid == active.ulid
-        row = await Job.query().filter(F("ulid") == failed.ulid).first()
+        row = await disk_queue.jobs.filter(F("ulid") == failed.ulid).first()
         assert row is not None
         assert row.status == JobStatus.FAILED.value
 
@@ -455,7 +449,7 @@ class TestUniqueKeyInOneBatch:
             ]
         )
         assert a.ulid == b.ulid
-        assert await _unique_rows("k1") == 1
+        assert await _unique_rows(queue, "k1") == 1
 
     async def test_keys_a_b_a(self, queue):
         res = await queue.enqueue_many(
@@ -468,23 +462,23 @@ class TestUniqueKeyInOneBatch:
         assert len(res) == 3
         assert res[0].ulid == res[2].ulid
         assert res[0].ulid != res[1].ulid
-        assert await _unique_rows("a") == 1
-        assert await _unique_rows("b") == 1
-        assert await Job.query().count() == 2
+        assert await _unique_rows(queue, "a") == 1
+        assert await _unique_rows(queue, "b") == 1
+        assert await queue.jobs.count() == 2
 
     async def test_task_wrapper_unique_true(self, queue):
         tw = TaskWrapper(_unique_noop, queue, unique=True)
         res = await tw.enqueue_many([{}, {}])
         assert len(res) == 2
         assert res[0].ulid == res[1].ulid
-        assert await _unique_rows(tw.task_path) == 1
+        assert await _unique_rows(queue, tw.task_path) == 1
 
     async def test_both_keys_repeated(self, queue):
         spec = {"task_path": "t", "idempotency_key": "i1", "unique_key": "u1"}
         a, b = await queue.enqueue_many([dict(spec), dict(spec)])
         assert a.ulid == b.ulid
-        assert await _unique_rows("u1") == 1
-        assert await Job.query().count() == 1
+        assert await _unique_rows(queue, "u1") == 1
+        assert await queue.jobs.count() == 1
 
 
 class TestKeyIndexText:

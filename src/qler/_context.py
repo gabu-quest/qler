@@ -51,6 +51,7 @@ async def set_progress(percent: int, message: str = "") -> None:
     Raises:
         RuntimeError: If called outside a task execution context.
         ValueError: If percent is not in 0–100 range.
+        NotBoundError: (sqler) the current job was never enqueued or read.
     """
     from sqler import F
 
@@ -68,7 +69,7 @@ async def set_progress(percent: int, message: str = "") -> None:
         )
 
     await (
-        Job.query()
+        Job.beside(job)
         .filter((F("ulid") == job.ulid) & (F("worker_id") == job.worker_id))
         .update_one(
             progress=percent,
@@ -85,6 +86,9 @@ async def is_cancellation_requested() -> bool:
     """Check if the current job has cancellation requested. Queries the DB.
 
     Returns False (not raises) when called outside a task context.
+
+    Raises:
+        NotBoundError: (sqler) the current job was never enqueued or read.
     """
     from sqler import F
 
@@ -93,7 +97,7 @@ async def is_cancellation_requested() -> bool:
     job = _current_job.get()
     if job is None:
         return False
-    refreshed = await Job.query().filter(F("ulid") == job.ulid).first()
+    refreshed = await Job.beside(job).filter(F("ulid") == job.ulid).first()
     if refreshed is None:
         return False
     # Only trust the flag if this worker still owns the job

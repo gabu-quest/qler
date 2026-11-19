@@ -95,17 +95,12 @@ class TestArchivalCleansUpReverseMap:
 
         from qler._time import now_epoch
         from qler.enums import JobStatus
-        from qler.models.job import Job
 
         now = now_epoch()
-        await (
-            Job.query()
-            .filter(F("ulid") == parent.ulid)
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now - 600,  # older than default 300s threshold
-                updated_at=now,
-            )
+        await queue.jobs.filter(F("ulid") == parent.ulid).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now - 600,  # older than default 300s threshold
+            updated_at=now,
         )
 
         # Confirm dep row exists before archival

@@ -343,12 +343,8 @@ class TestCounters:
         assert claimed is not None
 
         # Expire the lease by backdating it
-        await (
-            Job.query()
-            .filter(F("ulid") == claimed.ulid)
-            .update_one(
-                lease_expires_at=now_epoch() - 100,
-            )
+        await mq.jobs.filter(F("ulid") == claimed.ulid).update_one(
+            lease_expires_at=now_epoch() - 100,
         )
 
         recovered = await mq.recover_expired_leases()
@@ -411,7 +407,7 @@ class TestHistogram:
         async def stop_after_one():
             while True:
                 await asyncio.sleep(0.05)
-                jobs = await Job.query().all()
+                jobs = await mq.jobs.all()
                 if any(j.status == JobStatus.COMPLETED.value for j in jobs):
                     worker._running = False
                     return
@@ -442,7 +438,7 @@ class TestHistogram:
         async def stop_after_one():
             while True:
                 await asyncio.sleep(0.05)
-                jobs = await Job.query().all()
+                jobs = await mq.jobs.all()
                 if any(j.status == JobStatus.FAILED.value for j in jobs):
                     worker._running = False
                     return
@@ -599,7 +595,7 @@ class TestIntegration:
         async def stop_when_done():
             while True:
                 await asyncio.sleep(0.05)
-                jobs = await Job.query().all()
+                jobs = await mq.jobs.all()
                 if any(j.status == JobStatus.COMPLETED.value for j in jobs):
                     worker._running = False
                     return

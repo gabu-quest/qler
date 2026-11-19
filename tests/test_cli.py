@@ -15,7 +15,6 @@ from qler._time import now_epoch
 from qler.cli import cli
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.models.attempt import JobAttempt
-from qler.models.job import Job
 from qler.queue import Queue
 
 
@@ -47,27 +46,23 @@ def populated_db(db_path):
         # 1 completed
         j = await q.enqueue("myapp.tasks.done", queue_name="default")
         now = now_epoch()
-        await (
-            Job.query()
-            .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-            .update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now,
-                updated_at=now,
-            )
+        await q.jobs.filter(
+            (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+        ).update_one(
+            status=JobStatus.COMPLETED.value,
+            finished_at=now,
+            updated_at=now,
         )
         # 1 failed
         j2 = await q.enqueue("myapp.tasks.fail", queue_name="default")
-        await (
-            Job.query()
-            .filter((F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value))
-            .update_one(
-                status=JobStatus.FAILED.value,
-                last_error="Something went wrong",
-                last_failure_kind=FailureKind.EXCEPTION.value,
-                finished_at=now,
-                updated_at=now,
-            )
+        await q.jobs.filter(
+            (F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value)
+        ).update_one(
+            status=JobStatus.FAILED.value,
+            last_error="Something went wrong",
+            last_failure_kind=FailureKind.EXCEPTION.value,
+            finished_at=now,
+            updated_at=now,
         )
         await q.close()
 
@@ -410,7 +405,7 @@ class TestBackupCommand:
         async def _check():
             q = Queue(dest)
             await q.init_db()
-            jobs = await Job.query().all()
+            jobs = await q.jobs.all()
             await q.close()
             return jobs
 
@@ -465,7 +460,7 @@ class TestBackupCommand:
         async def _check():
             q = Queue(dest)
             await q.init_db()
-            count = await Job.query().count()
+            count = await q.jobs.count()
             await q.close()
             return count
 
@@ -655,11 +650,9 @@ class TestJobs:
             j = await q.enqueue("tasks.old", queue_name="default")
             # Manually set created_at to 2 hours ago
             old_ts = now_epoch() - 7200
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(created_at=old_ts, updated_at=old_ts)
-            )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(created_at=old_ts, updated_at=old_ts)
             await q.close()
 
         asyncio.run(_setup())
@@ -737,11 +730,9 @@ class TestJob:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.hello")
             # Corrupt the payload
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(payload_json="NOT VALID JSON")
-            )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(payload_json="NOT VALID JSON")
             await q.close()
             return j.ulid
 
@@ -758,16 +749,14 @@ class TestJob:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.fail")
             now = now_epoch()
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.FAILED.value,
-                    last_error="Division by zero",
-                    last_failure_kind=FailureKind.EXCEPTION.value,
-                    finished_at=now,
-                    updated_at=now,
-                )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.FAILED.value,
+                last_error="Division by zero",
+                last_failure_kind=FailureKind.EXCEPTION.value,
+                finished_at=now,
+                updated_at=now,
             )
             await q.close()
             return j.ulid
@@ -821,7 +810,7 @@ class TestAttempts:
                 failure_kind=FailureKind.EXCEPTION.value,
                 error="Timeout",
             )
-            await a1.save()
+            await a1.save(db=q.db)
             a2 = JobAttempt(
                 ulid=generate_ulid(),
                 job_ulid=j.ulid,
@@ -831,7 +820,7 @@ class TestAttempts:
                 started_at=now - 4,
                 finished_at=now,
             )
-            await a2.save()
+            await a2.save(db=q.db)
             await q.close()
             return j.ulid
 
@@ -867,7 +856,7 @@ class TestAttempts:
                 started_at=now - 5,
                 finished_at=now,
             )
-            await a.save()
+            await a.save(db=q.db)
             await q.close()
             return j.ulid
 
@@ -897,15 +886,13 @@ class TestRetry:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.fail")
             now = now_epoch()
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.FAILED.value,
-                    last_error="err",
-                    finished_at=now,
-                    updated_at=now,
-                )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.FAILED.value,
+                last_error="err",
+                finished_at=now,
+                updated_at=now,
             )
             await q.close()
             return j.ulid
@@ -947,15 +934,13 @@ class TestRetry:
             now = now_epoch()
             for i in range(3):
                 j = await q.enqueue(f"myapp.tasks.fail_{i}")
-                await (
-                    Job.query()
-                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                    .update_one(
-                        status=JobStatus.FAILED.value,
-                        last_error="err",
-                        finished_at=now,
-                        updated_at=now,
-                    )
+                await q.jobs.filter(
+                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.FAILED.value,
+                    last_error="err",
+                    finished_at=now,
+                    updated_at=now,
                 )
                 ulids.append(j.ulid)
             await q.close()
@@ -980,15 +965,13 @@ class TestRetry:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.fail")
             now = now_epoch()
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.FAILED.value,
-                    last_error="err",
-                    finished_at=now,
-                    updated_at=now,
-                )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.FAILED.value,
+                last_error="err",
+                finished_at=now,
+                updated_at=now,
             )
             await q.close()
             return j.ulid
@@ -1010,15 +993,13 @@ class TestRetry:
             # 2 failed with task_a, 1 failed with task_b
             for task_name in ["task_a", "task_a", "task_b"]:
                 j = await q.enqueue(f"myapp.{task_name}")
-                await (
-                    Job.query()
-                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                    .update_one(
-                        status=JobStatus.FAILED.value,
-                        last_error="err",
-                        finished_at=now,
-                        updated_at=now,
-                    )
+                await q.jobs.filter(
+                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.FAILED.value,
+                    last_error="err",
+                    finished_at=now,
+                    updated_at=now,
                 )
             await q.close()
 
@@ -1065,14 +1046,12 @@ class TestCancel:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.done")
             now = now_epoch()
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.COMPLETED.value,
-                    finished_at=now,
-                    updated_at=now,
-                )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.COMPLETED.value,
+                finished_at=now,
+                updated_at=now,
             )
             await q.close()
             return j.ulid
@@ -1168,27 +1147,23 @@ class TestPurge:
             old_ts = now_epoch() - 86400 * 10  # 10 days ago
             for i in range(3):
                 j = await q.enqueue(f"myapp.tasks.old_{i}")
-                await (
-                    Job.query()
-                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                    .update_one(
-                        status=JobStatus.COMPLETED.value,
-                        created_at=old_ts,
-                        finished_at=old_ts,
-                        updated_at=old_ts,
-                    )
+                await q.jobs.filter(
+                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.COMPLETED.value,
+                    created_at=old_ts,
+                    finished_at=old_ts,
+                    updated_at=old_ts,
                 )
             # 1 recent completed (should not be purged)
             j = await q.enqueue("myapp.tasks.recent")
             now = now_epoch()
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.COMPLETED.value,
-                    finished_at=now,
-                    updated_at=now,
-                )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.COMPLETED.value,
+                finished_at=now,
+                updated_at=now,
             )
             await q.close()
 
@@ -1207,27 +1182,23 @@ class TestPurge:
             # 2 old failed
             for i in range(2):
                 j = await q.enqueue(f"myapp.tasks.fail_{i}")
-                await (
-                    Job.query()
-                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                    .update_one(
-                        status=JobStatus.FAILED.value,
-                        created_at=old_ts,
-                        finished_at=old_ts,
-                        updated_at=old_ts,
-                    )
-                )
-            # 1 old completed (should not be purged when filtering by failed)
-            j = await q.enqueue("myapp.tasks.done")
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.COMPLETED.value,
+                await q.jobs.filter(
+                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.FAILED.value,
                     created_at=old_ts,
                     finished_at=old_ts,
                     updated_at=old_ts,
                 )
+            # 1 old completed (should not be purged when filtering by failed)
+            j = await q.enqueue("myapp.tasks.done")
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.COMPLETED.value,
+                created_at=old_ts,
+                finished_at=old_ts,
+                updated_at=old_ts,
             )
             await q.close()
 
@@ -1262,15 +1233,13 @@ class TestPurge:
             await q.init_db()
             old_ts = now_epoch() - 86400 * 10
             j = await q.enqueue("myapp.tasks.old")
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.COMPLETED.value,
-                    created_at=old_ts,
-                    finished_at=old_ts,
-                    updated_at=old_ts,
-                )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.COMPLETED.value,
+                created_at=old_ts,
+                finished_at=old_ts,
+                updated_at=old_ts,
             )
             # Add an attempt for the job
             a = JobAttempt(
@@ -1282,7 +1251,7 @@ class TestPurge:
                 started_at=old_ts,
                 finished_at=old_ts,
             )
-            await a.save()
+            await a.save(db=q.db)
             await q.close()
             return j.ulid
 
@@ -1299,7 +1268,7 @@ class TestPurge:
             await q.init_db()
             from sqler import F
 
-            remaining = await JobAttempt.query().filter(F("job_ulid") == job_ulid).all()
+            remaining = await q.attempts.filter(F("job_ulid") == job_ulid).all()
             await q.close()
             return len(remaining)
 
@@ -1341,15 +1310,13 @@ class TestDoctor:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.stuck")
             expired_ts = now_epoch() - 600  # 10 min ago
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(
-                    status=JobStatus.RUNNING.value,
-                    worker_id="dead-worker",
-                    lease_expires_at=expired_ts,
-                    updated_at=now_epoch(),
-                )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(
+                status=JobStatus.RUNNING.value,
+                worker_id="dead-worker",
+                lease_expires_at=expired_ts,
+                updated_at=now_epoch(),
             )
             await q.close()
 
@@ -1367,11 +1334,9 @@ class TestDoctor:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.stale")
             stale_ts = now_epoch() - 86400 * 2  # 2 days ago
-            await (
-                Job.query()
-                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                .update_one(created_at=stale_ts, updated_at=stale_ts)
-            )
+            await q.jobs.filter(
+                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+            ).update_one(created_at=stale_ts, updated_at=stale_ts)
             await q.close()
 
         asyncio.run(_setup())
@@ -1693,12 +1658,8 @@ class TestDLQCli:
                     claimed, "w1", ValueError("old"), failure_kind=FailureKind.EXCEPTION
                 )
                 # Backdate created_at
-                await (
-                    Job.query()
-                    .filter(F("ulid") == j.ulid)
-                    .update_one(
-                        created_at=old_ts,
-                    )
+                await q.jobs.filter(F("ulid") == j.ulid).update_one(
+                    created_at=old_ts,
                 )
 
             # 1 recent DLQ job
@@ -2105,27 +2066,23 @@ async def counted_task():
                 await q.enqueue(task_path)
                 # 1 completed (should NOT count)
                 j = await q.enqueue(task_path)
-                await (
-                    Job.query()
-                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
-                    .update_one(
-                        status=JobStatus.COMPLETED.value,
-                        finished_at=now,
-                        updated_at=now,
-                    )
+                await q.jobs.filter(
+                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.COMPLETED.value,
+                    finished_at=now,
+                    updated_at=now,
                 )
                 # 1 failed (should NOT count)
                 j2 = await q.enqueue(task_path)
-                await (
-                    Job.query()
-                    .filter((F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value))
-                    .update_one(
-                        status=JobStatus.FAILED.value,
-                        last_error="err",
-                        last_failure_kind=FailureKind.EXCEPTION.value,
-                        finished_at=now,
-                        updated_at=now,
-                    )
+                await q.jobs.filter(
+                    (F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value)
+                ).update_one(
+                    status=JobStatus.FAILED.value,
+                    last_error="err",
+                    last_failure_kind=FailureKind.EXCEPTION.value,
+                    finished_at=now,
+                    updated_at=now,
                 )
                 await q.close()
 

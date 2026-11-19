@@ -12,8 +12,6 @@ from qler.exceptions import (
     PayloadTooLargeError,
     TaskNotRegisteredError,
 )
-from qler.models.attempt import JobAttempt
-from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 
@@ -233,7 +231,7 @@ class TestImmediateTaskResolution:
             await imm_queue.enqueue("some.nonexistent.task", args=(1, 2))
 
         # Job should be FAILED, not left as a ghost RUNNING record
-        jobs = await Job.query().filter(F("task") == "some.nonexistent.task").all()
+        jobs = await imm_queue.jobs.filter(F("task") == "some.nonexistent.task").all()
         assert len(jobs) == 1
         assert jobs[0].status == JobStatus.FAILED.value
         assert jobs[0].last_failure_kind == FailureKind.TASK_NOT_FOUND.value
@@ -266,7 +264,7 @@ class TestImmediateAttemptRecord:
         wrapper = imm_queue._tasks[f"{__name__}.greet_task"]
         job = await wrapper.enqueue("world")
 
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await imm_queue.attempts.filter(F("job_ulid") == job.ulid).all()
 
         assert len(attempts) == 1
         attempt = attempts[0]
@@ -280,7 +278,7 @@ class TestImmediateAttemptRecord:
         wrapper = imm_queue._tasks[f"{__name__}.fail_oops_task"]
         job = await wrapper.enqueue()
 
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await imm_queue.attempts.filter(F("job_ulid") == job.ulid).all()
 
         assert len(attempts) == 1
         attempt = attempts[0]
@@ -302,7 +300,7 @@ class TestImmediateCorrelation:
         assert job.correlation_id == "req-abc-123"
         assert job.status == JobStatus.COMPLETED.value
 
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await imm_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.COMPLETED.value
         assert attempts[0].worker_id == "__immediate__"
@@ -424,7 +422,7 @@ class TestImmediateTimeout:
         wrapped = task(imm_timeout_queue, timeout=1)(imm_timeout_slow_task)
         job = await wrapped.enqueue()
 
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await imm_timeout_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert "timed out" in attempts[0].error
@@ -443,9 +441,9 @@ class TestImmediateFailWriteRaises:
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await imm_queue.enqueue(f"{__name__}.boom_task")
 
-        jobs = await Job.query().all()
+        jobs = await imm_queue.jobs.all()
         assert [j.status for j in jobs] == [JobStatus.RUNNING.value]
-        attempts = await JobAttempt.query().all()
+        attempts = await imm_queue.attempts.all()
         assert [a.status for a in attempts] == [AttemptStatus.RUNNING.value]
 
 
@@ -467,7 +465,7 @@ class TestImmediateRepeatedKeyInBatch:
         assert [r.status for r in results] == [JobStatus.COMPLETED.value] * 2
         assert [r.result for r in results] == [1, 1]
         assert _call_count == 1
-        attempts = await JobAttempt.query().all()
+        attempts = await imm_queue.attempts.all()
         assert len(attempts) == 1
 
 
@@ -499,7 +497,7 @@ class TestImmediateMatchedPendingJob:
         new_runs = len(results) - 1
         assert [r.status for r in results[1:]] == [JobStatus.COMPLETED.value] * new_runs
         assert _call_count == new_runs
-        attempts = await JobAttempt.query().all()
+        attempts = await other.attempts.all()
         assert [a.job_ulid for a in attempts] == [r.ulid for r in results[1:]]
-        stored = await Job.query().filter(F("ulid") == pending.ulid).first()
+        stored = await other.jobs.filter(F("ulid") == pending.ulid).first()
         assert stored.status == JobStatus.PENDING.value

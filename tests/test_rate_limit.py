@@ -9,7 +9,6 @@ from sqler import AsyncSQLerDB, F
 from qler.enums import JobStatus
 from qler.exceptions import ConfigurationError
 from qler.models.bucket import RateLimitBucket
-from qler.models.job import Job
 from qler.queue import Queue
 from qler.rate_limit import parse_rate, try_acquire
 from qler.task import task
@@ -329,7 +328,7 @@ class TestClaimRateLimit:
         assert claimed2 is None  # Rate limited, returned None
 
         # The requeued job should have a delayed ETA
-        remaining = await Job.query().filter(F("status") == JobStatus.PENDING.value).all()
+        remaining = await queue.jobs.filter(F("status") == JobStatus.PENDING.value).all()
         assert len(remaining) == 2
         # At least one should have a future ETA (delayed)
         future_etas = [j for j in remaining if j.eta > j1.eta]
