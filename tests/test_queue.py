@@ -170,6 +170,94 @@ class TestEnqueue:
         assert before <= job.created_at <= after
         assert before <= job.updated_at <= after
 
+    @pytest.mark.parametrize("task_path", ["", None])
+    async def test_falsy_task_path_is_refused_as_in_the_batch(self, queue, task_path):
+        with pytest.raises(ConfigurationError, match=r"^task_path is required$"):
+            await queue.enqueue(task_path)
+        assert await Job.query().count() == 0
+
+    async def test_int_in_depends_on_is_refused_with_a_clear_error(self, queue):
+        await queue.enqueue("parent")
+        with pytest.raises(
+            DependencyError,
+            match=r"^Integer dependency index 0 is only meaningful in enqueue_many; "
+            r"enqueue takes job ULIDs$",
+        ) as info:
+            await queue.enqueue("child", depends_on=[0])
+        assert info.value.dependency_ulid == "0"
+        assert await Job.query().count() == 1
+        assert await JobDependency.using(queue.db).count() == 0
+
+
+class _EnqueuedEvents(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "event", None) == "job.enqueued":
+            self.records.append(record)
+
+
+class TestBatchOfOneIsTheSingleCall:
+    """enqueue_many([spec]) gives what enqueue(**spec) gives, in a list, with batch=True."""
+
+    _FIELDS = (
+        "status", "queue_name", "priority", "task", "payload_json", "max_retries",
+        "retry_delay", "lease_duration", "correlation_id", "idempotency_key",
+        "unique_key", "dependencies", "pending_dep_count", "timeout", "attempts",
+    )
+
+    async def test_same_job_and_event_apart_from_batch(self, queue):
+        from qler.lifecycle import logger as lifecycle_logger
+
+        parent = await queue.enqueue("parent")
+        spec = {
+            "args": (1, "a"), "kwargs": {"k": 2}, "queue_name": "q1", "priority": 4,
+            "max_retries": 2, "retry_delay": 7, "lease_duration": 33,
+            "correlation_id": "corr", "depends_on": [parent.ulid], "timeout": 9,
+        }
+        handler = _EnqueuedEvents()
+        level = lifecycle_logger.level
+        lifecycle_logger.addHandler(handler)
+        lifecycle_logger.setLevel(logging.INFO)
+        try:
+            one = await queue.enqueue("t", idempotency_key="i1", unique_key="u1", **spec)
+            many = await queue.enqueue_many(
+                [{"task_path": "t", "idempotency_key": "i2", "unique_key": "u2", **spec}]
+            )
+        finally:
+            lifecycle_logger.removeHandler(handler)
+            lifecycle_logger.setLevel(level)
+
+        assert len(many) == 1
+        for f in self._FIELDS:
+            if f in ("idempotency_key", "unique_key"):
+                continue
+            assert getattr(many[0], f) == getattr(one, f), f
+        assert (one.idempotency_key, one.unique_key) == ("i1", "u1")
+        assert (many[0].idempotency_key, many[0].unique_key) == ("i2", "u2")
+        assert one.pending_dep_count == 1
+        assert one.dependencies == [parent.ulid]
+        assert len(handler.records) == 2
+        single_rec, batch_rec = handler.records
+        assert single_rec.job_id == one.ulid
+        assert batch_rec.job_id == many[0].ulid
+        assert not hasattr(single_rec, "batch")
+        assert batch_rec.batch is True
+        edges = await JobDependency.using(queue.db).order_by("child_ulid").all()
+        assert [(e.parent_ulid, e.child_ulid) for e in edges] == [
+            (parent.ulid, one.ulid), (parent.ulid, many[0].ulid)
+        ]
+
+    async def test_matched_key_returns_the_existing_job_in_both(self, queue):
+        existing = await queue.enqueue("t", unique_key="same")
+        one = await queue.enqueue("t", unique_key="same")
+        many = await queue.enqueue_many([{"task_path": "t", "unique_key": "same"}])
+        assert one.ulid == existing.ulid
+        assert [j.ulid for j in many] == [existing.ulid]
+        assert await Job.query().count() == 1
+
 
 class TestEnqueueIdempotency:
     """Verify idempotency key deduplication."""
@@ -406,6 +494,61 @@ class TestClaim:
         job = await queue.claim_job("worker-1", ["default"])
         assert job is not None
         assert _ULID_PATTERN.match(job.last_attempt_id), f"Expected ULID, got {job.last_attempt_id!r}"
+
+
+async def _claim_one(queue, how):
+    if how == "claim_job":
+        return await queue.claim_job("worker-1", ["default"])
+    return await queue.claim_jobs("worker-1", ["default"], 1)
+
+
+class TestClaimOfOne:
+    """claim_job is claim_jobs(n=1): same result, same state left behind."""
+
+    @pytest.mark.parametrize("how", ["claim_job", "claim_jobs"])
+    async def test_poison_pill_returns_nothing_and_fails_the_job(self, queue, how):
+        job = await queue.enqueue("my_task")
+        # No public call writes a bad payload: corrupt it as TestPoisonPill does.
+        await Job.query().filter(F("ulid") == job.ulid).update_one(payload_json="{{{")
+
+        claimed = await _claim_one(queue, how)
+
+        assert claimed == (None if how == "claim_job" else [])
+        await job.refresh()
+        assert job.status == JobStatus.FAILED.value
+        assert job.attempts == 1
+        assert job.worker_id == ""
+        assert job.lease_expires_at is None
+        assert job.last_failure_kind == FailureKind.PAYLOAD_INVALID.value
+        attempts = await JobAttempt.query().all()
+        assert len(attempts) == 1
+        assert attempts[0].ulid == job.last_attempt_id
+        assert attempts[0].status == "failed"
+
+    @pytest.mark.parametrize("how", ["claim_job", "claim_jobs"])
+    async def test_rate_limited_returns_nothing_and_requeues_the_job(self, db, how):
+        q = Queue(db, rate_limits={"default": "1/m"})
+        await q.init_db()
+        first = await q.enqueue("my_task")
+        second = await q.enqueue("my_task")
+        got = await _claim_one(q, how)
+        got = got if how == "claim_job" else got[0]
+        assert got.ulid == first.ulid
+        before = now_epoch()
+
+        claimed = await _claim_one(q, how)
+
+        assert claimed == (None if how == "claim_job" else [])
+        await second.refresh()
+        assert second.status == JobStatus.PENDING.value
+        assert second.attempts == 0
+        assert second.worker_id == ""
+        assert second.lease_expires_at is None
+        assert before + 60 <= second.eta <= now_epoch() + 60
+        # The claim named an attempt that was never written; the requeue keeps the name.
+        assert _ULID_PATTERN.match(second.last_attempt_id)
+        attempts = await JobAttempt.query().all()
+        assert [a.job_ulid for a in attempts] == [first.ulid]
 
 
 class TestClaimIsOneWrite:

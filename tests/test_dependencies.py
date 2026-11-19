@@ -492,6 +492,72 @@ class TestCascadeCancel:
             assert refreshed.pending_dep_count == 0
 
 
+def _u(letter: str) -> str:
+    """A fixed 26-character ulid, so the tree's order is known: A < B < C < D < E < P."""
+    return "01J" + letter * 23
+
+
+async def _shared_child_tree(queue):
+    """P; A and B wait on P; E waits on A; D waits on B; C waits on A, B and E.
+
+    C has two parents on level 1 (A and B) and one on level 2 (E). Built with explicit
+    ulids through enqueue_many, the root in its own queue so a claim takes it alone.
+    """
+    await queue.enqueue_many([
+        {"task_path": "t", "queue_name": "root", "ulid": _u("P")},
+        {"task_path": "t", "ulid": _u("A"), "depends_on": [_u("P")]},
+        {"task_path": "t", "ulid": _u("B"), "depends_on": [_u("P")]},
+        {"task_path": "t", "ulid": _u("E"), "depends_on": [_u("A")]},
+        {"task_path": "t", "ulid": _u("D"), "depends_on": [_u("B")]},
+        {"task_path": "t", "ulid": _u("C"), "depends_on": [_u("A"), _u("B"), _u("E")]},
+    ])
+    root = await queue.claim_job("worker-1", ["root"])
+    assert root.ulid == _u("P")
+    return root
+
+
+class TestCascadeReadsALevelAtATime:
+    """The cascade reads the edges of a whole level per query and keeps its order and
+    the parent each cancelled job names."""
+
+    async def test_order_and_named_parent_with_a_shared_child(self, queue):
+        root = await _shared_child_tree(queue)
+        async with queue.db.transaction():
+            cancelled = await queue._cascade_cancel_dependents(root.ulid)
+
+        assert cancelled == [_u("A"), _u("B"), _u("C"), _u("E"), _u("D")]
+        named = {
+            j.ulid: j.last_error
+            for j in await Job.query().filter(F("status") == JobStatus.CANCELLED.value).all()
+        }
+        assert named == {
+            _u("A"): f"Dependency {_u('P')} failed/cancelled",
+            _u("B"): f"Dependency {_u('P')} failed/cancelled",
+            _u("C"): f"Dependency {_u('A')} failed/cancelled",
+            _u("E"): f"Dependency {_u('A')} failed/cancelled",
+            _u("D"): f"Dependency {_u('B')} failed/cancelled",
+        }
+
+    async def test_one_edge_read_per_level(self, queue, monkeypatch):
+        root = await _shared_child_tree(queue)
+        reads = {"n": 0}
+        original = Queue._dependency_edges
+
+        def counted(self):
+            reads["n"] += 1
+            return original.fget(self)
+
+        monkeypatch.setattr(Queue, "_dependency_edges", property(counted))
+        await queue.fail_job(root, "worker-1", ValueError("boom"))
+
+        # Levels [P], [A, B], [C, E, D]: three reads (one per job would be six).
+        assert reads["n"] == 3
+        statuses = [
+            j.status for j in await Job.query().order_by("ulid").all()
+        ]
+        assert statuses == [JobStatus.CANCELLED.value] * 5 + [JobStatus.FAILED.value]
+
+
 # ---------------------------------------------------------------------------
 # TestWaitForDependencies
 # ---------------------------------------------------------------------------
