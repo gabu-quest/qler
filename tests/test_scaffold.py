@@ -59,31 +59,23 @@ def test_enums_importable():
 
 def test_exceptions_hierarchy():
     from qler import (
-        ClaimConflictError,
         ConfigurationError,
         JobCancelledError,
         JobFailedError,
-        JobNotFoundError,
         PayloadNotSerializableError,
         PayloadTooLargeError,
         QlerError,
-        SignatureMismatchError,
-        TaskNotFoundError,
         TaskNotRegisteredError,
         UniqueKeyConflictError,
     )
 
     # All exceptions inherit from QlerError
     for exc_cls in (
-        JobNotFoundError,
         JobFailedError,
         JobCancelledError,
-        TaskNotFoundError,
         TaskNotRegisteredError,
-        SignatureMismatchError,
         PayloadTooLargeError,
         PayloadNotSerializableError,
-        ClaimConflictError,
         ConfigurationError,
         UniqueKeyConflictError,
     ):
@@ -105,28 +97,16 @@ def test_exceptions_hierarchy():
 
     # Catch subclass as QlerError
     with pytest.raises(QlerError, match="sub error"):
-        raise JobNotFoundError("sub error", ulid="01ABC")
+        raise JobFailedError("sub error", ulid="01ABC")
 
     # Contextual attributes on subclasses
-    err = JobNotFoundError("not found", ulid="01ABC")
-    assert err.ulid == "01ABC"
-
     err = JobFailedError("failed", ulid="01DEF", failure_kind="exception")
     assert err.ulid == "01DEF"
     assert err.failure_kind == "exception"
 
-    err = TaskNotFoundError("no module", task_path="app.tasks.missing")
-    assert err.task_path == "app.tasks.missing"
-
-    err = SignatureMismatchError("wrong args", task_path="app.tasks.func")
-    assert err.task_path == "app.tasks.func"
-
     err = PayloadTooLargeError("too big", size=2_000_000, max_size=1_000_000)
     assert err.size == 2_000_000
     assert err.max_size == 1_000_000
-
-    err = ClaimConflictError("race", ulid="01GHI")
-    assert err.ulid == "01GHI"
 
 
 def test_cli_entrypoint():
