@@ -351,6 +351,49 @@ class TestWorkerLeaseRenewal:
         assert job.ulid in failures[0].getMessage()
         assert "database is locked" in failures[0].getMessage()
 
+    async def test_running_worker_recovers_a_job_whose_lease_ended(
+        self, queue, monkeypatch, caplog
+    ):
+        """The loop, not the start-up pass, resets a job claimed by a worker that is gone."""
+        job = await queue.enqueue("my_task", queue_name="orphans", lease_duration=1)
+        claimed = await queue.claim_job("ghost-worker", ["orphans"])
+        assert claimed is not None and claimed.ulid == job.ulid
+
+        real_recover = Queue.recover_expired_leases
+        results = []
+        recovered_by_loop = asyncio.Event()
+
+        async def recover_and_note(self, **kwargs):
+            count = await real_recover(self, **kwargs)
+            results.append(count)
+            if count:
+                recovered_by_loop.set()
+            return count
+
+        monkeypatch.setattr(Queue, "recover_expired_leases", recover_and_note)
+
+        w = _renewal_worker(queue, lease_recovery_interval=0.1)
+        with caplog.at_level(logging.INFO, logger="qler.lifecycle"):
+            worker_task = asyncio.create_task(w.run())
+            try:
+                await asyncio.wait_for(recovered_by_loop.wait(), timeout=10.0)
+            finally:
+                await _stop(w, worker_task)
+
+        # The start-up pass found nothing (the lease was still running); one loop pass recovered it.
+        assert results[0] == 0
+        assert [c for c in results if c] == [1]
+        row = await Job.query().filter(F("ulid") == job.ulid).first()
+        assert row.status == JobStatus.PENDING.value
+        assert row.worker_id == ""
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        assert [a.status for a in attempts] == [AttemptStatus.LEASE_EXPIRED.value]
+        events = [
+            r for r in caplog.records
+            if r.name == "qler.lifecycle" and r.event == "job.lease_recovered"
+        ]
+        assert [r.job_id for r in events] == [job.ulid]
+
     async def test_short_lease_job_is_never_recovered_while_running(self, db):
         """A job whose lease is far shorter than the queue default keeps it.
 
