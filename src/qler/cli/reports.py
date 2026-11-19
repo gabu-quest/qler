@@ -23,6 +23,7 @@ from qler.cli.helpers import (
     _run,
     _safe_json,
 )
+from qler.enums import JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 
@@ -129,7 +130,7 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
     "--status",
     "filter_status",
     type=click.Choice(
-        ["pending", "running", "completed", "failed", "cancelled"],
+        [s.value for s in JobStatus],
         case_sensitive=False,
     ),
 )

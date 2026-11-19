@@ -14,6 +14,7 @@ from qler.cli.helpers import (
     _import_modules,
     _run,
 )
+from qler.enums import ACTIVE_STATUSES
 from qler.queue import Queue
 
 # ---------------------------------------------------------------------------
@@ -35,7 +36,6 @@ def cron_cmd(
     output_json: bool,
 ) -> None:
     """List registered cron tasks with schedules and status."""
-    from sqler import F
 
     if app_string:
         q = _import_app(app_string)
@@ -52,9 +52,7 @@ def cron_cmd(
             tasks = []
             for path, cw in q._cron_tasks.items():
                 # Count active jobs for this cron task
-                active_count = await q.jobs.filter(
-                    (F("task") == path) & F("status").in_list(["pending", "running"])
-                ).count()
+                active_count = await cw._active_count()
 
                 next_run = cw.next_run()
                 tasks.append(
@@ -135,7 +133,7 @@ def tasks_cmd(
 
                 # Count active jobs (pending + running)
                 active_count = await q.jobs.filter(
-                    (F("task") == path) & F("status").in_list(["pending", "running"])
+                    (F("task") == path) & F("status").in_list(list(ACTIVE_STATUSES))
                 ).count()
 
                 # Check if this task has a cron schedule

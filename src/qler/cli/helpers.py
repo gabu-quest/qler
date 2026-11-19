@@ -12,7 +12,6 @@ from typing import Any
 import click
 
 from qler._time import now_epoch
-from qler.enums import JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
@@ -25,14 +24,6 @@ _SINCE_PATTERN = re.compile(r"(\d+)([smhd])")
 _SINCE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _MAX_SINCE_SECONDS = 10 * 365 * 86400  # 10 years
 _MODULE_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*$")
-
-TERMINAL_STATUSES = frozenset(
-    {
-        JobStatus.COMPLETED.value,
-        JobStatus.FAILED.value,
-        JobStatus.CANCELLED.value,
-    }
-)
 
 
 def _count_jobs(n: int) -> str:

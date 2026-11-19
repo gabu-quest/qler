@@ -15,6 +15,7 @@ class RateLimitBucket(AsyncSQLerSafeModel):
     (e.g., "task:myapp.tasks.send_email" or "queue:emails").
     """
 
+    __tablename__: ClassVar[str] = "qler_rate_limit_buckets"
     __promoted__: ClassVar[dict[str, str]] = {
         "bucket_key": "TEXT NOT NULL",
     }

@@ -18,7 +18,7 @@ from typing import Any
 
 from qler._context import _current_job, _current_queue
 from qler._time import generate_ulid, now_epoch
-from qler.enums import FailureKind, JobStatus
+from qler.enums import FailureKind
 from qler.exceptions import ConfigurationError
 from qler.lifecycle import emit as _lifecycle
 
@@ -637,7 +637,6 @@ class Worker:
         On startup, catchup-enabled tasks query their last enqueued timestamp
         and walk forward to enqueue missed runs (up to their catchup limit).
         """
-        from sqler import F
 
         # One-time startup: query last enqueued timestamp for catchup tasks
         catchup_anchors: dict[str, int | None] = {}
@@ -673,15 +672,7 @@ class Worker:
                             for ts in missed:
                                 # max_running guard
                                 if cw.schedule.max_running > 0:
-                                    running_count = await self.queue.jobs.filter(
-                                        (F("task") == path)
-                                        & F("status").in_list(
-                                            [
-                                                JobStatus.PENDING.value,
-                                                JobStatus.RUNNING.value,
-                                            ]
-                                        )
-                                    ).count()
+                                    running_count = await cw._active_count()
                                     if running_count >= cw.schedule.max_running:
                                         break
                                 await cw.task_wrapper.enqueue(
@@ -697,15 +688,7 @@ class Worker:
 
                     # max_running guard: check pending/running count
                     if cw.schedule.max_running > 0:
-                        running_count = await self.queue.jobs.filter(
-                            (F("task") == path)
-                            & F("status").in_list(
-                                [
-                                    JobStatus.PENDING.value,
-                                    JobStatus.RUNNING.value,
-                                ]
-                            )
-                        ).count()
+                        running_count = await cw._active_count()
                         if running_count >= cw.schedule.max_running:
                             continue
 

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from croniter import croniter
 
+from qler.enums import ACTIVE_STATUSES
 from qler.exceptions import ConfigurationError
 from qler.task import TaskWrapper
 
@@ -69,6 +70,14 @@ class CronWrapper:
 
     # Reject timestamps before 2020-01-01 as corrupt/invalid
     _MINIMUM_VALID_CRON_TS = 1_577_836_800
+
+    async def _active_count(self) -> int:
+        """How many pending or running jobs this schedule's task has."""
+        from sqler import F
+
+        return await self.task_wrapper.queue.jobs.filter(
+            (F("task") == self.task_path) & F("status").in_list(list(ACTIVE_STATUSES))
+        ).count()
 
     async def _find_last_enqueued_ts(self) -> int | None:
         """Query DB for the most recent cron job's scheduled timestamp.
