@@ -1163,22 +1163,34 @@ class Queue:
                 )
                 return
 
+        # One write: the guarded status update, the dependents' counts and the attempt's
+        # end commit together or not at all, so a stop between them (a locked database,
+        # a dying process) cannot leave a completed parent above children whose count
+        # nothing will lower again. The outside world hears only of a committed completion.
         now = now_epoch()
-        updated = await Job.query().filter(
-            (F("ulid") == job.ulid)
-            & (F("status") == JobStatus.RUNNING.value)
-            & (F("worker_id") == worker_id)
-        ).update_one(
-            status=JobStatus.COMPLETED.value,
-            result_json=result_json,
-            finished_at=now,
-            updated_at=now,
-            worker_id="",
-            lease_expires_at=None,
-        )
+        async with self._db.transaction():
+            updated = await Job.using(self._db, "qler_jobs").filter(
+                (F("ulid") == job.ulid)
+                & (F("status") == JobStatus.RUNNING.value)
+                & (F("worker_id") == worker_id)
+            ).update_one(
+                status=JobStatus.COMPLETED.value,
+                result_json=result_json,
+                finished_at=now,
+                updated_at=now,
+                worker_id="",
+                lease_expires_at=None,
+            )
 
-        if updated is None:
-            return  # Lost ownership
+            if updated is None:
+                return  # Lost ownership: nothing written, nothing told
+
+            # Resolve dependencies: unblock dependent jobs
+            await self._resolve_dependencies(job.ulid)
+
+            await self._terminalize_attempt(
+                job.last_attempt_id, AttemptStatus.COMPLETED.value, now
+            )
 
         _lifecycle(
             "job.completed", job_id=job.ulid, queue=job.queue_name,
@@ -1189,14 +1201,6 @@ class Queue:
             self._metrics.inc_completed(job.queue_name, job.task)
 
         _notify_fire(job.ulid)
-
-        # Resolve dependencies: unblock dependent jobs
-        await self._resolve_dependencies(job.ulid)
-
-        # Terminalize attempt (best effort)
-        await self._terminalize_attempt(
-            job.last_attempt_id, AttemptStatus.COMPLETED.value, now
-        )
 
     # ------------------------------------------------------------------
     # Fail
@@ -1244,14 +1248,33 @@ class Queue:
                 update_fields["original_queue"] = job.queue_name
                 update_fields["queue_name"] = self._dlq
 
-        updated = await Job.query().filter(
-            (F("ulid") == job.ulid)
-            & (F("status") == JobStatus.RUNNING.value)
-            & (F("worker_id") == worker_id)
-        ).update_one(**update_fields)
+        # One write: the guarded status update (with the dead-letter move), the dependents'
+        # cancellations and the attempt's end commit together or not at all, so a stop
+        # between them cannot leave a failed parent above pending children that will
+        # neither run nor be cancelled. The outside world hears only of what committed.
+        cancelled: list[str] = []
+        async with self._db.transaction():
+            updated = await Job.using(self._db, "qler_jobs").filter(
+                (F("ulid") == job.ulid)
+                & (F("status") == JobStatus.RUNNING.value)
+                & (F("worker_id") == worker_id)
+            ).update_one(**update_fields)
 
-        if updated is None:
-            return  # Lost ownership
+            if updated is None:
+                return  # Lost ownership: nothing written, nothing told
+
+            # Cascade-cancel dependents on terminal failure
+            if not can_retry:
+                cancelled = await self._cascade_cancel_dependents(job.ulid)
+
+            await self._terminalize_attempt(
+                job.last_attempt_id,
+                AttemptStatus.FAILED.value,
+                now,
+                error=error_msg,
+                traceback=error_tb_str,
+                failure_kind=failure_kind.value,
+            )
 
         if can_retry:
             _lifecycle(
@@ -1273,20 +1296,10 @@ class Queue:
             else:
                 self._metrics.inc_failed(job.queue_name, job.task, failure_kind.value)
 
-        # Cascade-cancel dependents on terminal failure
         if not can_retry:
             _notify_fire(job.ulid)
-            await self._cascade_cancel_dependents(job.ulid)
-
-        # Terminalize attempt (best effort)
-        await self._terminalize_attempt(
-            job.last_attempt_id,
-            AttemptStatus.FAILED.value,
-            now,
-            error=error_msg,
-            traceback=error_tb_str,
-            failure_kind=failure_kind.value,
-        )
+            for child_ulid in cancelled:
+                _notify_fire(child_ulid)
 
     # ------------------------------------------------------------------
     # Lease Recovery
@@ -1346,61 +1359,96 @@ class Queue:
     # ------------------------------------------------------------------
 
     async def _resolve_dependencies(self, completed_ulid: str) -> None:
-        """Decrement pending_dep_count for jobs depending on the completed job."""
-        cur = await self._db.adapter.execute(
-            "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
-            [completed_ulid],
-        )
-        children = await cur.fetchall()
-        await cur.close()
-        await self._db.adapter.auto_commit()
+        """Decrement pending_dep_count for jobs depending on the completed job.
 
-        for (child_ulid,) in children:
-            await Job.query().filter(
-                (F("ulid") == child_ulid)
-                & (F("status") == JobStatus.PENDING.value)
-                & (F("pending_dep_count") > 0)
-            ).update_one(
-                pending_dep_count=F("pending_dep_count") - 1,
-                updated_at=now_epoch(),
+        One transaction (a savepoint inside the caller's): every child is decremented,
+        or none is.
+        """
+        jobs = Job.using(self._db, "qler_jobs")
+        async with self._db.transaction():
+            cur = await self._db.adapter.execute(
+                "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
+                [completed_ulid],
             )
+            children = await cur.fetchall()
+            await cur.close()
 
-    async def _cascade_cancel_dependents(self, failed_ulid: str) -> None:
-        """Cancel PENDING jobs that depend on a failed/cancelled job, recursively."""
-        cur = await self._db.adapter.execute(
-            "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
-            [failed_ulid],
-        )
-        children = await cur.fetchall()
-        await cur.close()
-        await self._db.adapter.auto_commit()
+            now = now_epoch()
+            for (child_ulid,) in children:
+                await jobs.filter(
+                    (F("ulid") == child_ulid)
+                    & (F("status") == JobStatus.PENDING.value)
+                    & (F("pending_dep_count") > 0)
+                ).update_one(
+                    pending_dep_count=F("pending_dep_count") - 1,
+                    updated_at=now,
+                )
 
+    async def _cascade_cancel_dependents(self, failed_ulid: str) -> list[str]:
+        """Cancel PENDING jobs that depend on a failed/cancelled job, recursively.
+
+        One transaction (a savepoint inside the caller's): the whole cascade is
+        cancelled, or none of it. Returns the ULIDs it cancelled, in order, so the
+        caller notifies waiters only after its own commit.
+        """
+        jobs = Job.using(self._db, "qler_jobs")
         now = now_epoch()
         cancelled_ulids: list[str] = []
-        for (child_ulid,) in children:
-            updated = await Job.query().filter(
-                (F("ulid") == child_ulid)
-                & (F("status") == JobStatus.PENDING.value)
+        async with self._db.transaction():
+            frontier = [failed_ulid]
+            while frontier:
+                parent_ulid = frontier.pop(0)
+                cur = await self._db.adapter.execute(
+                    "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
+                    [parent_ulid],
+                )
+                children = await cur.fetchall()
+                await cur.close()
+
+                for (child_ulid,) in children:
+                    updated = await jobs.filter(
+                        (F("ulid") == child_ulid)
+                        & (F("status") == JobStatus.PENDING.value)
+                    ).update_one(
+                        status=JobStatus.CANCELLED.value,
+                        last_error=f"Dependency {parent_ulid} failed/cancelled",
+                        finished_at=now,
+                        updated_at=now,
+                    )
+                    if updated is not None:
+                        cancelled_ulids.append(child_ulid)
+                        frontier.append(child_ulid)
+        return cancelled_ulids
+
+    async def cancel_job(self, job: Job) -> bool:
+        """Cancel a job and cascade-cancel its dependents.
+
+        A PENDING job and its pending dependents are cancelled in one transaction; a
+        RUNNING job gets a cooperative cancellation request. Waiters are notified after
+        the commit, and only for what was committed.
+        """
+        now = now_epoch()
+        async with self._db.transaction():
+            updated = await Job.using(self._db, "qler_jobs").filter(
+                (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
             ).update_one(
                 status=JobStatus.CANCELLED.value,
-                last_error=f"Dependency {failed_ulid} failed/cancelled",
                 finished_at=now,
                 updated_at=now,
             )
-            if updated is not None:
-                _notify_fire(child_ulid)
-                cancelled_ulids.append(child_ulid)
+            cancelled = (
+                await self._cascade_cancel_dependents(job.ulid) if updated is not None else []
+            )
 
-        for ulid in cancelled_ulids:
-            await self._cascade_cancel_dependents(ulid)
+        if updated is None:
+            # Not PENDING: if RUNNING, request cooperative cancellation instead
+            return await job.request_cancel()
 
-    async def cancel_job(self, job: Job) -> bool:
-        """Cancel a job and cascade-cancel its dependents."""
-        ok = await job.cancel()
-        if ok and job.status == JobStatus.CANCELLED.value:
-            _notify_fire(job.ulid)
-            await self._cascade_cancel_dependents(job.ulid)
-        return ok
+        job._sync_from(updated)
+        _notify_fire(job.ulid)
+        for child_ulid in cancelled:
+            _notify_fire(child_ulid)
+        return True
 
     async def replay_job(
         self, job: Job, *, queue_name: Optional[str] = None
@@ -1511,7 +1559,7 @@ class Queue:
         if failure_kind is not None:
             update_fields["failure_kind"] = failure_kind
 
-        await JobAttempt.query().filter(
+        await JobAttempt.using(self._db, "qler_job_attempts").filter(
             (F("ulid") == attempt_id) & (F("status") == AttemptStatus.RUNNING.value)
         ).update_one(**update_fields)
 
