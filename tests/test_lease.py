@@ -1,6 +1,7 @@
 """Tests for lease recovery and renewal mechanics, and the worker's renewal loop."""
 
 import asyncio
+import logging
 import re
 import sqlite3
 
@@ -13,6 +14,7 @@ from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
 from sqler import F
+from sqler.models.async_queryset import AsyncSQLerQuerySet
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -143,6 +145,48 @@ class TestRecoverExpiredLeases:
         assert refreshed.status == JobStatus.PENDING.value
         assert refreshed.progress is None
         assert refreshed.progress_message == ""
+
+    async def test_reset_and_attempt_end_are_one_write(self, queue, monkeypatch, caplog):
+        """The attempt's end fails once: nothing is reset, no event; the next call recovers it."""
+        job = await _make_running_job(queue, lease_offset=-10)
+
+        original = AsyncSQLerQuerySet.update_one
+        seen = {"n": 0}
+
+        async def update_one(self, **fields):
+            if fields.get("status") == AttemptStatus.LEASE_EXPIRED.value:
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+            return await original(self, **fields)
+
+        monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
+
+        def recovered_events():
+            return [
+                r for r in caplog.records
+                if r.name == "qler.lifecycle" and r.event == "job.lease_recovered"
+            ]
+
+        with caplog.at_level(logging.INFO, logger="qler.lifecycle"):
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                await queue.recover_expired_leases()
+
+            stored = await Job.query().filter(F("ulid") == job.ulid).first()
+            assert stored.status == JobStatus.RUNNING.value
+            assert stored.worker_id == "worker-1"
+            assert stored.lease_expires_at is not None
+            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+            assert [a.status for a in attempts] == [AttemptStatus.RUNNING.value]
+            assert recovered_events() == []
+
+            assert await queue.recover_expired_leases() == 1
+
+            stored = await Job.query().filter(F("ulid") == job.ulid).first()
+            assert stored.status == JobStatus.PENDING.value
+            attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+            assert [a.status for a in attempts] == [AttemptStatus.LEASE_EXPIRED.value]
+            assert len(recovered_events()) == 1
 
 
 class TestRenewLease:

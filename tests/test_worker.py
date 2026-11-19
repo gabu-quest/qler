@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import logging
 import re
+import sqlite3
 import sys
 
 import pytest
@@ -1442,3 +1444,109 @@ class TestShutdownBounds:
         ]
         assert len(stuck_logs) == 1
         assert job.ulid in stuck_logs[0]
+
+
+class TestFinishFailureIsLogged:
+    """A finish write that raises in the worker is logged; the worker carries on."""
+
+    @pytest.fixture
+    def tasks(self, worker_queue):
+        return (
+            task(worker_queue)(succeeding_task),
+            task(worker_queue)(failing_task),
+        )
+
+    async def _run(self, worker_queue, monkeypatch, caplog, which, first_task, second_task, first_args=()):
+        """Make the first finish of kind `which` raise once; return (first, second, records)."""
+        first_finish_raised = asyncio.Event()
+        second_completed = asyncio.Event()
+        real_complete = Queue.complete_job
+        real_fail = Queue.fail_job
+        calls = {"n": 0}
+
+        async def complete_job(self, job, *a, **kw):
+            if which == "complete":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    first_finish_raised.set()
+                    raise sqlite3.OperationalError("database is locked")
+            await real_complete(self, job, *a, **kw)
+            if job.ulid == second.ulid:
+                second_completed.set()
+
+        async def fail_job(self, job, *a, **kw):
+            if which == "fail":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    first_finish_raised.set()
+                    raise sqlite3.OperationalError("database is locked")
+            await real_fail(self, job, *a, **kw)
+
+        monkeypatch.setattr(Queue, "complete_job", complete_job)
+        monkeypatch.setattr(Queue, "fail_job", fail_job)
+
+        first = await first_task.enqueue(*first_args)
+        second = None
+
+        w = _make_worker(worker_queue)
+        with caplog.at_level(logging.ERROR, logger="qler.worker"):
+            worker_task = asyncio.create_task(w.run())
+            try:
+                await asyncio.wait_for(first_finish_raised.wait(), timeout=5.0)
+                second = await second_task.enqueue(1)
+                await asyncio.wait_for(second_completed.wait(), timeout=5.0)
+            finally:
+                w._running = False
+                await asyncio.wait_for(worker_task, timeout=10.0)
+        return w, first, second
+
+    async def test_complete_that_raises_is_logged_and_worker_goes_on(
+        self, worker_queue, monkeypatch, caplog, tasks
+    ):
+        succeeding, _ = tasks
+        w, first, second = await self._run(
+            worker_queue, monkeypatch, caplog, "complete", succeeding, succeeding, (1,)
+        )
+
+        errors = [r for r in caplog.records if r.name == "qler.worker" and r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert first.ulid in message
+        assert succeeding.task_path in message
+        assert "complete" in message
+        assert "lease recovery" in message
+        assert errors[0].exc_info[0] is sqlite3.OperationalError
+
+        stored = await Job.query().filter(F("ulid") == first.ulid).first()
+        assert stored.status == JobStatus.RUNNING.value
+        assert stored.worker_id == w.worker_id
+        assert stored.lease_expires_at is not None
+        other = await Job.query().filter(F("ulid") == second.ulid).first()
+        assert other.status == JobStatus.COMPLETED.value
+
+    async def test_fail_that_raises_is_logged_and_worker_goes_on(
+        self, worker_queue, monkeypatch, caplog, tasks
+    ):
+        succeeding, failing = tasks
+        w, first, second = await self._run(
+            worker_queue, monkeypatch, caplog, "fail", failing, succeeding
+        )
+
+        errors = [
+            r for r in caplog.records
+            if r.name == "qler.worker" and r.levelno == logging.ERROR
+            and "lease recovery" in r.getMessage()
+        ]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert first.ulid in message
+        assert failing.task_path in message
+        assert "fail" in message
+        assert errors[0].exc_info[0] is sqlite3.OperationalError
+
+        stored = await Job.query().filter(F("ulid") == first.ulid).first()
+        assert stored.status == JobStatus.RUNNING.value
+        assert stored.worker_id == w.worker_id
+        assert stored.lease_expires_at is not None
+        other = await Job.query().filter(F("ulid") == second.ulid).first()
+        assert other.status == JobStatus.COMPLETED.value
