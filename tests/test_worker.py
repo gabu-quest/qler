@@ -125,6 +125,34 @@ async def swallowing_task():
         return "swallowed"
 
 
+# Set per test by TestShutdownBounds.
+_drain_release: asyncio.Event | None = None
+_lease_at_finish: list[tuple[int, int]] = []
+
+
+async def draining_task():
+    """First run waits for the test's release, then records (lease, clock)."""
+    global _held_runs
+    _held_runs += 1
+    if _held_runs > 1:
+        return "second run"
+    _held_started.set()
+    await _drain_release.wait()
+    row = await Job.query().filter(F("ulid") == current_job().ulid).first()
+    _lease_at_finish.append((row.lease_expires_at, now_epoch()))
+    return "first run"
+
+
+async def stubborn_task():
+    """Swallows the shutdown's cancel and keeps waiting."""
+    _held_started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await _drain_release.wait()
+    return "released"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -1319,3 +1347,98 @@ class TestTimeout:
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert attempts[0].failure_kind == FailureKind.TIMEOUT.value
         assert "timed out" in attempts[0].error
+
+
+class TestShutdownBounds:
+    """Renewal lasts through the drain, and the drain ends in bounded time."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        global _held_started, _held_runs, _drain_release, _lease_at_finish
+        _held_started = asyncio.Event()
+        _held_runs = 0
+        _drain_release = asyncio.Event()
+        _lease_at_finish = []
+        yield
+
+    async def _row(self, job):
+        return await Job.query().filter(F("ulid") == job.ulid).first()
+
+    async def test_lease_is_renewed_through_a_long_drain(self, worker_db):
+        """A drain longer than the job's lease: the lease stays ahead, one completion."""
+        q = Queue(worker_db, default_lease_duration=2, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(draining_task)
+        job = await wrapped.enqueue()
+
+        w1 = _make_worker(q, shutdown_timeout=10.0)
+        w1_task = asyncio.create_task(w1.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        w2 = _make_worker(q, lease_recovery_interval=0.1)
+        w2_task = asyncio.create_task(w2.run())
+        try:
+            w1._running = False  # the drain starts here
+            claim_lease = (await self._row(job)).lease_expires_at
+            # Hold the drain until the claim lease and one lease length after it
+            # are over (the clock has no event to wait on).
+            while now_epoch() <= claim_lease + 2:
+                await asyncio.sleep(0.05)
+            _drain_release.set()
+            await asyncio.wait_for(w1_task, timeout=10.0)
+        finally:
+            _drain_release.set()
+            w2._running = False
+            await asyncio.wait_for(w2_task, timeout=10.0)
+            if not w1_task.done():
+                w1_task.cancel()
+
+        assert len(_lease_at_finish) == 1
+        lease, clock = _lease_at_finish[0]
+        assert lease > clock
+        assert _held_runs == 1
+        row = await self._row(job)
+        assert row.status == JobStatus.COMPLETED.value
+        assert row.result == "first run"
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        assert [(a.status, a.worker_id) for a in attempts] == [
+            (AttemptStatus.COMPLETED.value, w1.worker_id),
+        ]
+
+    async def test_task_ignoring_the_cut_does_not_hold_shutdown(
+        self, worker_db, monkeypatch, caplog
+    ):
+        """A task that swallows the cancel and keeps waiting is left after the grace."""
+        import qler.worker as worker_module
+
+        monkeypatch.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.5, raising=False)
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(stubborn_task)
+        job = await wrapped.enqueue()
+
+        w = _make_worker(q, shutdown_timeout=0.2)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        stuck = set(w._active_tasks)
+        try:
+            with caplog.at_level("WARNING", logger="qler.worker"):
+                started = asyncio.get_running_loop().time()
+                w._running = False
+                await asyncio.wait_for(asyncio.shield(worker_task), timeout=5.0)
+                elapsed = asyncio.get_running_loop().time() - started
+            row = await self._row(job)
+        finally:
+            for t in stuck:
+                t.cancel()
+            await asyncio.gather(*stuck, return_exceptions=True)
+
+        # timeout 0.2 + grace 0.5, with room for a busy machine
+        assert elapsed < 0.2 + 0.5 + 1.5
+        assert row.status == JobStatus.RUNNING.value
+        assert row.worker_id == w.worker_id
+        stuck_logs = [
+            r.getMessage() for r in caplog.records
+            if "did not stop within" in r.getMessage()
+        ]
+        assert len(stuck_logs) == 1
+        assert job.ulid in stuck_logs[0]
