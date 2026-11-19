@@ -8,6 +8,7 @@ from typing import Any
 
 import click
 
+from qler._sqler import grouped_count
 from qler.cli.group import cli
 from qler.cli.helpers import (
     _attempt_to_dict,
@@ -39,7 +40,7 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
     async def _status() -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
         q = await _get_queue(db)
         try:
-            rows = await q.jobs.group_by("queue_name", "status").count()
+            rows = await grouped_count(q.jobs.group_by("queue_name", "status"))
 
             queues: dict[str, dict[str, int]] = {}
             for row in rows:
@@ -56,7 +57,7 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
 
             archived: dict[str, dict[str, int]] = {}
             if include_archive:
-                rows = await q.archive.group_by("queue_name", "status").count()
+                rows = await grouped_count(q.archive.group_by("queue_name", "status"))
                 for row in rows:
                     queue_name, job_status = row["queue_name"], row["status"]
                     if queue_name not in archived:

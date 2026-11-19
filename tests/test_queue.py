@@ -958,6 +958,23 @@ class TestQueueClose:
         with pytest.raises(RuntimeError, match="not initialized"):
             _ = q.db
 
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda q, job: q.complete_job(job, "worker-1"),
+            lambda q, job: q.fail_job(job, "worker-1", ValueError("boom")),
+            lambda q, job: q.cancel_job(job),
+            lambda q, job: q.replay_job(job),
+        ],
+        ids=["complete_job", "fail_job", "cancel_job", "replay_job"],
+    )
+    async def test_public_calls_raise_before_init(self, call):
+        """A call that does not set the database up itself says the queue is not initialized."""
+        q = Queue("/tmp/nonexistent.db")
+        job = Job(ulid="01ARZ3NDEKTSV4RRFFQ69G5FAV", queue_name="default", task="t")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await call(q, job)
+
 
 class TestErrorTruncation:
     """Verify error and traceback are capped at storage limits."""
