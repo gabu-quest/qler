@@ -482,6 +482,29 @@ class Queue:
         await self._lazy_init()
         now = now_epoch()
 
+        # What needs no database is checked first, for every spec, before the write lock
+        # is taken: a spec that cannot be stored is refused without waiting for it.
+        payloads: list[str] = []
+        for i, spec in enumerate(specs):
+            where = f"Job at index {i}: " if batch else ""
+            payload_word = f"{where}payload" if batch else "Payload"
+            if not spec.get("task_path"):
+                raise ConfigurationError(f"{where}task_path is required")
+            payload = {"args": list(spec.get("args", ())), "kwargs": spec.get("kwargs") or {}}
+            try:
+                payload_json = json.dumps(payload)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise PayloadNotSerializableError(
+                    f"{payload_word} is not JSON-serializable: {exc}"
+                ) from exc
+            if len(payload_json) > self.max_payload_size:
+                raise PayloadTooLargeError(
+                    f"{payload_word} size {len(payload_json)} exceeds max {self.max_payload_size}",
+                    size=len(payload_json),
+                    max_size=self.max_payload_size,
+                )
+            payloads.append(payload_json)
+
         # One write: the key look-ups, the parents' statuses and every row with its edges
         # run in one transaction that holds the write lock from its start, so no other
         # enqueue (task, connection or process) can write the same key between the check
@@ -499,26 +522,7 @@ class Queue:
 
             for i, spec in enumerate(specs):
                 where = f"Job at index {i}: " if batch else ""
-                payload_word = f"{where}payload" if batch else "Payload"
                 dep_word = f"{where}dependency" if batch else "Dependency job"
-
-                task_path = spec.get("task_path")
-                if not task_path:
-                    raise ConfigurationError(f"{where}task_path is required")
-
-                payload = {"args": list(spec.get("args", ())), "kwargs": spec.get("kwargs") or {}}
-                try:
-                    payload_json = json.dumps(payload)
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise PayloadNotSerializableError(
-                        f"{payload_word} is not JSON-serializable: {exc}"
-                    ) from exc
-                if len(payload_json) > self.max_payload_size:
-                    raise PayloadTooLargeError(
-                        f"{payload_word} size {len(payload_json)} exceeds max {self.max_payload_size}",
-                        size=len(payload_json),
-                        max_size=self.max_payload_size,
-                    )
 
                 # A key already active (in the database, then earlier in this call) is
                 # that job: idempotency key first, then unique key.
@@ -589,8 +593,8 @@ class Queue:
                     queue_name=spec.get("queue_name", "default"),
                     priority=spec.get("priority", 0),
                     eta=eta if eta is not None else now + delay if delay is not None else now,
-                    task=task_path,
-                    payload_json=payload_json,
+                    task=spec["task_path"],
+                    payload_json=payloads[i],
                     max_retries=max_retries if max_retries is not None else self.default_max_retries,
                     retry_delay=retry_delay if retry_delay is not None else self.default_retry_delay,
                     lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
