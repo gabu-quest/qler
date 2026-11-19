@@ -77,58 +77,58 @@ def populated_db(db_path):
 
 class TestHelpers:
     def test_format_duration_seconds(self):
-        from qler.cli import _format_duration
+        from qler.cli.helpers import _format_duration
 
         assert _format_duration(45) == "45s"
 
     def test_format_duration_minutes(self):
-        from qler.cli import _format_duration
+        from qler.cli.helpers import _format_duration
 
         assert _format_duration(90) == "1m 30s"
 
     def test_format_duration_hours(self):
-        from qler.cli import _format_duration
+        from qler.cli.helpers import _format_duration
 
         assert _format_duration(3661) == "1h 1m 1s"
 
     def test_format_duration_days(self):
-        from qler.cli import _format_duration
+        from qler.cli.helpers import _format_duration
 
         assert _format_duration(90061) == "1d 1h 1m 1s"
 
     def test_format_duration_zero(self):
-        from qler.cli import _format_duration
+        from qler.cli.helpers import _format_duration
 
         assert _format_duration(0) == "0s"
 
     def test_format_duration_negative(self):
-        from qler.cli import _format_duration
+        from qler.cli.helpers import _format_duration
 
         assert _format_duration(-1) == "-"
 
     def test_format_ts_none(self):
-        from qler.cli import _format_ts
+        from qler.cli.helpers import _format_ts
 
         assert _format_ts(None) == "-"
 
     def test_format_ts_epoch(self):
-        from qler.cli import _format_ts
+        from qler.cli.helpers import _format_ts
 
         assert _format_ts(0) == "1970-01-01T00:00:00Z"
 
     def test_format_ts_known(self):
-        from qler.cli import _format_ts
+        from qler.cli.helpers import _format_ts
 
         # 2024-01-01 00:00:00 UTC = 1704067200
         assert _format_ts(1704067200) == "2024-01-01T00:00:00Z"
 
     def test_safe_json_valid(self):
-        from qler.cli import _safe_json
+        from qler.cli.helpers import _safe_json
 
         assert _safe_json('{"key": "value"}') == {"key": "value"}
 
     def test_safe_json_invalid(self):
-        from qler.cli import _safe_json
+        from qler.cli.helpers import _safe_json
 
         result = _safe_json("not json")
         assert result["_invalid"] is True
@@ -136,12 +136,12 @@ class TestHelpers:
         assert "parse_error" in result
 
     def test_safe_json_none(self):
-        from qler.cli import _safe_json
+        from qler.cli.helpers import _safe_json
 
         assert _safe_json(None) is None
 
     def test_parse_since_hours(self):
-        from qler.cli import _parse_since
+        from qler.cli.helpers import _parse_since
 
         before = now_epoch()
         result = _parse_since("2h")
@@ -150,7 +150,7 @@ class TestHelpers:
         assert before - 7200 <= result <= after - 7200
 
     def test_parse_since_days(self):
-        from qler.cli import _parse_since
+        from qler.cli.helpers import _parse_since
 
         before = now_epoch()
         result = _parse_since("7d")
@@ -158,7 +158,7 @@ class TestHelpers:
         assert before - 604800 <= result <= after - 604800
 
     def test_parse_since_combined(self):
-        from qler.cli import _parse_since
+        from qler.cli.helpers import _parse_since
 
         before = now_epoch()
         result = _parse_since("1d12h")
@@ -168,40 +168,40 @@ class TestHelpers:
 
     def test_parse_since_invalid(self):
         import click
-        from qler.cli import _parse_since
+        from qler.cli.helpers import _parse_since
 
         with pytest.raises(click.BadParameter, match="Invalid duration"):
             _parse_since("invalid")
 
     def test_parse_since_exceeds_max(self):
         import click
-        from qler.cli import _parse_since
+        from qler.cli.helpers import _parse_since
 
         with pytest.raises(click.BadParameter, match="exceeds maximum"):
             _parse_since("99999d")
 
     def test_validate_module_path_rejects_traversal(self):
         import click
-        from qler.cli import _validate_module_path
+        from qler.cli.helpers import _validate_module_path
 
         with pytest.raises(click.BadParameter, match="Invalid module path"):
             _validate_module_path("../evil")
 
     def test_validate_module_path_rejects_spaces(self):
         import click
-        from qler.cli import _validate_module_path
+        from qler.cli.helpers import _validate_module_path
 
         with pytest.raises(click.BadParameter, match="Invalid module path"):
             _validate_module_path("my module")
 
     def test_validate_module_path_accepts_dotted(self):
-        from qler.cli import _validate_module_path
+        from qler.cli.helpers import _validate_module_path
 
         result = _validate_module_path("myapp.tasks.email")
         assert result is None
 
     def test_echo_table_output(self, runner, capsys):
-        from qler.cli import _echo_table
+        from qler.cli.helpers import _echo_table
 
         _echo_table(["Name", "Count"], [["alpha", "10"], ["beta", "5"]])
         captured = capsys.readouterr()
@@ -216,7 +216,7 @@ class TestHelpers:
         assert "5" in lines[3]
 
     def test_echo_table_empty(self, capsys):
-        from qler.cli import _echo_table
+        from qler.cli.helpers import _echo_table
 
         _echo_table(["A", "B"], [])
         captured = capsys.readouterr()
@@ -224,28 +224,28 @@ class TestHelpers:
 
     def test_import_app_bad_format(self):
         import click
-        from qler.cli import _import_app
+        from qler.cli.helpers import _import_app
 
         with pytest.raises(click.BadParameter, match="Expected 'module:attribute'"):
             _import_app("no_colon_here")
 
     def test_import_app_bad_module(self):
         import click
-        from qler.cli import _import_app
+        from qler.cli.helpers import _import_app
 
         with pytest.raises(click.BadParameter, match="Cannot import module"):
             _import_app("nonexistent_module_xyz:queue")
 
     def test_import_app_wrong_type(self):
         import click
-        from qler.cli import _import_app
+        from qler.cli.helpers import _import_app
 
         with pytest.raises(click.BadParameter, match="is not a Queue instance"):
             _import_app("os:path")
 
     def test_import_modules_bad(self):
         import click
-        from qler.cli import _import_modules
+        from qler.cli.helpers import _import_modules
 
         with pytest.raises(click.BadParameter, match="Cannot import module"):
             _import_modules(("nonexistent_module_abc",))
@@ -1772,7 +1772,7 @@ class TestHealthCommand:
                 def settimeout(self, t): pass
             return FakeSocket()
 
-        with patch("qler.cli.socket_mod.create_connection", mock_create_connection):
+        with patch("qler.cli.workers.socket_mod.create_connection", mock_create_connection):
             result = runner.invoke(cli, [
                 "health", "--port", "9100", "--json"
             ])
@@ -1819,7 +1819,7 @@ class TestHealthCommand:
                 def settimeout(self, t): pass
             return FakeSocket()
 
-        with patch("qler.cli.socket_mod.create_connection", mock_create_connection):
+        with patch("qler.cli.workers.socket_mod.create_connection", mock_create_connection):
             result = runner.invoke(cli, [
                 "health", "--port", "9100"
             ])
@@ -2234,7 +2234,7 @@ class TestReadsThroughHeldQueue:
             await b.close()
             return a
 
-        with patch("qler.cli._get_queue", _a_then_b_last):
+        with patch("qler.cli.reports._get_queue", _a_then_b_last):
             result = runner.invoke(cli, ["job", ulid_a, "--db", path_a, "--json"])
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["task"] == "myapp.tasks.in_a"
