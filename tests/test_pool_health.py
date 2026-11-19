@@ -201,6 +201,24 @@ class TestWorkerPoolHealth:
 # ---------------------------------------------------------------------------
 
 
+async def _hold_transaction(db):
+    """Hold one pooled connection through a public call: a transaction a task keeps open.
+
+    Returns (task, release); call release() and await the task to give it back.
+    """
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder():
+        async with db.transaction():
+            held.set()
+            await release.wait()
+
+    task_ = asyncio.create_task(holder())
+    await asyncio.wait_for(held.wait(), 5)
+    return task_, release
+
+
 class TestPoolHealthMethod:
     """Verify Queue.pool_health() returns correct pool state."""
 
@@ -213,14 +231,15 @@ class TestPoolHealthMethod:
         assert result["healthy"] is True
 
         # Hold a connection — pool becomes unhealthy
-        conn = await disk_db.adapter._pool.get()
+        holder, release = await _hold_transaction(disk_db)
         try:
             result = await disk_queue.pool_health()
             assert result["pool_size"] == 4
             assert result["available"] == 3
             assert result["healthy"] is False
         finally:
-            await disk_db.adapter._pool.put(conn)
+            release.set()
+            await holder
 
         # After release — healthy again
         result = await disk_queue.pool_health()
@@ -240,14 +259,15 @@ class TestPoolHealthMethod:
         assert pool["healthy"] is True
 
         # Hold a connection — health response reflects it
-        conn = await disk_db.adapter._pool.get()
+        holder, release = await _hold_transaction(disk_db)
         try:
             resp = w._health_response()
             pool = resp["pool"]
             assert pool["available"] == 3
             assert pool["healthy"] is False
         finally:
-            await disk_db.adapter._pool.put(conn)
+            release.set()
+            await holder
 
 
 # ---------------------------------------------------------------------------
