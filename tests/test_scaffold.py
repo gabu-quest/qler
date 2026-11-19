@@ -70,6 +70,7 @@ def test_exceptions_hierarchy():
         SignatureMismatchError,
         TaskNotFoundError,
         TaskNotRegisteredError,
+        UniqueKeyConflictError,
     )
 
     # All exceptions inherit from QlerError
@@ -84,6 +85,7 @@ def test_exceptions_hierarchy():
         PayloadNotSerializableError,
         ClaimConflictError,
         ConfigurationError,
+        UniqueKeyConflictError,
     ):
         assert issubclass(exc_cls, QlerError), f"{exc_cls.__name__} must subclass QlerError"
 
