@@ -12,6 +12,7 @@ from qler._sqler import grouped_count
 from qler.cli.group import cli
 from qler.cli.helpers import (
     _attempt_to_dict,
+    _count_jobs,
     _echo_json,
     _echo_table,
     _format_duration,
@@ -100,7 +101,7 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
                 ]
             )
         _echo_table(headers, rows)
-        click.echo(f"\nTotal: {total} jobs")
+        click.echo(f"\nTotal: {_count_jobs(total)}")
         if include_archive and archived:
             click.echo(f"\nArchived: {archived_total} jobs")
             headers = ["Queue", "Completed", "Failed", "Cancelled"]
@@ -229,7 +230,7 @@ def jobs(
             )
         _echo_table(headers, rows)
         shown = len(all_jobs)
-        msg = f"\n{shown} jobs shown"
+        msg = f"\n{_count_jobs(shown)} shown"
         if archived:
             msg += f" ({len(archived)} archived)"
         click.echo(msg)
