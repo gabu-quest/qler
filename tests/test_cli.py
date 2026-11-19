@@ -2105,12 +2105,14 @@ async def generate_report():
 # -----------------------------------------------------------------------
 
 
-logler = pytest.importorskip("logler")
-
-
 @pytest.fixture
 def logs_db(tmp_path):
-    """Create an on-disk DB with a completed job (job + attempt records)."""
+    """Create an on-disk DB with a completed job (job + attempt records).
+
+    Only the tests that read logs through logler skip without it; the skip is here
+    and not at module level, where it would skip every CLI test in this file.
+    """
+    pytest.importorskip("logler")
     import asyncio
 
     db_path = str(tmp_path / "logs-test.db")
@@ -2156,6 +2158,7 @@ class TestLogs:
         assert "Correlation ID: corr-123" in result.output
 
     def test_logs_job_not_found(self, runner, db_path):
+        pytest.importorskip("logler")
         runner.invoke(cli, ["init", "--db", db_path])
         result = runner.invoke(cli, ["logs", "NONEXISTENT", "--db", db_path])
         assert result.exit_code == 1
