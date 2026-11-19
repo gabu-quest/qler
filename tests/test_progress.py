@@ -5,6 +5,7 @@ import contextlib
 
 import pytest
 import pytest_asyncio
+from conftest import make_worker, run_worker_until_done
 from sqler import AsyncSQLerDB, F
 
 from qler._context import _current_job, set_progress
@@ -13,7 +14,6 @@ from qler.enums import JobStatus
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
-from qler.worker import Worker
 
 # ---------------------------------------------------------------------------
 # Module-level task functions
@@ -73,31 +73,6 @@ async def progress_queue(progress_db):
     yield q
 
 
-def _make_worker(queue, **kwargs):
-    defaults = {
-        "queues": ["default"],
-        "concurrency": 1,
-        "poll_interval": 0.01,
-        "lease_recovery_interval": 60.0,
-        "shutdown_timeout": 2.0,
-    }
-    defaults.update(kwargs)
-    return Worker(queue, **defaults)
-
-
-async def _run_worker_until_job_done(worker, job, timeout=5.0):
-    worker_task = asyncio.create_task(worker.run())
-    try:
-        result = await job.wait(timeout=timeout, poll_interval=0.02)
-        return result
-    finally:
-        worker._running = False
-        await asyncio.sleep(0.05)
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-
 # ---------------------------------------------------------------------------
 # Tests: set_progress() context function
 # ---------------------------------------------------------------------------
@@ -143,8 +118,8 @@ class TestSetProgress:
         wrapped = task(progress_queue)(progress_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(progress_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(progress_queue)
+        result = await run_worker_until_done(w, job)
 
         assert result.status == JobStatus.COMPLETED.value
         assert result.result == "finished"
@@ -156,8 +131,8 @@ class TestSetProgress:
         wrapped = task(progress_queue)(progress_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(progress_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(progress_queue)
+        await run_worker_until_done(w, job)
 
         # Re-fetch from DB to confirm persistence
         db_job = await Job.query().filter(F("ulid") == job.ulid).first()
@@ -170,8 +145,8 @@ class TestSetProgress:
         wrapped = task(progress_queue)(bare_progress_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(progress_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(progress_queue)
+        result = await run_worker_until_done(w, job)
 
         assert result.progress == 42
         assert result.progress_message == ""
@@ -207,7 +182,7 @@ class TestProgressReset:
         wrapped = task(q)(progress_fail_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         worker_task = asyncio.create_task(w.run())
         try:
             # Wait for first attempt to fail and job to go back to pending
@@ -234,7 +209,7 @@ class TestProgressReset:
         wrapped = task(progress_queue)(progress_fail_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(progress_queue)
+        w = make_worker(progress_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             # Wait for job to fail terminally (no retries)
@@ -269,7 +244,7 @@ class TestProgressReset:
         wrapped = task(q)(progress_fail_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         worker_task = asyncio.create_task(w.run())
         try:
             # Wait for job to fail and move to DLQ
@@ -355,7 +330,7 @@ class TestProgressDefaults:
         wrapped = task(progress_queue)(boundary_progress_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(progress_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(progress_queue)
+        result = await run_worker_until_done(w, job)
         assert result.progress == 100
         assert result.progress_message == "hundred"

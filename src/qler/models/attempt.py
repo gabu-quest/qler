@@ -10,6 +10,7 @@ from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, RebaseConfig
 class JobAttempt(AsyncSQLerSafeModel):
     """Tracks a single execution attempt of a job."""
 
+    __tablename__: ClassVar[str] = "qler_job_attempts"
     __promoted__: ClassVar[dict[str, str]] = {
         "ulid": "TEXT NOT NULL",
         "job_ulid": "TEXT NOT NULL",

@@ -10,6 +10,7 @@ import sys
 
 import pytest
 import pytest_asyncio
+from conftest import make_worker, run_worker_until_done
 from sqler import AsyncSQLerDB, F
 
 from qler._context import current_job
@@ -180,33 +181,6 @@ async def worker_queue(worker_db):
     yield q
 
 
-def _make_worker(queue, **kwargs):
-    """Create a Worker with fast test defaults."""
-    defaults = {
-        "queues": ["default"],
-        "concurrency": 1,
-        "poll_interval": 0.01,
-        "lease_recovery_interval": 60.0,
-        "shutdown_timeout": 2.0,
-    }
-    defaults.update(kwargs)
-    return Worker(queue, **defaults)
-
-
-async def _run_worker_until_job_done(worker, job, timeout=5.0):
-    """Run worker in background, wait for job to reach terminal state, stop worker."""
-    worker_task = asyncio.create_task(worker.run())
-    try:
-        result = await job.wait(timeout=timeout, poll_interval=0.02)
-        return result
-    finally:
-        worker._running = False
-        await asyncio.sleep(0.05)
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-
-
 # ---------------------------------------------------------------------------
 # TestWorkerInit
 # ---------------------------------------------------------------------------
@@ -216,7 +190,7 @@ class TestWorkerInit:
     """Worker.__init__ validation and defaults."""
 
     def test_worker_id_format(self, worker_queue):
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         assert _WORKER_ID_PATTERN.match(w.worker_id), (
             f"Expected hostname:pid:ULID format, got {w.worker_id!r}"
         )
@@ -261,8 +235,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(succeeding_task)
         job = await wrapped.enqueue(10, y=5)
 
-        w = _make_worker(worker_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        result = await run_worker_until_done(w, job)
         assert result.status == "completed"
         assert result.result == {"sum": 15}
 
@@ -270,8 +244,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue, sync=True)(sync_task)
         job = await wrapped.enqueue(21)
 
-        w = _make_worker(worker_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        result = await run_worker_until_done(w, job)
         assert result.status == "completed"
         assert result.result == 42
 
@@ -279,9 +253,9 @@ class TestWorkerExecution:
         """Unregistered task path → permanent FAILED with TASK_NOT_FOUND."""
         job = await worker_queue.enqueue("nonexistent.task_fn")
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.TASK_NOT_FOUND.value
 
         await job.refresh()
@@ -297,9 +271,9 @@ class TestWorkerExecution:
             args=(1,),  # Missing b and c
         )
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.SIGNATURE_MISMATCH.value
 
         await job.refresh()
@@ -313,7 +287,7 @@ class TestWorkerExecution:
         wrapped = task(q)(failing_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         worker_task = asyncio.create_task(w.run())
         try:
             # Wait for first attempt to fail and job to go back to pending
@@ -340,9 +314,9 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(failing_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         with pytest.raises(JobFailedError):
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == "failed"
@@ -354,8 +328,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(succeeding_task)
         job = await wrapped.enqueue(3, y=7)
 
-        w = _make_worker(worker_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        result = await run_worker_until_done(w, job)
         assert result.result_json is not None
         assert result.result == {"sum": 10}
 
@@ -367,8 +341,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(context_var_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         assert _captured_job_ulid == job.ulid
 
@@ -377,8 +351,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(succeeding_task)
         job = await wrapped.enqueue(1)
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
@@ -400,7 +374,7 @@ class TestWorkerConcurrency:
         job1 = await wrapped.enqueue(duration=0.1)
         job2 = await wrapped.enqueue(duration=0.1)
 
-        w = _make_worker(worker_queue, concurrency=2)
+        w = make_worker(worker_queue, concurrency=2)
         worker_task = asyncio.create_task(w.run())
         try:
             # Both should complete within ~0.2s (parallel), not ~0.4s (serial)
@@ -425,7 +399,7 @@ class TestWorkerConcurrency:
         job1 = await wrapped.enqueue("a")
         job2 = await wrapped.enqueue("b")
 
-        w = _make_worker(worker_queue, concurrency=1)
+        w = make_worker(worker_queue, concurrency=1)
         worker_task = asyncio.create_task(w.run())
         try:
             await job1.wait(timeout=2.0, poll_interval=0.02)
@@ -462,7 +436,7 @@ class TestWorkerShutdown:
         wrapped = task(worker_queue)(slow_task)
         job = await wrapped.enqueue(duration=0.1)
 
-        w = _make_worker(worker_queue, shutdown_timeout=5.0)
+        w = make_worker(worker_queue, shutdown_timeout=5.0)
         worker_task = asyncio.create_task(w.run())
 
         # Wait for job to start executing
@@ -483,7 +457,7 @@ class TestWorkerShutdown:
 
     async def test_running_flag_stops_claim_loop(self, worker_queue):
         """Setting _running = False causes the worker task to exit cleanly."""
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
 
         await asyncio.sleep(0.05)
@@ -518,8 +492,8 @@ class TestCorrelation:
             correlation_id="my-trace-123",
         )
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         assert _captured_correlation == "my-trace-123"
 
@@ -531,8 +505,8 @@ class TestCorrelation:
         wrapped = task(worker_queue)(capture_no_correlation_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         # correlation_id defaults to "" for jobs enqueued without one
         assert _captured_correlation == ""
@@ -553,7 +527,7 @@ class TestLeaseRenewalLoop:
         wrapped = task(q)(slow_task)
         job = await wrapped.enqueue(duration=3.0)
 
-        w = _make_worker(q, lease_recovery_interval=60.0)
+        w = make_worker(q, lease_recovery_interval=60.0)
         worker_task = asyncio.create_task(w.run())
 
         try:
@@ -627,7 +601,7 @@ class TestShutdownTimeout:
         wrapped = task(q)(held_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q, shutdown_timeout=0.2)
+        w = make_worker(q, shutdown_timeout=0.2)
         worker_task = await self._start(w)
         before = await self._row(job)
         with caplog.at_level("WARNING", logger="qler.worker"):
@@ -650,7 +624,7 @@ class TestShutdownTimeout:
         wrapped = task(q)(held_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q, shutdown_timeout=0.2)
+        w = make_worker(q, shutdown_timeout=0.2)
         await self._shut_down(w, await self._start(w))
         assert (await self._row(job)).status == JobStatus.RUNNING.value
 
@@ -662,8 +636,8 @@ class TestShutdownTimeout:
             await asyncio.sleep(0.1)
         assert recovered == 1
 
-        w2 = _make_worker(q)
-        result = await _run_worker_until_job_done(w2, job)
+        w2 = make_worker(q)
+        result = await run_worker_until_done(w2, job)
         assert result.status == JobStatus.COMPLETED.value
         assert result.result == "second run"
         assert result.retry_count == 0
@@ -681,7 +655,7 @@ class TestShutdownTimeout:
         wrapped = task(q)(held_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q, shutdown_timeout=0.2)
+        w = make_worker(q, shutdown_timeout=0.2)
         await self._shut_down(w, await self._start(w))
 
         recovered = 0
@@ -696,7 +670,7 @@ class TestShutdownTimeout:
         assert row.worker_id == ""
         assert row.retry_count == 0
 
-        result = await _run_worker_until_job_done(_make_worker(q), job)
+        result = await run_worker_until_done(make_worker(q), job)
         assert result.status == JobStatus.COMPLETED.value
         assert _held_runs == 2
 
@@ -707,7 +681,7 @@ class TestShutdownTimeout:
         wrapped = task(q)(held_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q, shutdown_timeout=0.2)
+        w = make_worker(q, shutdown_timeout=0.2)
         worker_task = await self._start(w)
         w._running = False  # draining from here on
         assert await q.cancel_job(job) is True
@@ -753,7 +727,7 @@ class TestShutdownTimeout:
         monkeypatch.setattr(q, "complete_job", gated_complete)
         monkeypatch.setattr(asyncio, "wait", wait_then_signal)
 
-        w = _make_worker(q, shutdown_timeout=0.2)
+        w = make_worker(q, shutdown_timeout=0.2)
         worker_task = asyncio.create_task(w.run())
         await asyncio.wait_for(entered.wait(), timeout=5.0)
         w._running = False
@@ -775,7 +749,7 @@ class TestShutdownTimeout:
         wrapped = task(q)(swallowing_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q, shutdown_timeout=0.2)
+        w = make_worker(q, shutdown_timeout=0.2)
         await self._shut_down(w, await self._start(w))
 
         row = await self._row(job)
@@ -819,9 +793,9 @@ class TestMalformedPayload:
         )
         await job.save()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.PAYLOAD_INVALID.value
 
         await job.refresh()
@@ -850,9 +824,9 @@ class TestMalformedPayload:
         )
         await job.save()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.PAYLOAD_INVALID.value
 
         await job.refresh()
@@ -880,10 +854,10 @@ class TestRetryExhaustion:
         wrapped = task(q)(failing_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         # job.wait() will raise JobFailedError once retries are exhausted
         with pytest.raises(JobFailedError):
-            await _run_worker_until_job_done(w, job, timeout=10.0)
+            await run_worker_until_done(w, job, timeout=10.0)
 
         await job.refresh()
         assert job.status == "failed"
@@ -957,18 +931,18 @@ class TestHealthEndpoint:
 
     def test_status_property_before_run(self, worker_queue):
         """Before run(), _running is False → status is 'draining'."""
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         assert w.status == "draining"
 
     def test_started_at_set_on_init(self, worker_queue):
         before = now_epoch()
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         after = now_epoch()
         assert before <= w._started_at <= after
 
     async def test_health_not_started_without_flag(self, worker_queue):
         """No health server starts without explicit port/socket."""
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.05)
         try:
@@ -988,7 +962,7 @@ class TestHealthEndpoint:
         """TCP health endpoint returns 200 with correct JSON fields."""
         port = 19100
         before = now_epoch()
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         after = now_epoch()
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)  # Let server start
@@ -1015,7 +989,7 @@ class TestHealthEndpoint:
     async def test_health_unix_socket_responds(self, worker_queue, tmp_path):
         """Unix socket health endpoint returns 200 with correct JSON."""
         sock_path = str(tmp_path / "health.sock")
-        w = _make_worker(worker_queue, health_socket=sock_path)
+        w = make_worker(worker_queue, health_socket=sock_path)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
@@ -1037,7 +1011,7 @@ class TestHealthEndpoint:
     async def test_health_unix_socket_cleanup(self, worker_queue, tmp_path):
         """Socket file is removed after worker stops."""
         sock_path = str(tmp_path / "health.sock")
-        w = _make_worker(worker_queue, health_socket=sock_path)
+        w = make_worker(worker_queue, health_socket=sock_path)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
@@ -1058,7 +1032,7 @@ class TestHealthEndpoint:
     async def test_health_404_on_other_path(self, worker_queue):
         """Non-/health path returns 404."""
         port = 19101
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
@@ -1080,7 +1054,7 @@ class TestHealthEndpoint:
         _running can be toggled without triggering the full shutdown sequence.
         """
         port = 19102
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         w._running = True  # Simulate started state
         health_task = asyncio.create_task(w._health_server_loop())
         await asyncio.sleep(0.15)
@@ -1104,7 +1078,7 @@ class TestHealthEndpoint:
         wrapped = task(worker_queue)(slow_task)
         job = await wrapped.enqueue(duration=2.0)
 
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
@@ -1140,7 +1114,7 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=1)(timeout_slow_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1164,7 +1138,7 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=1, max_retries=2)(timeout_slow_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1189,8 +1163,8 @@ class TestTimeout:
         wrapped = task(worker_queue)(timeout_fast_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == JobStatus.COMPLETED.value
@@ -1201,8 +1175,8 @@ class TestTimeout:
         wrapped = task(worker_queue)(slow_task)
         job = await wrapped.enqueue(0.5)
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == JobStatus.COMPLETED.value
@@ -1216,7 +1190,7 @@ class TestTimeout:
 
         assert job.timeout == 1
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1240,8 +1214,8 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=5)(timeout_fast_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == JobStatus.COMPLETED.value
@@ -1252,7 +1226,7 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=1)(timeout_slow_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1277,7 +1251,7 @@ class TestTimeout:
         wrapped = task(worker_queue, sync=True, timeout=1)(timeout_sync_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1324,10 +1298,10 @@ class TestShutdownBounds:
         wrapped = task(q)(draining_task)
         job = await wrapped.enqueue()
 
-        w1 = _make_worker(q, shutdown_timeout=10.0)
+        w1 = make_worker(q, shutdown_timeout=10.0)
         w1_task = asyncio.create_task(w1.run())
         await asyncio.wait_for(_held_started.wait(), timeout=5.0)
-        w2 = _make_worker(q, lease_recovery_interval=0.1)
+        w2 = make_worker(q, lease_recovery_interval=0.1)
         w2_task = asyncio.create_task(w2.run())
         try:
             w1._running = False  # the drain starts here
@@ -1369,7 +1343,7 @@ class TestShutdownBounds:
         wrapped = task(q)(stubborn_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q, shutdown_timeout=0.2)
+        w = make_worker(q, shutdown_timeout=0.2)
         worker_task = asyncio.create_task(w.run())
         await asyncio.wait_for(_held_started.wait(), timeout=5.0)
         stuck = set(w._active_tasks)
@@ -1440,7 +1414,7 @@ class TestFinishFailureIsLogged:
         first = await first_task.enqueue(*first_args)
         second = None
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         with caplog.at_level(logging.ERROR, logger="qler.worker"):
             worker_task = asyncio.create_task(w.run())
             try:
@@ -1520,7 +1494,7 @@ async def test_cancel_check_reads_its_own_queue_after_another_was_initialised_la
     qb = Queue(str(tmp_path / "b.db"))
     await qb.init_db()  # binds the class-wide handle to B last
     try:
-        w = _make_worker(qa)
+        w = make_worker(qa)
         assert await w._cancel_was_requested(job) is True
     finally:
         await qa.close()

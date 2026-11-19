@@ -10,14 +10,13 @@ import contextlib
 import re
 
 import pytest
-from conftest import assert_pool_healthy
+from conftest import assert_pool_healthy, make_worker
 from sqler import F
 
 from qler.enums import AttemptStatus, JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.task import task
-from qler.worker import Worker
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -47,18 +46,6 @@ async def pool_failing_task():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_worker(queue, **kwargs):
-    defaults = {
-        "queues": ["default"],
-        "concurrency": 2,
-        "poll_interval": 0.01,
-        "lease_recovery_interval": 60.0,
-        "shutdown_timeout": 2.0,
-    }
-    defaults.update(kwargs)
-    return Worker(queue, **defaults)
 
 
 async def _run_worker_until_idle(worker, expected_count, timeout=10.0):
@@ -99,7 +86,7 @@ class TestWorkerPoolHealth:
         for i in range(6):
             await wrapped.enqueue(f"job_{i}")
 
-        w = _make_worker(disk_queue, concurrency=2)
+        w = make_worker(disk_queue, concurrency=2)
         await _run_worker_until_idle(w, 6)
 
         assert len(_pool_log) == 6
@@ -119,7 +106,7 @@ class TestWorkerPoolHealth:
         )
 
         # Worker completes parent, dep resolution unblocks child, worker completes child
-        w = _make_worker(disk_queue, concurrency=1)
+        w = make_worker(disk_queue, concurrency=1)
         await _run_worker_until_idle(w, 2)
 
         assert set(_pool_log) == {"parent", "child"}
@@ -142,7 +129,7 @@ class TestWorkerPoolHealth:
             depends_on=[parent.ulid],
         )
 
-        w = _make_worker(disk_queue, concurrency=1)
+        w = make_worker(disk_queue, concurrency=1)
         worker_task = asyncio.create_task(w.run())
         try:
             # Wait for parent to fail
@@ -173,7 +160,7 @@ class TestWorkerPoolHealth:
         for i in range(5):
             await wrapped.enqueue(f"e2e_{i}", duration=0.02)
 
-        w = _make_worker(disk_queue, concurrency=2)
+        w = make_worker(disk_queue, concurrency=2)
         await _run_worker_until_idle(w, 5)
 
         assert len(_pool_log) == 5
@@ -244,7 +231,7 @@ class TestPoolHealthMethod:
 
     async def test_health_response_includes_pool(self, disk_db, disk_queue):
         """Worker._health_response() includes pool stats with concrete values."""
-        w = _make_worker(disk_queue)
+        w = make_worker(disk_queue, concurrency=2)
         await disk_queue.init_db()
 
         # Idle: all connections returned

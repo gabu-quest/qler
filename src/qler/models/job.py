@@ -15,13 +15,17 @@ from qler._notify import clear as _notify_clear
 from qler._notify import fire as _notify_fire
 from qler._notify import register as _notify_register
 from qler._time import now_epoch
-from qler.enums import JobStatus
+from qler.enums import ACTIVE_STATUSES, JobStatus
 from qler.exceptions import JobCancelledError, JobFailedError, UniqueKeyConflictError
+
+# The second table of Job rows: archived jobs, read through Queue.archive.
+ARCHIVE_TABLE = "qler_jobs_archive"
 
 
 class Job(AsyncSQLerSafeModel):
     """A queued job with optimistic locking and promoted hot columns."""
 
+    __tablename__: ClassVar[str] = "qler_jobs"
     __promoted__: ClassVar[dict[str, str]] = {
         "ulid": "TEXT NOT NULL",
         "status": "TEXT NOT NULL DEFAULT 'pending'",
@@ -356,7 +360,7 @@ KEY_INDEXES = (
         scope="pending or running",
         name=UNIQUE_KEY_INDEX,
         where=_UNIQUE_KEY_WHERE,
-        active=F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value]),
+        active=F("status").in_list(list(ACTIVE_STATUSES)),
         legacy_name="idx_qler_jobs_unique",
         legacy_where=_UNIQUE_KEY_WHERE,
         lookup_name="idx_qler_jobs_unique_key",
