@@ -2200,3 +2200,41 @@ class TestLogs:
             result = runner.invoke(cli, ["logs", "FAKE", "--db", db_path])
         assert result.exit_code == 1
         assert "logler is required" in result.output
+
+
+# -----------------------------------------------------------------------
+# A command reads through the queue it holds, not the last-bound database
+# -----------------------------------------------------------------------
+
+
+class TestReadsThroughHeldQueue:
+    def test_job_reads_its_own_queue_after_another_was_initialised_last(
+        self, runner, tmp_path
+    ):
+        import asyncio
+
+        path_a = str(tmp_path / "a.db")
+        path_b = str(tmp_path / "b.db")
+
+        async def _seed(path, task_name):
+            q = Queue(path)
+            await q.init_db()
+            job = await q.enqueue(task_name)
+            await q.close()
+            return job.ulid
+
+        ulid_a = asyncio.run(_seed(path_a, "myapp.tasks.in_a"))
+        asyncio.run(_seed(path_b, "myapp.tasks.in_b"))
+
+        async def _a_then_b_last(_db):
+            a = Queue(path_a)
+            await a.init_db()
+            b = Queue(path_b)
+            await b.init_db()  # binds the class-wide handle to B last
+            await b.close()
+            return a
+
+        with patch("qler.cli._get_queue", _a_then_b_last):
+            result = runner.invoke(cli, ["job", ulid_a, "--db", path_a, "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["task"] == "myapp.tasks.in_a"

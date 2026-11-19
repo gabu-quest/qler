@@ -1550,3 +1550,22 @@ class TestFinishFailureIsLogged:
         assert stored.lease_expires_at is not None
         other = await Job.query().filter(F("ulid") == second.ulid).first()
         assert other.status == JobStatus.COMPLETED.value
+
+
+async def test_cancel_check_reads_its_own_queue_after_another_was_initialised_last(
+    tmp_path,
+):
+    """The worker's cancel check goes through the queue it holds."""
+    qa = Queue(str(tmp_path / "a.db"))
+    await qa.init_db()
+    await qa.enqueue("m.f")
+    job = await qa.claim_job("w1", ["default"])
+    assert await job.request_cancel() is True
+    qb = Queue(str(tmp_path / "b.db"))
+    await qb.init_db()  # binds the class-wide handle to B last
+    try:
+        w = _make_worker(qa)
+        assert await w._cancel_was_requested(job) is True
+    finally:
+        await qa.close()
+        await qb.close()
