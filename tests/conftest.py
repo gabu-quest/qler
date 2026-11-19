@@ -68,8 +68,8 @@ async def assert_pool_healthy(db):
 
     Call this after Worker shutdown in pool-sensitive tests.
     """
-    adapter = db.adapter
-    assert adapter._pool.qsize() == adapter._pool_size, (
-        f"Pool leak: {adapter._pool.qsize()}/{adapter._pool_size} connections returned"
+    stats = db.pool_stats()
+    assert stats.available_connections == stats.max_connections, (
+        f"Pool leak: {stats.available_connections}/{stats.max_connections} connections returned"
     )
-    assert adapter._task_conn.get(None) is None, "Connection still pinned to task"
+    assert stats.in_use_connections == 0, "Connection still checked out"
