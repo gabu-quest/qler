@@ -17,6 +17,7 @@ from qler.exceptions import (
     SignatureMismatchError,
     TaskNotFoundError,
     TaskNotRegisteredError,
+    UniqueKeyConflictError,
 )
 from qler.metrics import QlerMetrics
 from qler.models import Job, JobAttempt
@@ -59,4 +60,5 @@ __all__ = [
     "PayloadNotSerializableError",
     "ClaimConflictError",
     "ConfigurationError",
+    "UniqueKeyConflictError",
 ]
