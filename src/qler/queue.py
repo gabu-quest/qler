@@ -797,10 +797,17 @@ class Queue:
 
         # Phase 3: Execute in immediate mode if applicable
         if self.immediate:
+            # A job repeated in the batch (same unique/idempotency key) is one job:
+            # run it once and give every entry that stands for it the executed row.
+            executed: dict[str, Job] = {}
             results = []
             for job in job_instances:
-                if job.status == JobStatus.PENDING.value:
-                    results.append(await self._execute_immediate(job))
+                if job.ulid in executed:
+                    results.append(executed[job.ulid])
+                elif job.status == JobStatus.PENDING.value:
+                    done = await self._execute_immediate(job)
+                    executed[job.ulid] = done
+                    results.append(done)
                 else:
                     results.append(job)
             return results
@@ -907,15 +914,11 @@ class Queue:
             _current_job.reset(token)
 
         if task_exc is not None:
-            try:
-                await self.fail_job(
-                    job, worker_id, task_exc, failure_kind=failure_kind
-                )
-            except Exception:
-                # Best-effort: terminalize attempt directly if fail_job raises
-                await self._terminalize_attempt(
-                    attempt_id, AttemptStatus.FAILED.value, now_epoch(), error="Internal error"
-                )
+            # fail_job is one write: if it raises, nothing was written and the error
+            # reaches the caller, as it does for complete_job below.
+            await self.fail_job(
+                job, worker_id, task_exc, failure_kind=failure_kind
+            )
         else:
             await self.complete_job(job, worker_id, result=result)
 
@@ -1334,32 +1337,37 @@ class Queue:
         recovered = 0
 
         for _ in range(max_per_tick):
-            job = await Job.query().filter(
-                (F("status") == JobStatus.RUNNING.value)
-                & (F("lease_expires_at") <= now)
-            ).order_by("lease_expires_at").update_one(
-                status=JobStatus.PENDING.value,
-                worker_id="",
-                lease_expires_at=None,
-                updated_at=now,
-                progress=None,
-                progress_message="",
-            )
-            if job is None:
-                break
+            # One transaction per job: the reset and the attempt's end commit together
+            # or not at all, so a stop between them cannot leave a pending job whose
+            # last attempt still says running. An error at one job keeps those before it.
+            async with self._db.transaction():
+                job = await Job.using(self._db, "qler_jobs").filter(
+                    (F("status") == JobStatus.RUNNING.value)
+                    & (F("lease_expires_at") <= now)
+                ).order_by("lease_expires_at").update_one(
+                    status=JobStatus.PENDING.value,
+                    worker_id="",
+                    lease_expires_at=None,
+                    updated_at=now,
+                    progress=None,
+                    progress_message="",
+                )
+                if job is None:
+                    break
 
+                # Terminalize the attempt as LEASE_EXPIRED
+                await self._terminalize_attempt(
+                    job.last_attempt_id,
+                    AttemptStatus.LEASE_EXPIRED.value,
+                    now,
+                    failure_kind=FailureKind.LEASE_EXPIRED.value,
+                    error="Lease expired",
+                )
+
+            # Told only after the commit
             _lifecycle(
                 "job.lease_recovered", job_id=job.ulid, queue=job.queue_name,
                 task=job.task, correlation_id=job.correlation_id,
-            )
-
-            # Terminalize the attempt as LEASE_EXPIRED
-            await self._terminalize_attempt(
-                job.last_attempt_id,
-                AttemptStatus.LEASE_EXPIRED.value,
-                now,
-                failure_kind=FailureKind.LEASE_EXPIRED.value,
-                error="Lease expired",
             )
             recovered += 1
 
