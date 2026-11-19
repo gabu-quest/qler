@@ -372,7 +372,8 @@ class Worker:
             task_wrapper = self.queue._tasks.get(job.task)
             if task_wrapper is None:
                 logger.error("Task not found: %s (job %s)", job.task, job.ulid)
-                await self.queue.fail_job(
+                await self._finish(
+                    "fail",
                     job,
                     self.worker_id,
                     failure_kind=FailureKind.TASK_NOT_FOUND,
@@ -386,7 +387,8 @@ class Worker:
                 kwargs = payload.get("kwargs", {})
             except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as exc:
                 logger.error("Invalid payload for job %s: %s", job.ulid, exc)
-                await self.queue.fail_job(
+                await self._finish(
+                    "fail",
                     job,
                     self.worker_id,
                     exc,
@@ -403,7 +405,8 @@ class Worker:
                     "Signature mismatch for %s (job %s): %s",
                     job.task, job.ulid, exc,
                 )
-                await self.queue.fail_job(
+                await self._finish(
+                    "fail",
                     job,
                     self.worker_id,
                     exc,
@@ -442,7 +445,8 @@ class Worker:
                     "Task %s timed out after %ss (job %s)",
                     job.task, timeout, job.ulid,
                 )
-                await self.queue.fail_job(
+                await self._finish(
+                    "fail",
                     job,
                     self.worker_id,
                     TimeoutError(
@@ -472,7 +476,8 @@ class Worker:
                     "Task %s cancelled (job %s), marking failed",
                     job.task, job.ulid,
                 )
-                await self.queue.fail_job(
+                await self._finish(
+                    "fail",
                     job,
                     self.worker_id,
                     failure_kind=FailureKind.CANCELLED,
@@ -483,7 +488,8 @@ class Worker:
                     "Task %s failed (job %s): %s",
                     job.task, job.ulid, exc,
                 )
-                await self.queue.fail_job(
+                await self._finish(
+                    "fail",
                     job,
                     self.worker_id,
                     exc,
@@ -492,7 +498,7 @@ class Worker:
                 return
 
             # 5. Complete
-            await self.queue.complete_job(job, self.worker_id, result=result)
+            await self._finish("complete", job, self.worker_id, result=result)
 
         finally:
             duration = time.monotonic() - start_time
@@ -510,6 +516,23 @@ class Worker:
             self._active_jobs.pop(job.ulid, None)
             if self._semaphore is not None:
                 self._semaphore.release()
+
+    async def _finish(self, which: str, job: Any, *args: Any, **kwargs: Any) -> None:
+        """Run the queue's complete_job or fail_job for a job; log it if it raises.
+
+        `which` is "complete" or "fail". The finish is one write, so when it raises
+        nothing was written: the job stays RUNNING with this worker's id and lease, and
+        lease recovery runs it again once the lease ends. The worker logs it and carries
+        on; the database's busy timeout is the retry. CancelledError is not caught.
+        """
+        finish = self.queue.complete_job if which == "complete" else self.queue.fail_job
+        try:
+            await finish(job, *args, **kwargs)
+        except Exception:
+            logger.error(
+                "Could not %s job %s (task %s); left it running for lease recovery",
+                which, job.ulid, job.task, exc_info=True,
+            )
 
     async def _cancel_was_requested(self, job: Any) -> bool:
         """Return True if the user has asked to cancel this job (cancel_requested)."""

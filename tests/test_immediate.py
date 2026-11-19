@@ -1,5 +1,7 @@
 """Tests for immediate mode — Queue(immediate=True) executes jobs inline."""
 
+import sqlite3
+
 import pytest
 import pytest_asyncio
 from qler.enums import AttemptStatus, FailureKind, JobStatus
@@ -13,6 +15,7 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from sqler import AsyncSQLerDB, F
+from sqler.models.async_queryset import AsyncSQLerQuerySet
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required: @task rejects nested functions)
@@ -436,3 +439,54 @@ class TestImmediateTimeout:
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert "timed out" in attempts[0].error
         assert attempts[0].failure_kind == FailureKind.TIMEOUT.value
+
+
+class TestImmediateFailWriteRaises:
+    """A fail_job that raises in immediate mode reaches the caller with nothing written."""
+
+    async def test_failed_fail_write_reaches_caller_and_leaves_job_running(
+        self, imm_queue, monkeypatch
+    ):
+        original = AsyncSQLerQuerySet.update_one
+        seen = {"n": 0}
+
+        async def update_one(self, **fields):
+            if "last_failure_kind" in fields:  # fail_job's update of the job
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+            return await original(self, **fields)
+
+        monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await imm_queue.enqueue(f"{__name__}.boom_task")
+
+        jobs = await Job.query().all()
+        assert [j.status for j in jobs] == [JobStatus.RUNNING.value]
+        attempts = await JobAttempt.query().all()
+        assert [a.status for a in attempts] == [AttemptStatus.RUNNING.value]
+
+
+class TestImmediateRepeatedKeyInBatch:
+    """A key repeated in one batch is one job: run once, every entry is the executed job."""
+
+    @pytest.mark.parametrize("key_field", ["unique_key", "idempotency_key"])
+    async def test_repeated_key_runs_once_and_both_entries_are_executed(
+        self, imm_queue, key_field
+    ):
+        global _call_count
+        _call_count = 0
+        path = f"{__name__}.counted_task"
+
+        results = await imm_queue.enqueue_many(
+            [{"task_path": path, key_field: "k"}, {"task_path": path, key_field: "k"}]
+        )
+
+        assert len(results) == 2
+        assert results[0].ulid == results[1].ulid
+        assert [r.status for r in results] == [JobStatus.COMPLETED.value] * 2
+        assert [r.result for r in results] == [1, 1]
+        assert _call_count == 1
+        attempts = await JobAttempt.query().all()
+        assert len(attempts) == 1
