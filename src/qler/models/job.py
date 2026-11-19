@@ -242,19 +242,23 @@ class Job(AsyncSQLerSafeModel):
     async def retry(self) -> bool:
         """Reset a FAILED job back to PENDING. Returns True if reset, False otherwise.
 
-        Uses atomic update_one() to avoid version mismatch.
+        A dead-lettered job also leaves the dead-letter queue: it goes back to
+        the queue it came from (``original_queue``). A job with no recorded
+        original queue keeps its ``queue_name``.
+
+        One atomic update_one(), guarded on status and on the original_queue
+        that was read, so the reset and the move cannot be separated.
         """
+        current = await Job.query().filter(F("ulid") == self.ulid).first()
+        if current is None:
+            return False
         now = now_epoch()
         updated = await Job.query().filter(
-            (F("ulid") == self.ulid) & (F("status") == JobStatus.FAILED.value)
+            (F("ulid") == self.ulid)
+            & (F("status") == JobStatus.FAILED.value)
+            & (F("original_queue") == current.original_queue)
         ).update_one(
-            status=JobStatus.PENDING.value,
-            eta=now,
-            retry_count=0,
-            finished_at=None,
-            updated_at=now,
-            progress=None,
-            progress_message="",
+            **failed_to_pending_fields(now, target_queue=current.original_queue)
         )
         if updated is None:
             return False
@@ -294,3 +298,25 @@ class Job(AsyncSQLerSafeModel):
             setattr(self, fname, getattr(other, fname))
         self._id = other._id
         self._version = other._version
+
+
+def failed_to_pending_fields(now: int, *, target_queue: str | None) -> dict:
+    """Row fields for a FAILED job leaving the dead-letter queue as PENDING.
+
+    The one rule shared by ``Job.retry`` and ``Queue.replay_job``. With a
+    ``target_queue`` the job moves there and ``original_queue`` is cleared;
+    without one the queue fields are left alone.
+    """
+    fields: dict = {
+        "status": JobStatus.PENDING.value,
+        "retry_count": 0,
+        "finished_at": None,
+        "eta": now,
+        "updated_at": now,
+        "progress": None,
+        "progress_message": "",
+    }
+    if target_queue:
+        fields["queue_name"] = target_queue
+        fields["original_queue"] = ""
+    return fields
