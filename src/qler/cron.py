@@ -77,9 +77,7 @@ class CronWrapper:
         """
         from sqler import F
 
-        from qler.models.job import Job
-
-        last_job = await Job.query().filter(
+        last_job = await self.task_wrapper.queue.jobs.filter(
             F("task") == self.task_path
         ).order_by("-ulid").first()
 

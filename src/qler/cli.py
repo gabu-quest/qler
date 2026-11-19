@@ -485,40 +485,28 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
     async def _status() -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
         q = await _get_queue(db)
         try:
-            sql = """
-                SELECT queue_name, status, COUNT(*) as cnt
-                FROM qler_jobs
-                GROUP BY queue_name, status
-            """
-            cur = await q.db.adapter.execute(sql)
-            rows = await cur.fetchall()
-            await cur.close()
+            rows = await q.jobs.group_by("queue_name", "status").count()
 
             queues: dict[str, dict[str, int]] = {}
-            for queue_name, job_status, count in rows:
+            for row in rows:
+                queue_name, job_status = row["queue_name"], row["status"]
                 if queue_name not in queues:
                     queues[queue_name] = {
                         "pending": 0, "running": 0,
                         "completed": 0, "failed": 0, "cancelled": 0,
                     }
-                queues[queue_name][job_status] = count
+                queues[queue_name][job_status] = row["count"]
 
             archived: dict[str, dict[str, int]] = {}
             if include_archive:
-                sql_archive = """
-                    SELECT queue_name, status, COUNT(*) as cnt
-                    FROM qler_jobs_archive
-                    GROUP BY queue_name, status
-                """
-                cur = await q.db.adapter.execute(sql_archive)
-                rows = await cur.fetchall()
-                await cur.close()
-                for queue_name, job_status, count in rows:
+                rows = await q.archive.group_by("queue_name", "status").count()
+                for row in rows:
+                    queue_name, job_status = row["queue_name"], row["status"]
                     if queue_name not in archived:
                         archived[queue_name] = {
                             "completed": 0, "failed": 0, "cancelled": 0,
                         }
-                    archived[queue_name][job_status] = count
+                    archived[queue_name][job_status] = row["count"]
 
             return queues, archived
         finally:
@@ -597,7 +585,7 @@ def jobs(
     async def _jobs() -> tuple[list[Job], list[Job]]:
         q = await _get_queue(db)
         try:
-            query = Job.query()
+            query = q.jobs
             filters = []
             if filter_status:
                 filters.append(F("status") == filter_status)
@@ -689,7 +677,7 @@ def job(ulid: str, db: str, output_json: bool) -> None:
     async def _job() -> Job | None:
         q = await _get_queue(db)
         try:
-            return await Job.query().filter(F("ulid") == ulid).first()
+            return await q.jobs.filter(F("ulid") == ulid).first()
         finally:
             await q.close()
 
@@ -758,7 +746,7 @@ def attempts(ulid: str, db: str, output_json: bool) -> None:
     async def _attempts() -> list[JobAttempt]:
         q = await _get_queue(db)
         try:
-            return await JobAttempt.query().filter(
+            return await q.attempts.filter(
                 F("job_ulid") == ulid
             ).order_by("ulid").all()
         finally:
@@ -818,7 +806,7 @@ def retry_cmd(
         try:
             retried: list[str] = []
             if ulid:
-                j = await Job.query().filter(F("ulid") == ulid).first()
+                j = await q.jobs.filter(F("ulid") == ulid).first()
                 if j is None:
                     raise click.ClickException(f"Job {ulid} not found")
                 ok = await j.retry()
@@ -835,7 +823,7 @@ def retry_cmd(
                 combined = filters[0]
                 for f in filters[1:]:
                     combined = combined & f
-                matching = await Job.query().filter(combined).all()
+                matching = await q.jobs.filter(combined).all()
                 for j in matching:
                     ok = await j.retry()
                     if ok:
@@ -891,7 +879,7 @@ def cancel_cmd(
             cancelled: list[str] = []
             requested: list[str] = []
             if ulid:
-                j = await Job.query().filter(F("ulid") == ulid).first()
+                j = await q.jobs.filter(F("ulid") == ulid).first()
                 if j is None:
                     raise click.ClickException(f"Job {ulid} not found")
                 if j.status == JobStatus.RUNNING.value:
@@ -924,7 +912,7 @@ def cancel_cmd(
                 combined = filters[0]
                 for f in filters[1:]:
                     combined = combined & f
-                matching = await Job.query().filter(combined).all()
+                matching = await q.jobs.filter(combined).all()
                 for j in matching:
                     ok = await q.cancel_job(j)
                     if ok:
@@ -945,7 +933,7 @@ def cancel_cmd(
                     combined = running_filters[0]
                     for f in running_filters[1:]:
                         combined = combined & f
-                    running_jobs = await Job.query().filter(combined).all()
+                    running_jobs = await q.jobs.filter(combined).all()
                     for j in running_jobs:
                         ok = await j.request_cancel()
                         if ok:
@@ -1030,19 +1018,19 @@ def purge(db: str, older_than: str, filter_status: str | None, output_json: bool
                 statuses = list(TERMINAL_STATUSES)
 
             job_filter = F("status").in_list(statuses) & (F("created_at") <= threshold)
-            matching_jobs = await Job.query().filter(job_filter).all()
+            matching_jobs = await q.jobs.filter(job_filter).all()
 
             if not matching_jobs:
                 return 0
 
             # Delete attempts first (cascade)
             ulids = [j.ulid for j in matching_jobs]
-            await JobAttempt.query().filter(
+            await q.attempts.filter(
                 F("job_ulid").in_list(ulids)
             ).delete_all()
 
             # Delete jobs
-            deleted = await Job.query().filter(job_filter).delete_all()
+            deleted = await q.jobs.filter(job_filter).delete_all()
             return deleted
         finally:
             await q.close()
@@ -1109,7 +1097,7 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             # 3. Expired leases
             try:
                 now = now_epoch()
-                expired = await Job.query().filter(
+                expired = await q.jobs.filter(
                     (F("status") == JobStatus.RUNNING.value)
                     & (F("lease_expires_at") <= now)
                 ).all()
@@ -1125,7 +1113,7 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             if modules:
                 _import_modules(modules)
                 try:
-                    running = await Job.query().filter(
+                    running = await q.jobs.filter(
                         F("status") == JobStatus.RUNNING.value
                     ).all()
                     orphaned = [j for j in running if j.task not in q._tasks]
@@ -1140,7 +1128,7 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             # 5. Stale pending
             try:
                 stale_threshold = now_epoch() - 86400  # 24h
-                stale = await Job.query().filter(
+                stale = await q.jobs.filter(
                     (F("status") == JobStatus.PENDING.value)
                     & (F("created_at") <= stale_threshold)
                 ).all()
@@ -1154,8 +1142,8 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
 
             # 6. Database size
             try:
-                job_count = await Job.query().count()
-                attempt_count = await JobAttempt.query().count()
+                job_count = await q.jobs.count()
+                attempt_count = await q.attempts.count()
                 db_size = os.path.getsize(db) if os.path.exists(db) else 0
                 checks.append({
                     "check": "database_size",
@@ -1222,7 +1210,7 @@ def cron_cmd(
             tasks = []
             for path, cw in q._cron_tasks.items():
                 # Count active jobs for this cron task
-                active_count = await Job.query().filter(
+                active_count = await q.jobs.filter(
                     (F("task") == path)
                     & F("status").in_list(["pending", "running"])
                 ).count()
@@ -1300,7 +1288,7 @@ def tasks_cmd(
                     continue
 
                 # Count active jobs (pending + running)
-                active_count = await Job.query().filter(
+                active_count = await q.jobs.filter(
                     (F("task") == path)
                     & F("status").in_list(["pending", "running"])
                 ).count()
@@ -1449,7 +1437,7 @@ def dlq_list(ctx: click.Context, limit: int, since: str | None, filter_task: str
             for f in filters[1:]:
                 combined = combined & f
 
-            return await Job.query().filter(combined).order_by("-ulid").limit(limit).all()
+            return await q.jobs.filter(combined).order_by("-ulid").limit(limit).all()
         finally:
             await q.close()
 
@@ -1497,7 +1485,7 @@ def dlq_count(ctx: click.Context) -> None:
     async def _count() -> int:
         q = await _get_queue(db_path)
         try:
-            return await Job.query().filter(
+            return await q.jobs.filter(
                 (F("queue_name") == dlq_name) & (F("status") == JobStatus.FAILED.value)
             ).count()
         finally:
@@ -1521,7 +1509,7 @@ def dlq_job(ctx: click.Context, ulid: str) -> None:
     async def _job() -> Job | None:
         q = await _get_queue(db_path)
         try:
-            return await Job.query().filter(
+            return await q.jobs.filter(
                 (F("ulid") == ulid)
                 & (F("queue_name") == dlq_name)
                 & (F("status") == JobStatus.FAILED.value)
@@ -1565,7 +1553,7 @@ def dlq_replay(
         try:
             replayed: list[dict[str, str]] = []
             if ulid:
-                j = await Job.query().filter(
+                j = await q.jobs.filter(
                     (F("ulid") == ulid)
                     & (F("queue_name") == dlq_name)
                     & (F("status") == JobStatus.FAILED.value)
@@ -1582,7 +1570,7 @@ def dlq_replay(
                         "status": updated.status,
                     })
             else:
-                jobs = await Job.query().filter(
+                jobs = await q.jobs.filter(
                     (F("queue_name") == dlq_name)
                     & (F("status") == JobStatus.FAILED.value)
                 ).all()
@@ -1635,7 +1623,7 @@ def logs(ulid: str, db: str, level: str | None, limit: int, output_json: bool) -
     async def _logs():
         q = await _get_queue(db)
         try:
-            found = await Job.query().filter(_F("ulid") == ulid).first()
+            found = await q.jobs.filter(_F("ulid") == ulid).first()
             return found
         finally:
             await q.close()
@@ -1709,16 +1697,16 @@ def dlq_purge(ctx: click.Context, older_than: str | None, confirm: bool) -> None
                 combined = combined & f
 
             # Delete associated attempts first
-            matching_jobs = await Job.query().filter(combined).all()
+            matching_jobs = await q.jobs.filter(combined).all()
             if not matching_jobs:
                 return 0
 
             ulids = [j.ulid for j in matching_jobs]
-            await JobAttempt.query().filter(
+            await q.attempts.filter(
                 F("job_ulid").in_list(ulids)
             ).delete_all()
 
-            return await Job.query().filter(combined).delete_all()
+            return await q.jobs.filter(combined).delete_all()
         finally:
             await q.close()
 
