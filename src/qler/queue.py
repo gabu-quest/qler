@@ -14,6 +14,7 @@ from sqler.exceptions import UniqueConstraintError
 
 from qler._context import _current_job
 from qler._notify import fire as _notify_fire
+from qler._sqler import grouped_count
 from qler._time import generate_ulid, now_epoch
 from qler.enums import RETRYABLE_FAILURES, AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
@@ -152,7 +153,7 @@ class Queue:
 
     async def _migrate_rate_limit_bucket_key_column(self) -> None:
         """Rename the legacy reserved-word bucket column to ``bucket_key``."""
-        found = await self._db.execute_sql(
+        found = await self.db.execute_sql(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='qler_rate_limit_buckets';"
         )
         if not found:
@@ -160,24 +161,24 @@ class Queue:
 
         columns = {
             col["name"]
-            for col in await self._db.execute_sql('PRAGMA table_info("qler_rate_limit_buckets");')
+            for col in await self.db.execute_sql('PRAGMA table_info("qler_rate_limit_buckets");')
         }
 
         if "key" in columns and "bucket_key" not in columns:
             # Upgrade step for databases made by qler 0.2.0 to 0.5.0; sqler has no column rename,
             # and execute_sql takes only reads, so the rename stays on the adapter.
-            cur = await self._db.adapter.execute(
+            cur = await self.db.adapter.execute(
                 'ALTER TABLE "qler_rate_limit_buckets" RENAME COLUMN "key" TO bucket_key'
             )
             await cur.close()
-            await self._db.adapter.auto_commit()
+            await self.db.adapter.auto_commit()
 
     async def _create_unique_indexes(self) -> None:
         """Create the UNIQUE indexes on the ulid columns and the bucket key.
 
         The idempotency-key and unique-key indexes are made by ``_create_key_index``.
         """
-        db = self._db
+        db = self.db
         await db.create_index("qler_jobs", "ulid", unique=True, name="idx_qler_jobs_ulid")
         await db.create_index(
             "qler_job_attempts", "ulid", unique=True, name="idx_qler_job_attempts_ulid"
@@ -199,27 +200,31 @@ class Queue:
 
         if self._db is None:
             # on_disk sets the PRAGMAs: WAL, busy_timeout 5000, synchronous NORMAL, wal_autocheckpoint 1000.
+            if self._db_path is None:
+                raise RuntimeError("Queue has neither a database nor a path to open one.")
             self._db = AsyncSQLerDB.on_disk(self._db_path)
             await self._db.connect()
 
+        db = self.db
+
         await self._migrate_schema()
 
-        Job.set_db(self._db, "qler_jobs")
-        JobAttempt.set_db(self._db, "qler_job_attempts")
-        RateLimitBucket.set_db(self._db, "qler_rate_limit_buckets")
+        Job.set_db(db, "qler_jobs")
+        JobAttempt.set_db(db, "qler_job_attempts")
+        RateLimitBucket.set_db(db, "qler_rate_limit_buckets")
 
         # Tables with promoted columns, CHECK constraints and a version column. ensure_table
         # also adds a promoted column an existing table lacks.
-        await self._db.ensure_table(
+        await db.ensure_table(
             "qler_jobs", promoted=Job.__promoted__, checks=Job.__checks__, versioned=True
         )
-        await self._db.ensure_table(
+        await db.ensure_table(
             "qler_job_attempts",
             promoted=JobAttempt.__promoted__,
             checks=JobAttempt.__checks__,
             versioned=True,
         )
-        await self._db.ensure_table(
+        await db.ensure_table(
             "qler_rate_limit_buckets",
             promoted=RateLimitBucket.__promoted__,
             checks=RateLimitBucket.__checks__,
@@ -227,15 +232,13 @@ class Queue:
         )
 
         # Reverse dependency map: the children of a parent, read through its UNIQUE index
-        await self._db.ensure_table(
-            JobDependency.__tablename__, promoted=JobDependency.__promoted__
-        )
+        await db.ensure_table(JobDependency.__tablename__, promoted=JobDependency.__promoted__)
 
         await self._create_indexes()
         await self._upgrade_job_deps_from_0_5_1()
 
         # Create archive table with same schema (no indexes — read-only)
-        await self._db.ensure_table(
+        await db.ensure_table(
             "qler_jobs_archive", promoted=Job.__promoted__, checks=Job.__checks__, versioned=True
         )
         await self._create_unique_indexes()
@@ -248,7 +251,7 @@ class Queue:
 
     async def _create_indexes(self) -> None:
         """Create all required indexes (idempotent)."""
-        db = self._db
+        db = self.db
         # 1. Claim: pick highest-priority pending job with earliest ETA and no pending deps
         await db.drop_index("idx_qler_jobs_claim")
         await db.create_index(
@@ -323,7 +326,7 @@ class Queue:
         takes the write lock at its start: a second process starting on the same file at the
         same time waits for it, then finds the view. Every edge is there once.
         """
-        db = self._db
+        db = self.db
         async with db.transaction():
             found = await db.execute_sql(
                 "SELECT type FROM sqlite_master WHERE name='qler_job_deps'"
@@ -363,18 +366,17 @@ class Queue:
         the write lock keeps working. The next start after the duplicates are gone makes the
         index.
         """
-        db = self._db
+        db = self.db
         async with db.transaction():
             if spec.lookup_name is not None:
                 await Job.add_index(
                     spec.field, name=spec.lookup_name, where=spec.lookup_where, db=db
                 )
-            dups = await (
+            dups = await grouped_count(
                 Job.using(db, "qler_jobs")
                 .filter(F(spec.field).is_not_null() & spec.active)
                 .group_by(spec.field)
                 .having(F("_count") > 1)
-                .count()
             )
             if not dups:
                 await Job.add_index(
@@ -519,8 +521,8 @@ class Queue:
         # run in one transaction that holds the write lock from its start, so no other
         # enqueue (task, connection or process) can write the same key between the check
         # and the save. The UNIQUE indexes on the keys are the database's own guard.
-        jobs_q = Job.using(self._db, "qler_jobs")
-        async with self._db.transaction():
+        jobs_q = Job.using(self.db, "qler_jobs")
+        async with self.db.transaction():
             idem_existing = await self._active_by_key(jobs_q, "idempotency_key", specs)
             unique_existing = await self._active_by_key(jobs_q, "unique_key", specs)
 
@@ -636,9 +638,9 @@ class Queue:
 
             if len(new_jobs) == 1:
                 # One row is one INSERT; save_many would wrap it in a savepoint of its own
-                await new_jobs[0].save(db=self._db)
+                await new_jobs[0].save(db=self.db)
             elif new_jobs:
-                await Job.save_many(new_jobs, db=self._db)
+                await Job.save_many(new_jobs, db=self.db)
             # Each job's dependencies list holds a parent once: one edge per (parent, child)
             edges = [
                 JobDependency(parent_ulid=dep_ulid, child_ulid=job.ulid)
@@ -646,7 +648,7 @@ class Queue:
                 for dep_ulid in job.dependencies
             ]
             if edges:
-                await JobDependency.save_many(edges, db=self._db)
+                await JobDependency.save_many(edges, db=self.db)
 
         # Told only after the commit, and only of the jobs this call created
         extra = {"batch": True} if batch else {}
@@ -686,7 +688,7 @@ class Queue:
 
         # Transition PENDING → RUNNING
         claimed = (
-            await Job.using(self._db, "qler_jobs")
+            await Job.using(self.db, "qler_jobs")
             .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value))
             .update_one(
                 status=JobStatus.RUNNING.value,
@@ -725,7 +727,7 @@ class Queue:
                 ),
                 failure_kind=FailureKind.TASK_NOT_FOUND,
             )
-            updated = await Job.using(self._db, "qler_jobs").filter(F("ulid") == job.ulid).first()
+            updated = await Job.using(self.db, "qler_jobs").filter(F("ulid") == job.ulid).first()
             raise TaskNotRegisteredError(
                 f"Task '{job.task}' is not registered on this queue. "
                 "Register it with @task(queue) before enqueuing.",
@@ -774,7 +776,7 @@ class Queue:
         else:
             await self.complete_job(job, worker_id, result=result)
 
-        updated = await Job.using(self._db, "qler_jobs").filter(F("ulid") == job.ulid).first()
+        updated = await Job.using(self.db, "qler_jobs").filter(F("ulid") == job.ulid).first()
         return updated if updated is not None else job
 
     # ------------------------------------------------------------------
@@ -821,7 +823,7 @@ class Queue:
             raise ConfigurationError("n must be >= 1")
 
         now_ts = now_epoch()
-        jobs_table = Job.using(self._db, "qler_jobs")
+        jobs_table = Job.using(self.db, "qler_jobs")
         # The lease is each job's own lease_duration, read from its row by the update.
         eligible = jobs_table.filter(
             (F("status") == JobStatus.PENDING.value)
@@ -841,7 +843,7 @@ class Queue:
         # rate-limit writes and every attempt record commit together or not at all, so a
         # failure at any job leaves every job of the claim pending as before it.
         claimed: list[Job] = []
-        async with self._db.transaction():
+        async with self.db.transaction():
             if n == 1:
                 # One job: its attempt id goes into the claiming update itself.
                 attempt_id = generate_ulid()
@@ -880,7 +882,7 @@ class Queue:
                     worker_id=worker_id,
                     started_at=now_ts,
                     lease_expires_at=job.lease_expires_at,
-                ).save(db=self._db)
+                ).save(db=self.db)
                 claimed.append(job)
 
         # Events and metrics only for the jobs the committed claim returns.
@@ -903,7 +905,7 @@ class Queue:
     async def _poison_pill(self, job: Job, worker_id: str, attempt_id: str, now_ts: int) -> None:
         """Handle a job with an unparseable payload (inside the claim's transaction)."""
         await (
-            Job.using(self._db, "qler_jobs")
+            Job.using(self.db, "qler_jobs")
             .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value))
             .update_one(
                 status=JobStatus.FAILED.value,
@@ -927,7 +929,7 @@ class Queue:
             failure_kind=FailureKind.PAYLOAD_INVALID.value,
             error="Payload is not valid JSON",
         )
-        await attempt.save(db=self._db)
+        await attempt.save(db=self.db)
 
     # ------------------------------------------------------------------
     # Complete
@@ -977,9 +979,9 @@ class Queue:
         # a dying process) cannot leave a completed parent above children whose count
         # nothing will lower again. The outside world hears only of a committed completion.
         now = now_epoch()
-        async with self._db.transaction():
+        async with self.db.transaction():
             updated = (
-                await Job.using(self._db, "qler_jobs")
+                await Job.using(self.db, "qler_jobs")
                 .filter(
                     (F("ulid") == job.ulid)
                     & (F("status") == JobStatus.RUNNING.value)
@@ -1066,9 +1068,9 @@ class Queue:
         # between them cannot leave a failed parent above pending children that will
         # neither run nor be cancelled. The outside world hears only of what committed.
         cancelled: list[str] = []
-        async with self._db.transaction():
+        async with self.db.transaction():
             updated = (
-                await Job.using(self._db, "qler_jobs")
+                await Job.using(self.db, "qler_jobs")
                 .filter(
                     (F("ulid") == job.ulid)
                     & (F("status") == JobStatus.RUNNING.value)
@@ -1148,9 +1150,9 @@ class Queue:
             # One transaction per job: the reset and the attempt's end commit together
             # or not at all, so a stop between them cannot leave a pending job whose
             # last attempt still says running. An error at one job keeps those before it.
-            async with self._db.transaction():
+            async with self.db.transaction():
                 job = (
-                    await Job.using(self._db, "qler_jobs")
+                    await Job.using(self.db, "qler_jobs")
                     .filter(
                         (F("status") == JobStatus.RUNNING.value) & (F("lease_expires_at") <= now)
                     )
@@ -1220,8 +1222,8 @@ class Queue:
         One transaction (a savepoint inside the caller's): every child is decremented,
         or none is.
         """
-        jobs = Job.using(self._db, "qler_jobs")
-        async with self._db.transaction():
+        jobs = Job.using(self.db, "qler_jobs")
+        async with self.db.transaction():
             children = await self._children_of(completed_ulid)
 
             now = now_epoch()
@@ -1242,10 +1244,10 @@ class Queue:
         cancelled, or none of it. Returns the ULIDs it cancelled, in order, so the
         caller notifies waiters only after its own commit.
         """
-        jobs = Job.using(self._db, "qler_jobs")
+        jobs = Job.using(self.db, "qler_jobs")
         now = now_epoch()
         cancelled_ulids: list[str] = []
-        async with self._db.transaction():
+        async with self.db.transaction():
             # A level at a time: one read for the edges of every job on the level, then
             # its parents in order, each one's children ascending, as a job-by-job walk
             # would go. A child is tried once, under the first parent that reaches it.
@@ -1281,9 +1283,9 @@ class Queue:
         the commit, and only for what was committed.
         """
         now = now_epoch()
-        async with self._db.transaction():
+        async with self.db.transaction():
             updated = (
-                await Job.using(self._db, "qler_jobs")
+                await Job.using(self.db, "qler_jobs")
                 .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value))
                 .update_one(
                     status=JobStatus.CANCELLED.value,
@@ -1324,7 +1326,7 @@ class Queue:
         now = now_epoch()
         try:
             updated = (
-                await Job.using(self._db, "qler_jobs")
+                await Job.using(self.db, "qler_jobs")
                 .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value))
                 .update_one(**failed_to_pending_fields(now, target_queue=target_queue))
             )
@@ -1345,7 +1347,7 @@ class Queue:
         # Queue-level rate limit
         queue_rate = self._rate_limits.get(job.queue_name)
         if queue_rate is not None:
-            allowed = await try_acquire(f"queue:{job.queue_name}", queue_rate, db=self._db)
+            allowed = await try_acquire(f"queue:{job.queue_name}", queue_rate, db=self.db)
             if not allowed:
                 await self._requeue_rate_limited(job, worker_id, queue_rate, now_ts)
                 return True
@@ -1353,7 +1355,7 @@ class Queue:
         # Task-level rate limit
         task_wrapper = self._tasks.get(job.task)
         if task_wrapper is not None and task_wrapper.rate_spec is not None:
-            allowed = await try_acquire(f"task:{job.task}", task_wrapper.rate_spec, db=self._db)
+            allowed = await try_acquire(f"task:{job.task}", task_wrapper.rate_spec, db=self.db)
             if not allowed:
                 await self._requeue_rate_limited(job, worker_id, task_wrapper.rate_spec, now_ts)
                 return True
@@ -1366,7 +1368,7 @@ class Queue:
         """Requeue a rate-limited job back to PENDING with a delayed ETA."""
         delay = max(1, int(1.0 / rate.refill_rate)) if rate.refill_rate > 0 else 1
         await (
-            Job.using(self._db, "qler_jobs")
+            Job.using(self.db, "qler_jobs")
             .filter(
                 (F("ulid") == job.ulid)
                 & (F("status") == JobStatus.RUNNING.value)
@@ -1409,7 +1411,7 @@ class Queue:
             update_fields["failure_kind"] = failure_kind
 
         await (
-            JobAttempt.using(self._db, "qler_job_attempts")
+            JobAttempt.using(self.db, "qler_job_attempts")
             .filter((F("ulid") == attempt_id) & (F("status") == AttemptStatus.RUNNING.value))
             .update_one(**update_fields)
         )
@@ -1421,10 +1423,13 @@ class Queue:
 
     async def _query_queue_depth(self) -> list[tuple[str, str, int]]:
         """Async query for queue depth — called before /metrics generation."""
-        if self._db is None:
+        db = self._db
+        if db is None:
             return []
         try:
-            groups = await Job.using(self._db, "qler_jobs").group_by("queue_name", "status").count()
+            groups = await grouped_count(
+                Job.using(db, "qler_jobs").group_by("queue_name", "status")
+            )
             return [(g["queue_name"], g["status"], g["count"]) for g in groups]
         except Exception:
             # A scrape must not fail, but the reason it came back empty is logged.
@@ -1450,7 +1455,7 @@ class Queue:
             F("status").in_list(list(self._TERMINAL_STATUSES)) & (F("finished_at") < threshold)
         )
 
-        async with self._db.transaction():
+        async with self.db.transaction():
             moved = await archivable.distinct_values("ulid")
             if not moved:
                 return 0
@@ -1487,7 +1492,7 @@ class Queue:
     ) -> list[Job]:
         """Query archived jobs (read-only)."""
         await self._lazy_init()
-        query = Job.using(self._db, "qler_jobs_archive")
+        query = Job.using(self.db, "qler_jobs_archive")
         filters = []
         if queue_name:
             filters.append(F("queue_name") == queue_name)
@@ -1503,7 +1508,7 @@ class Queue:
     async def pool_health(self) -> dict[str, Any]:
         """Report connection pool state for monitoring."""
         await self._lazy_init()
-        stats = self._db.pool_stats()
+        stats = self.db.pool_stats()
         return {
             "pool_size": stats.max_connections,
             "available": stats.available_connections,
@@ -1513,7 +1518,7 @@ class Queue:
     async def archive_count(self) -> int:
         """Return total number of archived jobs."""
         await self._lazy_init()
-        return await Job.using(self._db, "qler_jobs_archive").count()
+        return await Job.using(self.db, "qler_jobs_archive").count()
 
     async def close(self) -> None:
         """Close the database connection if we own it."""
