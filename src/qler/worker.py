@@ -27,7 +27,7 @@ try:
 except ImportError:
 
     @contextmanager
-    def correlation_context(correlation_id: str):  # type: ignore[misc]
+    def correlation_context(correlation_id: str):
         yield correlation_id
 
 
@@ -102,7 +102,7 @@ class Worker:
 
         self._running = False
         self._started_at = now_epoch()
-        self._semaphore: asyncio.Semaphore | None = None
+        self._semaphore = asyncio.Semaphore(concurrency)
         self._active_jobs: dict[str, Any] = {}  # ulid -> Job
         self._active_tasks: set[asyncio.Task] = set()
         self._background_tasks: list[asyncio.Task] = []
@@ -244,6 +244,7 @@ class Worker:
         """Start the worker loop. Blocks until shutdown."""
         await self.queue.init_db()
         self._running = True
+        # A fresh semaphore per run: a worker run a second time starts with all its permits.
         self._semaphore = asyncio.Semaphore(self.concurrency)
 
         # Install signal handlers (may fail in non-main thread / pytest)
@@ -273,9 +274,13 @@ class Worker:
             if self.health_port is not None or self.health_socket is not None:
                 self._background_tasks.append(asyncio.create_task(self._health_server_loop()))
             if self.archive_interval is not None:
-                self._background_tasks.append(asyncio.create_task(self._archival_loop()))
+                self._background_tasks.append(
+                    asyncio.create_task(self._archival_loop(self.archive_interval))
+                )
             if self.memory_limit_mb is not None:
-                self._background_tasks.append(asyncio.create_task(self._memory_watchdog_loop()))
+                self._background_tasks.append(
+                    asyncio.create_task(self._memory_watchdog_loop(self.memory_limit_mb))
+                )
 
             # Main claim loop
             await self._claim_loop()
@@ -493,8 +498,7 @@ class Worker:
             _current_job.reset(token)
             _current_queue.reset(queue_token)
             self._active_jobs.pop(job.ulid, None)
-            if self._semaphore is not None:
-                self._semaphore.release()
+            self._semaphore.release()
 
     async def _finish(self, which: str, job: Any, *args: Any, **kwargs: Any) -> None:
         """Run the queue's complete_job or fail_job for a job; log it if it raises.
@@ -580,10 +584,10 @@ class Worker:
             except Exception:
                 logger.exception("Error in lease recovery loop")
 
-    async def _archival_loop(self) -> None:
+    async def _archival_loop(self, interval: float) -> None:
         """Background task: periodically archive terminal jobs."""
         while self._running:
-            await asyncio.sleep(self.archive_interval)
+            await asyncio.sleep(interval)
             if not self._running:
                 break
             try:
@@ -593,7 +597,7 @@ class Worker:
             except Exception:
                 logger.exception("Error in archival loop")
 
-    async def _memory_watchdog_loop(self) -> None:
+    async def _memory_watchdog_loop(self, limit_mb: int) -> None:
         """Background task: log warnings and trigger archival when RSS exceeds limit."""
         while self._running:
             await asyncio.sleep(30)
@@ -610,12 +614,12 @@ class Worker:
                         rss_mb = rss_raw / 1024  # Linux: KB -> MB
                 except ImportError:
                     continue  # resource module unavailable on Windows
-                if rss_mb > self.memory_limit_mb:
+                if rss_mb > limit_mb:
                     logger.warning(
                         "Memory watchdog: RSS %.0f MB exceeds limit %d MB, "
                         "triggering emergency archival",
                         rss_mb,
-                        self.memory_limit_mb,
+                        limit_mb,
                     )
                     count = await self.queue.archive_jobs(older_than_seconds=0)
                     if count:
