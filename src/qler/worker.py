@@ -43,6 +43,26 @@ SHUTDOWN_CUT_GRACE = 5.0
 _RENEWAL_MIN_SLEEP = 0.25
 
 
+def _run_then_signal(
+    fn: Any,
+    args: list[Any],
+    kwargs: dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
+    returned: asyncio.Future[None],
+) -> Any:
+    """Run a sync task's function in its thread; set `returned` on the loop once it is over."""
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        with suppress(RuntimeError):  # the loop has closed: no one is waiting
+            loop.call_soon_threadsafe(_set_returned, returned)
+
+
+def _set_returned(returned: asyncio.Future[None]) -> None:
+    if not returned.done():
+        returned.set_result(None)
+
+
 class Worker:
     """Async worker that claims and executes jobs from one or more queues.
 
@@ -117,6 +137,10 @@ class Worker:
         self._cut_by_shutdown: set[str] = set()
         self._left_for_recovery: list[str] = []
         self._failed_on_cut: list[str] = []
+        # ulid -> a future set once a sync task's function has returned in its
+        # thread; the entry goes when it is set. A cancelled to_thread await ends
+        # while the thread runs on, so this, not the task, says the work is over.
+        self._thread_running: dict[str, asyncio.Future[None]] = {}
 
     @property
     def status(self) -> str:
@@ -406,7 +430,14 @@ class Worker:
                 try:
                     with correlation_context(correlation_id):
                         if task_wrapper.sync:
-                            coro = asyncio.to_thread(fn, *args, **kwargs)
+                            coro = asyncio.to_thread(
+                                _run_then_signal,
+                                fn,
+                                args,
+                                kwargs,
+                                asyncio.get_running_loop(),
+                                self._track_thread(job.ulid),
+                            )
                         else:
                             coro = fn(*args, **kwargs)
                         if timeout is not None:
@@ -445,7 +476,7 @@ class Worker:
                     self._left_for_recovery.append(job.ulid)
                     logger.warning(
                         "Shutdown stopped task %s (job %s) before it finished; "
-                        "left it running for lease recovery",
+                        "its lease is released once its work has ended",
                         job.task,
                         job.ulid,
                     )
@@ -519,6 +550,18 @@ class Worker:
                 job.task,
                 exc_info=True,
             )
+
+    def _track_thread(self, ulid: str) -> asyncio.Future[None]:
+        """Register a sync job's thread in _thread_running; return the future it sets."""
+        returned: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._thread_running[ulid] = returned
+
+        def forget(fut: asyncio.Future[None]) -> None:
+            if self._thread_running.get(ulid) is fut:
+                del self._thread_running[ulid]
+
+        returned.add_done_callback(forget)
+        return returned
 
     async def _cancel_was_requested(self, job: Any) -> bool:
         """Return True if the user has asked to cancel this job (cancel_requested)."""
@@ -735,9 +778,13 @@ class Worker:
     async def _drain(self) -> None:
         """Wait for active jobs; cut those still running after shutdown_timeout.
 
-        After the cut, wait at most SHUTDOWN_CUT_GRACE for the cut tasks to end.
-        A task still going then (it swallowed the cancel) is logged by job id
-        and left; its row stays RUNNING for lease recovery.
+        After the cut, wait at most SHUTDOWN_CUT_GRACE for the cut tasks to end,
+        and for the threads of cut sync tasks to return. Within that same bound,
+        each cut job whose work is over (its task done and, for a sync task, its
+        function returned) is released: lease recovery's transition, at once, so
+        another worker claims it without waiting out the lease. A job still going
+        then (it swallowed the cancel, or its thread runs on), or whose release
+        failed, keeps its lease and is logged by job id; lease recovery takes it.
         """
         if not self._active_tasks:
             return
@@ -746,30 +793,91 @@ class Worker:
         # writing its outcome is left to finish the write, so no row is
         # left half recorded. No await between the wait and the cuts, so
         # _in_task_body is the state at the moment the timeout passed.
-        cut: dict[asyncio.Task, str] = {}
+        cut: dict[str, asyncio.Task] = {}
         for ulid, t in list(self._in_task_body.items()):
             if t in pending:
                 self._cut_by_shutdown.add(ulid)
-                cut[t] = ulid
+                cut[ulid] = t
                 t.cancel()
         if not pending:
             return
-        _ended, still_going = await asyncio.wait(pending, timeout=SHUTDOWN_CUT_GRACE)
-        not_stopped = sorted(cut.get(t, "<writing its outcome>") for t in still_going)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SHUTDOWN_CUT_GRACE
+        # A cut sync task's await ends at once; its thread may run on.
+        waiting: set[asyncio.Future[Any]] = set(pending)
+        waiting.update(self._thread_running[u] for u in cut if u in self._thread_running)
+        handled: set[str] = set()
+        released = 0
+        failed: list[str] = []
+        while True:
+            # Release each job the cut left whose work is proven over: its task is
+            # done and no thread of it is still running. As soon as it is, so a
+            # task that ignores the cut does not spend the others' time.
+            # Only this shutdown's cut: a worker run a second time still lists the
+            # jobs its earlier shutdown left.
+            for ulid in self._left_for_recovery:
+                if ulid in handled or ulid not in cut:
+                    continue
+                if not cut[ulid].done() or ulid in self._thread_running:
+                    continue
+                handled.add(ulid)
+                outcome = await self._release(ulid, deadline - loop.time())
+                if outcome == "released":
+                    released += 1
+                elif outcome == "failed":
+                    failed.append(ulid)
+            waiting = {f for f in waiting if not f.done()}
+            remaining = deadline - loop.time()
+            if not waiting or remaining <= 0:
+                break
+            await asyncio.wait(waiting, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+
+        ulid_of = {t: u for u, t in cut.items()}
+        kept = sorted(
+            {ulid_of.get(t, "<writing its outcome>") for t in pending if not t.done()}
+            | {u for u in self._left_for_recovery if u in cut and u not in handled}
+            | set(failed)
+        )
+
         logger.warning(
             "Shutdown timeout of %ss passed with %d job(s) unfinished: "
-            "left %d running for lease recovery, failed %d as cancelled "
-            "because their cancel was requested",
+            "released %d to be claimed at once, %d keep their lease for lease recovery, "
+            "failed %d as cancelled because their cancel was requested",
             self.shutdown_timeout,
             len(pending),
-            len(self._left_for_recovery),
-            len(self._failed_on_cut),
+            released,
+            len(kept),
+            sum(1 for u in self._failed_on_cut if u in cut),
         )
-        if not_stopped:
+        if kept:
             logger.warning(
-                "%d job(s) did not stop within the %ss grace after the cut and "
-                "were left running for lease recovery: %s",
-                len(not_stopped),
+                "%d job(s) keep their lease for lease recovery (still running %ss "
+                "after the cut, or their release failed): %s",
+                len(kept),
                 SHUTDOWN_CUT_GRACE,
-                ", ".join(not_stopped),
+                ", ".join(kept),
             )
+
+    async def _release(self, ulid: str, remaining: float) -> str:
+        """Release one cut job whose work is over, within `remaining` seconds.
+
+        Returns "released"; "moved" when the guarded write found the job moved
+        already (lease recovery, a cancel or another worker came first), so it is
+        no longer this worker's to report; or "failed" when the write raised or
+        outlasted the bound, which is logged as an error and leaves the job for
+        lease recovery. Never raises an Exception out of the drain.
+        """
+        try:
+            if remaining <= 0:
+                raise TimeoutError("no time left in the shutdown's grace")
+            async with asyncio.timeout(remaining):
+                released = await self.queue._release_lease(ulid, self.worker_id)
+        except Exception:
+            logger.error(
+                "Could not release job %s after the shutdown cut; "
+                "left it running for lease recovery",
+                ulid,
+                exc_info=True,
+            )
+            return "failed"
+        return "released" if released else "moved"

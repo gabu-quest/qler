@@ -9,7 +9,7 @@ import random
 import traceback as tb_module
 from typing import TYPE_CHECKING, Any
 
-from sqler import AsyncSQLerDB, AsyncSQLerQuerySet, F
+from sqler import AsyncSQLerDB, AsyncSQLerQuerySet, F, SQLerExpression
 from sqler.exceptions import UniqueConstraintError
 
 from qler._context import _current_job
@@ -912,50 +912,77 @@ class Queue:
         recovered = 0
 
         for _ in range(max_per_tick):
-            # One transaction per job: the reset and the attempt's end commit together
-            # or not at all, so a stop between them cannot leave a pending job whose
-            # last attempt still says running. An error at one job keeps those before it.
-            async with self.db.transaction():
-                job = (
-                    await self.jobs.filter(
-                        (F("status") == JobStatus.RUNNING.value) & (F("lease_expires_at") <= now)
-                    )
-                    .order_by("lease_expires_at")
-                    .update_one(
-                        status=JobStatus.PENDING.value,
-                        worker_id="",
-                        lease_expires_at=None,
-                        updated_at=now,
-                        progress=None,
-                        progress_message="",
-                    )
-                )
-                if job is None:
-                    break
-
-                # Terminalize the attempt as LEASE_EXPIRED
-                await self._terminalize_attempt(
-                    job.last_attempt_id,
-                    AttemptStatus.LEASE_EXPIRED.value,
-                    now,
-                    failure_kind=FailureKind.LEASE_EXPIRED.value,
-                    error="Lease expired",
-                )
-
-            # Told only after the commit
-            _lifecycle(
-                "job.lease_recovered",
-                job_id=job.ulid,
-                queue=job.queue_name,
-                task=job.task,
-                correlation_id=job.correlation_id,
-            )
+            expired = (F("status") == JobStatus.RUNNING.value) & (F("lease_expires_at") <= now)
+            if await self._recover_one(expired, now) is None:
+                break
             recovered += 1
 
         if self._metrics and recovered:
             self._metrics.inc_leases_recovered(recovered)
 
         return recovered
+
+    async def _release_lease(self, job_ulid: str, worker_id: str) -> bool:
+        """Recover one job at once, before its lease ends, if `worker_id` still runs it.
+
+        For a worker whose shutdown cut the job and whose task has ended: the job
+        becomes what lease recovery makes it. The write is guarded, so a job that
+        lease recovery, a cancel or another worker already moved is left alone.
+        Returns True if the job was released.
+        """
+        now = now_epoch()
+        still_ours = (
+            (F("ulid") == job_ulid)
+            & (F("status") == JobStatus.RUNNING.value)
+            & (F("worker_id") == worker_id)
+        )
+        if await self._recover_one(still_ours, now) is None:
+            return False
+        if self._metrics:
+            self._metrics.inc_leases_recovered(1)
+        return True
+
+    async def _recover_one(self, where: SQLerExpression, now: int) -> Job | None:
+        """Return the first RUNNING job matching `where` to PENDING, as lease recovery does.
+
+        Its attempt ends as LEASE_EXPIRED; its retry count is kept (a lost lease is
+        not a task failure). One transaction: the reset and the attempt's end commit
+        together or not at all, so a stop between them cannot leave a pending job
+        whose last attempt still says running. Returns the job, or None if none matched.
+        """
+        async with self.db.transaction():
+            job = (
+                await self.jobs.filter(where)
+                .order_by("lease_expires_at")
+                .update_one(
+                    status=JobStatus.PENDING.value,
+                    worker_id="",
+                    lease_expires_at=None,
+                    updated_at=now,
+                    progress=None,
+                    progress_message="",
+                )
+            )
+            if job is None:
+                return None
+
+            await self._terminalize_attempt(
+                job.last_attempt_id,
+                AttemptStatus.LEASE_EXPIRED.value,
+                now,
+                failure_kind=FailureKind.LEASE_EXPIRED.value,
+                error="Lease expired",
+            )
+
+        # Told only after the commit
+        _lifecycle(
+            "job.lease_recovered",
+            job_id=job.ulid,
+            queue=job.queue_name,
+            task=job.task,
+            correlation_id=job.correlation_id,
+        )
+        return job
 
     # ------------------------------------------------------------------
     # Dependencies
