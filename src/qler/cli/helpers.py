@@ -35,6 +35,11 @@ TERMINAL_STATUSES = frozenset(
 )
 
 
+def _count_jobs(n: int) -> str:
+    """Return "1 job" or "N jobs"."""
+    return f"{n} job" if n == 1 else f"{n} jobs"
+
+
 def _run(coro: Any) -> Any:
     """Bridge async → sync for Click commands."""
     return asyncio.run(coro)

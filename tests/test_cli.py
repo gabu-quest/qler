@@ -544,6 +544,20 @@ class TestStatus:
         assert "email" in result.output
         assert "Total:" in result.output
 
+    def test_single_job_total_is_singular(self, runner, db_path):
+        import asyncio
+
+        async def _setup():
+            q = Queue(db_path)
+            await q.init_db()
+            await q.enqueue("tasks.only", queue_name="default")
+            await q.close()
+
+        asyncio.run(_setup())
+        result = runner.invoke(cli, ["status", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Total: 1 job\n" in result.output
+
     def test_populated_json(self, runner, populated_db):
         result = runner.invoke(cli, ["status", "--db", populated_db, "--json"])
         assert result.exit_code == 0
@@ -582,7 +596,7 @@ class TestJobs:
     def test_filter_status(self, runner, populated_db):
         result = runner.invoke(cli, ["jobs", "--db", populated_db, "--status", "failed"])
         assert result.exit_code == 0
-        assert "1 jobs shown" in result.output
+        assert "1 job shown" in result.output
 
     def test_filter_queue(self, runner, populated_db):
         result = runner.invoke(cli, ["jobs", "--db", populated_db, "--queue", "email"])
@@ -592,7 +606,7 @@ class TestJobs:
     def test_filter_task(self, runner, populated_db):
         result = runner.invoke(cli, ["jobs", "--db", populated_db, "--task", "myapp.tasks.done"])
         assert result.exit_code == 0
-        assert "1 jobs shown" in result.output
+        assert "1 job shown" in result.output
 
     def test_limit(self, runner, populated_db):
         result = runner.invoke(cli, ["jobs", "--db", populated_db, "--limit", "3"])
@@ -629,7 +643,7 @@ class TestJobs:
         asyncio.run(_setup())
         result = runner.invoke(cli, ["jobs", "--db", db_path, "--since", "1h"])
         assert result.exit_code == 0
-        assert "1 jobs shown" in result.output
+        assert "1 job shown" in result.output
 
     def test_since_excludes_old(self, runner, db_path):
         """Jobs with old created_at should be excluded by --since 1h."""

@@ -594,7 +594,7 @@ class TestCLIJobsIncludeArchive:
         """qler jobs without --include-archive shows only active jobs."""
         result = runner.invoke(cli, ["jobs", "--db", db_with_archive])
         assert result.exit_code == 0
-        assert "1 jobs shown" in result.output
+        assert "1 job shown" in result.output
         assert "(archived)" not in result.output
 
     def test_jobs_with_archive(self, runner, db_with_archive):
