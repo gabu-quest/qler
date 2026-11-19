@@ -110,6 +110,14 @@ class Worker:
         self._active_jobs: dict[str, Any] = {}  # ulid -> Job
         self._active_tasks: set[asyncio.Task] = set()
         self._background_tasks: list[asyncio.Task] = []
+        # ulid -> task, for jobs whose task function is being awaited right now
+        # (not resolving, not writing their outcome).
+        self._in_task_body: dict[str, asyncio.Task] = {}
+        # Set by _shutdown before it cancels a job's task; the fact that tells
+        # the shutdown's cancel apart from any other in _execute_job.
+        self._cut_by_shutdown: set[str] = set()
+        self._left_for_recovery: list[str] = []
+        self._failed_on_cut: list[str] = []
 
     @property
     def status(self) -> str:
@@ -394,22 +402,28 @@ class Worker:
             correlation_id = job.correlation_id or job.ulid
             timeout = job.timeout
             try:
-                with correlation_context(correlation_id):
-                    if task_wrapper.sync:
-                        coro = asyncio.to_thread(fn, *args, **kwargs)
-                    else:
-                        coro = fn(*args, **kwargs)
-                    if timeout is not None:
+                current = asyncio.current_task()
+                if current is not None:
+                    self._in_task_body[job.ulid] = current
+                try:
+                    with correlation_context(correlation_id):
                         if task_wrapper.sync:
-                            # Sync tasks run in threads that can't be cancelled.
-                            # Shield prevents wait_for from blocking on cancellation.
-                            result = await asyncio.wait_for(
-                                asyncio.shield(coro), timeout=timeout
-                            )
+                            coro = asyncio.to_thread(fn, *args, **kwargs)
                         else:
-                            result = await asyncio.wait_for(coro, timeout=timeout)
-                    else:
-                        result = await coro
+                            coro = fn(*args, **kwargs)
+                        if timeout is not None:
+                            if task_wrapper.sync:
+                                # Sync tasks run in threads that can't be cancelled.
+                                # Shield prevents wait_for from blocking on cancellation.
+                                result = await asyncio.wait_for(
+                                    asyncio.shield(coro), timeout=timeout
+                                )
+                            else:
+                                result = await asyncio.wait_for(coro, timeout=timeout)
+                        else:
+                            result = await coro
+                finally:
+                    self._in_task_body.pop(job.ulid, None)
             except asyncio.TimeoutError:
                 logger.error(
                     "Task %s timed out after %ss (job %s)",
@@ -425,6 +439,22 @@ class Worker:
                 )
                 return
             except asyncio.CancelledError:
+                if (
+                    job.ulid in self._cut_by_shutdown
+                    and not await self._cancel_was_requested(job)
+                ):
+                    # The worker's own shutdown cut this job, not the user. The
+                    # row stays RUNNING with this worker's id and lease, so lease
+                    # recovery hands it to a worker once the lease ends.
+                    self._left_for_recovery.append(job.ulid)
+                    logger.warning(
+                        "Shutdown stopped task %s (job %s) before it finished; "
+                        "left it running for lease recovery",
+                        job.task, job.ulid,
+                    )
+                    raise
+                if job.ulid in self._cut_by_shutdown:
+                    self._failed_on_cut.append(job.ulid)
                 logger.warning(
                     "Task %s cancelled (job %s), marking failed",
                     job.task, job.ulid,
@@ -467,6 +497,13 @@ class Worker:
             self._active_jobs.pop(job.ulid, None)
             if self._semaphore is not None:
                 self._semaphore.release()
+
+    async def _cancel_was_requested(self, job: Any) -> bool:
+        """Return True if the user has asked to cancel this job (cancel_requested)."""
+        from sqler import F
+
+        row = await Job.query().filter(F("ulid") == job.ulid).first()
+        return bool(row is not None and row.cancel_requested)
 
     async def _lease_renewal_loop(self) -> None:
         """Background task: periodically renew leases for active jobs."""
@@ -651,12 +688,22 @@ class Worker:
             _done, pending = await asyncio.wait(
                 self._active_tasks, timeout=self.shutdown_timeout
             )
-            for t in pending:
-                t.cancel()
+            # Cut only the jobs still inside their task function. A job that is
+            # writing its outcome is left to finish the write, so no row is
+            # left half recorded. No await between the wait and the cuts, so
+            # _in_task_body is the state at the moment the timeout passed.
+            for ulid, t in list(self._in_task_body.items()):
+                if t in pending:
+                    self._cut_by_shutdown.add(ulid)
+                    t.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
                 logger.warning(
-                    "Cancelled %d jobs that didn't finish within timeout", len(pending)
+                    "Shutdown timeout of %ss passed with %d job(s) unfinished: "
+                    "left %d running for lease recovery, failed %d as cancelled "
+                    "because their cancel was requested",
+                    self.shutdown_timeout, len(pending),
+                    len(self._left_for_recovery), len(self._failed_on_cut),
                 )
 
         # Remove signal handlers
