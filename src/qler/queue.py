@@ -150,6 +150,7 @@ class Queue:
             await cur.close()
 
         if "key" in columns and "bucket_key" not in columns:
+            # Upgrade step for databases made by qler 0.2.0 to 0.5.0; sqler has no column rename.
             cur = await self._db.adapter.execute(
                 'ALTER TABLE "qler_rate_limit_buckets" RENAME COLUMN "key" TO bucket_key'
             )
@@ -161,26 +162,20 @@ class Queue:
 
         The idempotency-key and unique-key indexes are made by ``_create_key_index``.
         """
-        adapter = self._db.adapter
-        indexes = [
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_jobs_ulid ON qler_jobs (ulid)",
-            (
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_job_attempts_ulid "
-                "ON qler_job_attempts (ulid)"
-            ),
-            (
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_rate_limit_buckets_bucket_key "
-                "ON qler_rate_limit_buckets (bucket_key)"
-            ),
-            (
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_jobs_archive_ulid "
-                "ON qler_jobs_archive (ulid)"
-            ),
-        ]
-        for ddl in indexes:
-            cur = await adapter.execute(ddl)
-            await cur.close()
-        await adapter.auto_commit()
+        db = self._db
+        await db.create_index("qler_jobs", "ulid", unique=True, name="idx_qler_jobs_ulid")
+        await db.create_index(
+            "qler_job_attempts", "ulid", unique=True, name="idx_qler_job_attempts_ulid"
+        )
+        await db.create_index(
+            "qler_rate_limit_buckets",
+            "bucket_key",
+            unique=True,
+            name="idx_qler_rate_limit_buckets_bucket_key",
+        )
+        await db.create_index(
+            "qler_jobs_archive", "ulid", unique=True, name="idx_qler_jobs_archive_ulid"
+        )
 
     async def init_db(self) -> None:
         """Initialize the database schema. Lazy and idempotent."""
@@ -188,17 +183,9 @@ class Queue:
             return
 
         if self._db is None:
+            # on_disk sets the PRAGMAs: WAL, busy_timeout 5000, synchronous NORMAL, wal_autocheckpoint 1000.
             self._db = AsyncSQLerDB.on_disk(self._db_path)
             await self._db.connect()
-            # Set SQLite PRAGMAs for performance
-            for pragma in [
-                "PRAGMA journal_mode=WAL",
-                "PRAGMA busy_timeout=5000",
-                "PRAGMA synchronous=NORMAL",
-                "PRAGMA wal_autocheckpoint=1000",
-            ]:
-                cur = await self._db.adapter.execute(pragma)
-                await cur.close()
 
         await self._migrate_schema()
 
@@ -206,35 +193,23 @@ class Queue:
         JobAttempt.set_db(self._db, "qler_job_attempts")
         RateLimitBucket.set_db(self._db, "qler_rate_limit_buckets")
 
-        # Create tables with promoted columns + CHECK constraints.
-        # We call the db methods directly instead of Model._ensure_schema()
-        # because Pydantic's metaclass intercepts underscore-prefixed class
-        # attribute access.
-        await self._db._ensure_table_with_promoted(
-            "qler_jobs", Job.__promoted__, Job.__checks__
+        # Tables with promoted columns, CHECK constraints and a version column. ensure_table
+        # also adds a promoted column an existing table lacks.
+        await self._db.ensure_table(
+            "qler_jobs", promoted=Job.__promoted__, checks=Job.__checks__, versioned=True
         )
-        await self._db._ensure_table_with_promoted(
-            "qler_job_attempts", JobAttempt.__promoted__, JobAttempt.__checks__
+        await self._db.ensure_table(
+            "qler_job_attempts",
+            promoted=JobAttempt.__promoted__,
+            checks=JobAttempt.__checks__,
+            versioned=True,
         )
-        await self._db._ensure_table_with_promoted(
+        await self._db.ensure_table(
             "qler_rate_limit_buckets",
-            RateLimitBucket.__promoted__,
-            RateLimitBucket.__checks__,
+            promoted=RateLimitBucket.__promoted__,
+            checks=RateLimitBucket.__checks__,
+            versioned=True,
         )
-
-        await self._db._ensure_versioned_table("qler_jobs")
-        await self._db._ensure_versioned_table("qler_job_attempts")
-        await self._db._ensure_versioned_table("qler_rate_limit_buckets")
-
-        # Schema migration: add pending_dep_count column (idempotent)
-        try:
-            cur = await self._db.adapter.execute(
-                "ALTER TABLE qler_jobs ADD COLUMN pending_dep_count INTEGER NOT NULL DEFAULT 0"
-            )
-            await cur.close()
-            await self._db.adapter.auto_commit()
-        except Exception:
-            pass  # Column already exists
 
         # Reverse dependency map for O(1) child lookups
         cur = await self._db.adapter.execute(
@@ -249,10 +224,9 @@ class Queue:
         await self._create_indexes()
 
         # Create archive table with same schema (no indexes — read-only)
-        await self._db._ensure_table_with_promoted(
-            "qler_jobs_archive", Job.__promoted__, Job.__checks__
+        await self._db.ensure_table(
+            "qler_jobs_archive", promoted=Job.__promoted__, checks=Job.__checks__, versioned=True
         )
-        await self._db._ensure_versioned_table("qler_jobs_archive")
         await self._create_unique_indexes()
 
         # Wire up queue depth query for Prometheus scrapes
@@ -263,49 +237,52 @@ class Queue:
 
     async def _create_indexes(self) -> None:
         """Create all required indexes (idempotent)."""
-        adapter = self._db.adapter
-        indexes = [
-            # 1. Claim: pick highest-priority pending job with earliest ETA and no pending deps
-            "DROP INDEX IF EXISTS idx_qler_jobs_claim",
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_claim "
-                "ON qler_jobs (queue_name, priority DESC, eta, ulid) "
-                "WHERE status = 'pending' AND pending_dep_count = 0"
-            ),
-            # 2. Lease expiry: find running jobs with expired leases
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_lease "
-                "ON qler_jobs (lease_expires_at) "
-                "WHERE status = 'running'"
-            ),
-            # 3. Correlation: look up jobs by correlation ID
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_correlation "
-                "ON qler_jobs (json_extract(data, '$.correlation_id')) "
-                "WHERE json_extract(data, '$.correlation_id') != ''"
-            ),
-            # 4. Attempt lookup: find attempts for a job
-            "CREATE INDEX IF NOT EXISTS idx_qler_attempts_job ON qler_job_attempts (job_ulid)",
-            # 5. Idempotency and 7. uniqueness: see _create_key_index
-            # 6. DLQ: find failed jobs in a specific queue
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_dlq "
-                "ON qler_jobs (queue_name, status) "
-                "WHERE status = 'failed'"
-            ),
-            # 8. Dependency resolution: find pending jobs with unresolved deps
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_pending_deps "
-                "ON qler_jobs (status, pending_dep_count) "
-                "WHERE status = 'pending' AND pending_dep_count > 0"
-            ),
-            # 9. Reverse dependency map: find children by parent
-            "CREATE INDEX IF NOT EXISTS idx_qler_job_deps_parent ON qler_job_deps (parent_ulid)",
-        ]
-        for ddl in indexes:
-            cur = await adapter.execute(ddl)
-            await cur.close()
-        await adapter.auto_commit()
+        db = self._db
+        # 1. Claim: pick highest-priority pending job with earliest ETA and no pending deps
+        await db.drop_index("idx_qler_jobs_claim")
+        await db.create_index(
+            "qler_jobs",
+            ["queue_name", ("priority", "desc"), "eta", "ulid"],
+            name="idx_qler_jobs_claim",
+            where="status = 'pending' AND pending_dep_count = 0",
+        )
+        # 2. Lease expiry: find running jobs with expired leases
+        await db.create_index(
+            "qler_jobs",
+            "lease_expires_at",
+            name="idx_qler_jobs_lease",
+            where="status = 'running'",
+        )
+        # 3. Correlation: look up jobs by correlation ID
+        await db.create_index(
+            "qler_jobs",
+            "correlation_id",
+            name="idx_qler_jobs_correlation",
+            where="json_extract(data, '$.correlation_id') != ''",
+        )
+        # 4. Attempt lookup: find attempts for a job
+        await db.create_index("qler_job_attempts", "job_ulid", name="idx_qler_attempts_job")
+        # 5. Idempotency and 7. uniqueness: see _create_key_index
+        # 6. DLQ: find failed jobs in a specific queue
+        await db.create_index(
+            "qler_jobs",
+            ["queue_name", "status"],
+            name="idx_qler_jobs_dlq",
+            where="status = 'failed'",
+        )
+        # 8. Dependency resolution: find pending jobs with unresolved deps
+        await db.create_index(
+            "qler_jobs",
+            ["status", "pending_dep_count"],
+            name="idx_qler_jobs_pending_deps",
+            where="status = 'pending' AND pending_dep_count > 0",
+        )
+        # 9. Reverse dependency map: find children by parent (qler_job_deps stays raw)
+        cur = await db.adapter.execute(
+            "CREATE INDEX IF NOT EXISTS idx_qler_job_deps_parent ON qler_job_deps (parent_ulid)"
+        )
+        await cur.close()
+        await db.adapter.auto_commit()
         for spec in KEY_INDEXES:
             await self._create_key_index(spec)
 
@@ -777,7 +754,7 @@ class Queue:
         attempt_id = generate_ulid()
 
         # Transition PENDING → RUNNING
-        claimed = await Job.query().filter(
+        claimed = await Job.using(self._db, "qler_jobs").filter(
             (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
         ).update_one(
             status=JobStatus.RUNNING.value,
@@ -815,7 +792,7 @@ class Queue:
                 ),
                 failure_kind=FailureKind.TASK_NOT_FOUND,
             )
-            updated = await Job.query().filter(F("ulid") == job.ulid).first()
+            updated = await Job.using(self._db, "qler_jobs").filter(F("ulid") == job.ulid).first()
             raise TaskNotRegisteredError(
                 f"Task '{job.task}' is not registered on this queue. "
                 "Register it with @task(queue) before enqueuing.",
@@ -870,7 +847,7 @@ class Queue:
         else:
             await self.complete_job(job, worker_id, result=result)
 
-        updated = await Job.query().filter(F("ulid") == job.ulid).first()
+        updated = await Job.using(self._db, "qler_jobs").filter(F("ulid") == job.ulid).first()
         return updated if updated is not None else job
 
     # ------------------------------------------------------------------
@@ -1442,7 +1419,7 @@ class Queue:
 
         now = now_epoch()
         try:
-            updated = await Job.query().filter(
+            updated = await Job.using(self._db, "qler_jobs").filter(
                 (F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value)
             ).update_one(
                 **failed_to_pending_fields(now, target_queue=target_queue)
@@ -1545,9 +1522,13 @@ class Queue:
         if self._db is None:
             return []
         try:
-            groups = await Job.query().group_by("queue_name", "status").count()
+            groups = (
+                await Job.using(self._db, "qler_jobs").group_by("queue_name", "status").count()
+            )
             return [(g["queue_name"], g["status"], g["count"]) for g in groups]
         except Exception:
+            # A scrape must not fail, but the reason it came back empty is logged.
+            logger.warning("qler queue depth query failed; reporting no depth", exc_info=True)
             return []
 
     # ------------------------------------------------------------------

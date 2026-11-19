@@ -722,6 +722,45 @@ class TestPoisonPill:
         assert attempts[0].failure_kind == "payload_invalid"
 
 
+async def _schema_rows(queue):
+    cur = await queue.db.adapter.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+    )
+    rows = [tuple(r) for r in await cur.fetchall()]
+    await cur.close()
+    return rows
+
+
+class TestInitDbOnAnExistingFile:
+    """A database made by an earlier start opens unchanged and keeps working."""
+
+    async def test_reopen_makes_no_new_schema_and_the_queue_works(self, tmp_path):
+        path = str(tmp_path / "older.db")
+        first = Queue(path)
+        await first.init_db()
+        parent = await first.enqueue("t.parent")
+        await first.enqueue("t.child", depends_on=[parent.ulid])
+        await first.enqueue("t.idem", idempotency_key="idem-1")
+        await first.enqueue("t.uniq", unique_key="uniq-1")
+        await first.enqueue("t.late", queue_name="other", priority=5)
+        claimed = await first.claim_job("w1", ["default"])
+        await first.complete_job(claimed, "w1", {"ok": 1})
+        assert await first.archive_jobs(older_than_seconds=-5) == 1
+        before = await _schema_rows(first)
+        await first.close()
+
+        second = Queue(path)
+        await second.init_db()
+        assert await _schema_rows(second) == before
+
+        job = await second.claim_job("w2", ["default"])
+        assert job is not None
+        await second.complete_job(job, "w2", {"ok": 2})
+        refreshed = await Job.using(second.db, "qler_jobs").filter(F("ulid") == job.ulid).first()
+        assert refreshed.status == JobStatus.COMPLETED.value
+        await second.close()
+
+
 class TestQueueClose:
     """Verify Queue.close() resource cleanup."""
 
