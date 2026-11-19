@@ -277,3 +277,93 @@ class TestPoolHealthMethod:
             assert pool["healthy"] is False
         finally:
             await disk_db.adapter._pool.put(conn)
+
+
+# ---------------------------------------------------------------------------
+# Queue read methods give their connection back
+# ---------------------------------------------------------------------------
+
+
+async def _read_depth(q):
+    return await q._query_queue_depth()
+
+
+async def _read_archive_count(q):
+    return await q.archive_count()
+
+
+async def _read_archived_jobs(q):
+    return await q.archived_jobs()
+
+
+async def _read_pool_health(q):
+    return await q.pool_health()
+
+
+# Every read method of Queue (the rest of its public methods write).
+_READS = [
+    pytest.param(_read_depth, id="_query_queue_depth"),
+    pytest.param(_read_archive_count, id="archive_count"),
+    pytest.param(_read_archived_jobs, id="archived_jobs"),
+    pytest.param(_read_pool_health, id="pool_health"),
+]
+
+
+class TestQueueReadsReleaseConnection:
+    @pytest.mark.parametrize("read", _READS)
+    async def test_live_tasks_after_read_do_not_hold_connections(
+        self, disk_db, disk_queue, read
+    ):
+        hold = asyncio.Event()
+        done = []
+
+        async def reader():
+            await read(disk_queue)
+            done.append(1)
+            await hold.wait()
+
+        tasks = [asyncio.create_task(reader()) for _ in range(4)]
+        try:
+            for _ in range(200):
+                if len(done) == 4:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(done) == 4
+
+            job = await asyncio.wait_for(disk_queue.enqueue("m.f"), 2)
+            assert job.status == JobStatus.PENDING.value
+            await assert_pool_healthy(disk_db)
+        finally:
+            hold.set()
+            await asyncio.gather(*tasks)
+        await assert_pool_healthy(disk_db)
+
+    async def test_archived_jobs_does_not_redirect_other_tasks(
+        self, disk_db, disk_queue
+    ):
+        for i in range(3):
+            await disk_queue.enqueue("m.f", args=(i,))
+        claimed = await disk_queue.claim_job("w-test", ["default"])
+        await disk_queue.complete_job(claimed, "w-test", result="ok")
+        await Job.query().filter(F("ulid") == claimed.ulid).update_one(finished_at=1)
+        assert await disk_queue.archive_jobs(older_than_seconds=300) == 1
+        assert await Job.query().count() == 2
+
+        counts = []
+        stop = asyncio.Event()
+
+        async def counter():
+            while not stop.is_set():
+                counts.append(await Job.query().count())
+                await asyncio.sleep(0)
+
+        t = asyncio.create_task(counter())
+        try:
+            for _ in range(30):
+                archived = await disk_queue.archived_jobs()
+                assert len(archived) == 1
+        finally:
+            stop.set()
+            await t
+        assert counts
+        assert set(counts) == {2}
