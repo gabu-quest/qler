@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sys
@@ -62,10 +63,8 @@ def logs(ulid: str, db: str, level: str | None, limit: int, output_json: bool) -
             limit=limit,
         )
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(jsonl_path)
-        except OSError:
-            pass
 
     if output_json:
         _echo_json(results)

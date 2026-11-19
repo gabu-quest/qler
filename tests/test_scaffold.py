@@ -54,7 +54,7 @@ def test_enums_importable():
     from qler.enums import RETRYABLE_FAILURES
 
     assert isinstance(RETRYABLE_FAILURES, frozenset)
-    assert RETRYABLE_FAILURES == frozenset({FailureKind.EXCEPTION, FailureKind.TIMEOUT})
+    assert frozenset({FailureKind.EXCEPTION, FailureKind.TIMEOUT}) == RETRYABLE_FAILURES
 
 
 def test_exceptions_hierarchy():

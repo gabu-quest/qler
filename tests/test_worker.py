@@ -1,6 +1,7 @@
 """Tests for the Worker class — init, execution, concurrency, shutdown, correlation."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -9,6 +10,8 @@ import sys
 
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB, F
+
 from qler._context import current_job
 from qler._time import generate_ulid, now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
@@ -18,7 +21,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 _WORKER_ID_PATTERN = re.compile(r"^.+:\d+:[0-9A-Z]{26}$")
@@ -199,10 +201,8 @@ async def _run_worker_until_job_done(worker, job, timeout=5.0):
         worker._running = False
         await asyncio.sleep(0.05)
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -322,10 +322,8 @@ class TestWorkerExecution:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # After 1 failure with max_retries=1, job goes back to pending for retry
         assert job.status == "pending"
@@ -408,10 +406,8 @@ class TestWorkerConcurrency:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job1.refresh()
         await job2.refresh()
@@ -434,10 +430,8 @@ class TestWorkerConcurrency:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # With concurrency=1, one job must fully complete before the next starts.
         # Order is non-deterministic (a or b first), but must be serial.
@@ -477,10 +471,8 @@ class TestWorkerShutdown:
         w._running = False
         await asyncio.sleep(0.3)  # Let it drain
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
         await job.refresh()
         assert job.status == "completed"
@@ -588,10 +580,8 @@ class TestLeaseRenewalLoop:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1006,10 +996,8 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     async def test_health_tcp_responds(self, worker_queue):
         """TCP health endpoint returns 200 with correct JSON fields."""
@@ -1035,10 +1023,8 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     @pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets not available on Windows")
     async def test_health_unix_socket_responds(self, worker_queue, tmp_path):
@@ -1059,10 +1045,8 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     @pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets not available on Windows")
     async def test_health_unix_socket_cleanup(self, worker_queue, tmp_path):
@@ -1078,10 +1062,8 @@ class TestHealthEndpoint:
         w._running = False
         await asyncio.sleep(0.2)
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
         # Give a moment for cleanup
         await asyncio.sleep(0.1)
@@ -1102,10 +1084,8 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     async def test_health_draining_status(self, worker_queue):
         """After _running = False, health response status becomes 'draining'.
@@ -1129,10 +1109,8 @@ class TestHealthEndpoint:
             assert data["status"] == "draining"
         finally:
             health_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await health_task
-            except asyncio.CancelledError:
-                pass
 
     async def test_health_response_active_jobs(self, worker_queue):
         """active_jobs count reflects running work."""
@@ -1159,10 +1137,8 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1188,10 +1164,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
@@ -1214,10 +1188,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         # Should be pending (requeued for retry), not permanently failed
@@ -1268,10 +1240,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
@@ -1306,10 +1276,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         attempts = await JobAttempt.query().filter(
@@ -1335,10 +1303,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
@@ -1383,7 +1349,7 @@ class TestShutdownBounds:
             claim_lease = (await self._row(job)).lease_expires_at
             # Hold the drain until the claim lease and one lease length after it
             # are over (the clock has no event to wait on).
-            while now_epoch() <= claim_lease + 2:
+            while now_epoch() <= claim_lease + 2:  # noqa: ASYNC110 - waits on the wall clock, no event exists
                 await asyncio.sleep(0.05)
             _drain_release.set()
             await asyncio.wait_for(w1_task, timeout=10.0)

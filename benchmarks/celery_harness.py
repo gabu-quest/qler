@@ -56,7 +56,8 @@ class CeleryWorkerContext:
         # Suppress Celery banner noise
         env["C_FORCE_ROOT"] = "1"
 
-        self._proc = subprocess.Popen(
+        # Started once, before anything is timed; nothing else runs on the loop yet.
+        self._proc = subprocess.Popen(  # noqa: ASYNC220
             [
                 sys.executable, "-m", "celery",
                 "-A", "benchmarks.celery_app",

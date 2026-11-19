@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+from pydantic import ConfigDict
 from sqler import AsyncSQLerModel
 
 
@@ -25,4 +26,4 @@ class JobDependency(AsyncSQLerModel):
     parent_ulid: str
     child_ulid: str
 
-    model_config = {"extra": "ignore", "frozen": False}
+    model_config = ConfigDict(extra="ignore", frozen=False)

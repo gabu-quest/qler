@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from croniter import croniter
 
@@ -55,7 +56,7 @@ class CronWrapper:
             Next scheduled run time as a timezone-aware datetime.
         """
         if after is None:
-            after = datetime.now(timezone.utc)
+            after = datetime.now(UTC)
         it = croniter(self.schedule.expression, after)
         return it.get_next(datetime)
 
@@ -102,7 +103,7 @@ class CronWrapper:
         Args:
             limit: Maximum number of runs to collect (prevents unbounded walks).
         """
-        base = datetime.fromtimestamp(since_ts, tz=timezone.utc)
+        base = datetime.fromtimestamp(since_ts, tz=UTC)
         it = croniter(self.schedule.expression, base)
         runs: list[int] = []
         while True:
@@ -118,11 +119,11 @@ class CronWrapper:
     async def enqueue(
         self,
         *args: Any,
-        _delay: Optional[int] = None,
-        _eta: Optional[int] = None,
-        _priority: Optional[int] = None,
-        _idempotency_key: Optional[str] = None,
-        _correlation_id: Optional[str] = None,
+        _delay: int | None = None,
+        _eta: int | None = None,
+        _priority: int | None = None,
+        _idempotency_key: str | None = None,
+        _correlation_id: str | None = None,
         **kwargs: Any,
     ) -> Any:
         """Delegate to the inner TaskWrapper's enqueue."""
@@ -186,11 +187,11 @@ def cron(
     max_running: int = 1,
     catchup: int | str | bool = False,
     timezone_name: str = "UTC",
-    queue_name: Optional[str] = None,
-    max_retries: Optional[int] = None,
-    retry_delay: Optional[int] = None,
-    priority: Optional[int] = None,
-    lease_duration: Optional[int] = None,
+    queue_name: str | None = None,
+    max_retries: int | None = None,
+    retry_delay: int | None = None,
+    priority: int | None = None,
+    lease_duration: int | None = None,
     sync: bool = False,
 ) -> Callable[[Callable], CronWrapper]:
     """Decorator to register a function as a periodic cron task.

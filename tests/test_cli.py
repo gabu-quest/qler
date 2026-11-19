@@ -9,13 +9,14 @@ from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
+from sqler import F
+
 from qler._time import now_epoch
 from qler.cli import cli
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
-from sqler import F
 
 
 @pytest.fixture
@@ -168,6 +169,7 @@ class TestHelpers:
 
     def test_parse_since_invalid(self):
         import click
+
         from qler.cli.helpers import _parse_since
 
         with pytest.raises(click.BadParameter, match="Invalid duration"):
@@ -175,6 +177,7 @@ class TestHelpers:
 
     def test_parse_since_exceeds_max(self):
         import click
+
         from qler.cli.helpers import _parse_since
 
         with pytest.raises(click.BadParameter, match="exceeds maximum"):
@@ -182,6 +185,7 @@ class TestHelpers:
 
     def test_validate_module_path_rejects_traversal(self):
         import click
+
         from qler.cli.helpers import _validate_module_path
 
         with pytest.raises(click.BadParameter, match="Invalid module path"):
@@ -189,6 +193,7 @@ class TestHelpers:
 
     def test_validate_module_path_rejects_spaces(self):
         import click
+
         from qler.cli.helpers import _validate_module_path
 
         with pytest.raises(click.BadParameter, match="Invalid module path"):
@@ -224,6 +229,7 @@ class TestHelpers:
 
     def test_import_app_bad_format(self):
         import click
+
         from qler.cli.helpers import _import_app
 
         with pytest.raises(click.BadParameter, match="Expected 'module:attribute'"):
@@ -231,6 +237,7 @@ class TestHelpers:
 
     def test_import_app_bad_module(self):
         import click
+
         from qler.cli.helpers import _import_app
 
         with pytest.raises(click.BadParameter, match="Cannot import module"):
@@ -238,6 +245,7 @@ class TestHelpers:
 
     def test_import_app_wrong_type(self):
         import click
+
         from qler.cli.helpers import _import_app
 
         with pytest.raises(click.BadParameter, match="is not a Queue instance"):
@@ -245,6 +253,7 @@ class TestHelpers:
 
     def test_import_modules_bad(self):
         import click
+
         from qler.cli.helpers import _import_modules
 
         with pytest.raises(click.BadParameter, match="Cannot import module"):
@@ -416,7 +425,7 @@ class TestBackupCommand:
         assert data["destination_path"] == dest
         assert data["source_path"] == db_path
         assert data["size_bytes"] >= 4096  # minimum SQLite DB size
-        assert isinstance(data["duration_ms"], (int, float))
+        assert isinstance(data["duration_ms"], int | float)
         assert data["duration_ms"] >= 0
         assert data["error"] is None
 
@@ -2009,8 +2018,9 @@ async def counted_task():
         sys.path.insert(0, mod_dir)
         try:
             async def _setup():
-                from qler.enums import FailureKind
                 from sqler import F
+
+                from qler.enums import FailureKind
                 mod = __import__("_tasks_count")
                 q = mod.q
                 await q.init_db()

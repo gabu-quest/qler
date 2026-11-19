@@ -30,6 +30,7 @@ from benchmarks.core.timer import AsyncPrecisionTimer
 
 from qler import Worker
 from qler.task import TaskWrapper
+import contextlib
 
 SUITE_NAME = "comparison"
 TASK_PATH = "bench.noop"
@@ -46,7 +47,7 @@ def _make_queue(db_path: str):
 def _check_celery_available() -> bool:
     """Check if both Redis and celery are available."""
     try:
-        from benchmarks.celery_app import app  # noqa: F401
+        from benchmarks.celery_app import app
 
         if app is None:
             return False
@@ -134,10 +135,8 @@ class EnqueueLatency:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class BatchEnqueue:
@@ -218,10 +217,8 @@ class BatchEnqueue:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class RoundTrip:
@@ -310,10 +307,8 @@ class RoundTrip:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class Throughput:
@@ -395,10 +390,8 @@ class Throughput:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class WorkerRoundTrip:
@@ -451,10 +444,8 @@ class WorkerRoundTrip:
                 finally:
                     worker._running = False
                     worker_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await worker_task
-                    except asyncio.CancelledError:
-                        pass
                     await q.close()
 
             stats = await timer.async_measure(do_qler_worker_rt)
@@ -503,10 +494,8 @@ class WorkerRoundTrip:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class WorkerThroughput:
@@ -554,10 +543,8 @@ class WorkerThroughput:
                 finally:
                     worker._running = False
                     worker_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await worker_task
-                    except asyncio.CancelledError:
-                        pass
                     await q.close()
 
             stats = await timer.async_measure(do_qler_worker_tp)
@@ -605,10 +592,8 @@ class WorkerThroughput:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class ColdStart:
@@ -656,10 +641,8 @@ class ColdStart:
                 finally:
                     worker._running = False
                     worker_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await worker_task
-                    except asyncio.CancelledError:
-                        pass
                     await q.close()
 
             stats = await timer.async_measure(do_qler_cold)
@@ -710,10 +693,8 @@ class ColdStart:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 def check_available() -> bool:

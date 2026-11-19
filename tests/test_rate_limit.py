@@ -4,6 +4,8 @@ import asyncio
 
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB, F
+
 from qler.enums import JobStatus
 from qler.exceptions import ConfigurationError
 from qler.models.bucket import RateLimitBucket
@@ -11,7 +13,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.rate_limit import parse_rate, try_acquire
 from qler.task import task
-from sqler import AsyncSQLerDB, F
 
 
 # Module-level functions (required by @task's qualname validation)

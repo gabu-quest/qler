@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, RebaseConfig
 
 
@@ -27,11 +27,7 @@ class RateLimitBucket(AsyncSQLerSafeModel):
     refill_rate: float = 0.167  # tokens per second
     last_refill_at: int = 0
 
-    model_config = {
-        "extra": "ignore",
-        "frozen": False,
-        "populate_by_name": True,
-    }
+    model_config = ConfigDict(extra="ignore", frozen=False, populate_by_name=True)
 
     @property
     def key(self) -> str:

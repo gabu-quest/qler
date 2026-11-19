@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from qler.models.job import Job
     from qler.queue import Queue
 
-_current_job: ContextVar[Optional["Job"]] = ContextVar("qler_current_job", default=None)
-_current_queue: ContextVar[Optional["Queue"]] = ContextVar("qler_current_queue", default=None)
+_current_job: ContextVar[Job | None] = ContextVar("qler_current_job", default=None)
+_current_queue: ContextVar[Queue | None] = ContextVar("qler_current_queue", default=None)
 
 
-def current_job() -> "Job":
+def current_job() -> Job:
     """Return the currently-executing Job.
 
     Raises:
@@ -28,7 +28,7 @@ def current_job() -> "Job":
     return job
 
 
-def current_queue() -> "Queue":
+def current_queue() -> Queue:
     """Return the Queue that owns the currently-executing job.
 
     Raises:
