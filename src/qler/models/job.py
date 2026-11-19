@@ -8,13 +8,14 @@ import time
 from typing import Any, ClassVar, Optional
 
 from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, F, RebaseConfig
+from sqler.exceptions import UniqueConstraintError
 
 from qler._notify import clear as _notify_clear
 from qler._notify import fire as _notify_fire
 from qler._notify import register as _notify_register
 from qler._time import now_epoch
 from qler.enums import JobStatus
-from qler.exceptions import JobCancelledError, JobFailedError
+from qler.exceptions import JobCancelledError, JobFailedError, UniqueKeyConflictError
 
 
 class Job(AsyncSQLerSafeModel):
@@ -248,18 +249,25 @@ class Job(AsyncSQLerSafeModel):
 
         One atomic update_one(), guarded on status and on the original_queue
         that was read, so the reset and the move cannot be separated.
+
+        Raises:
+            UniqueKeyConflictError: another job with this job's ``unique_key`` is
+                pending or running; the job stays FAILED.
         """
         current = await Job.query().filter(F("ulid") == self.ulid).first()
         if current is None:
             return False
         now = now_epoch()
-        updated = await Job.query().filter(
-            (F("ulid") == self.ulid)
-            & (F("status") == JobStatus.FAILED.value)
-            & (F("original_queue") == current.original_queue)
-        ).update_one(
-            **failed_to_pending_fields(now, target_queue=current.original_queue)
-        )
+        try:
+            updated = await Job.query().filter(
+                (F("ulid") == self.ulid)
+                & (F("status") == JobStatus.FAILED.value)
+                & (F("original_queue") == current.original_queue)
+            ).update_one(
+                **failed_to_pending_fields(now, target_queue=current.original_queue)
+            )
+        except UniqueConstraintError as err:
+            raise await unique_key_conflict(current, err) from err
         if updated is None:
             return False
         self._sync_from(updated)
@@ -298,6 +306,34 @@ class Job(AsyncSQLerSafeModel):
             setattr(self, fname, getattr(other, fname))
         self._id = other._id
         self._version = other._version
+
+
+# The UNIQUE index over the unique key of pending and running jobs (Queue._create_indexes).
+UNIQUE_KEY_INDEX = "idx_qler_jobs_unique_uq"
+
+
+async def unique_key_conflict(
+    job: Job, err: UniqueConstraintError
+) -> UniqueKeyConflictError:
+    """The error for a move of ``job`` back to pending that the unique-key index refused.
+
+    Shared by ``Job.retry`` and ``Queue.replay_job``. Any other refusal is not this
+    one and goes on as it came.
+    """
+    if err.index != UNIQUE_KEY_INDEX:
+        raise err
+    active = await Job.query().filter(
+        (F("unique_key") == job.unique_key)
+        & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
+    ).first()
+    active_ulid = active.ulid if active is not None else None
+    return UniqueKeyConflictError(
+        f"Job {job.ulid} stays failed: job {active_ulid} with unique key "
+        f"{job.unique_key!r} is pending or running",
+        ulid=job.ulid,
+        unique_key=job.unique_key,
+        active_ulid=active_ulid,
+    )
 
 
 def failed_to_pending_fields(now: int, *, target_queue: str | None) -> dict:
