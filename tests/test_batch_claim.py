@@ -130,6 +130,17 @@ class TestClaimJobs:
                 f"Expected ULID, got {job.last_attempt_id!r}"
             )
 
+        # The id names the job's one running attempt
+        for job in jobs:
+            attempts = await JobAttempt.query().filter(
+                F("job_ulid") == job.ulid
+            ).all()
+            assert len(attempts) == 1
+            assert attempts[0].ulid == job.last_attempt_id
+            assert attempts[0].worker_id == "w1"
+            assert attempts[0].attempt_number == 1
+            assert attempts[0].status == AttemptStatus.RUNNING.value
+
     async def test_partial_availability(self, queue):
         """n=5 but only 3 pending -> returns 3."""
         for i in range(3):

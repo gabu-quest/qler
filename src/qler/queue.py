@@ -7,7 +7,7 @@ import json
 import logging
 import random
 import traceback as tb_module
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from sqler import AsyncSQLerDB, F
 from sqler.exceptions import UniqueConstraintError
@@ -27,9 +27,11 @@ from qler.lifecycle import emit as _lifecycle
 from qler.models.attempt import JobAttempt
 from qler.models.bucket import RateLimitBucket
 from qler.models.job import (
-    UNIQUE_KEY_INDEX,
+    KEY_INDEXES,
     Job,
+    KeyIndex,
     failed_to_pending_fields,
+    key_active,
     unique_key_conflict,
 )
 from qler.rate_limit import RateSpec, parse_rate, try_acquire
@@ -47,61 +49,6 @@ _MAX_RETRY_DELAY = 86_400  # 24 hours
 _MAX_KEYS_LOGGED = 20
 
 logger = logging.getLogger(__name__)
-
-
-class _KeyIndex(NamedTuple):
-    """The UNIQUE partial index over one job key, and the non-unique one it replaces."""
-
-    field: str
-    label: str  # how the error names the key
-    scope: str  # how the error names the jobs the index covers
-    name: str
-    where: str
-    active: Any  # the same set of jobs as ``where``, as a filter
-    legacy_name: str
-    legacy_where: str
-    # A plain index for the look-up, when the UNIQUE one cannot serve it: SQLite does not
-    # take a partial index whose WHERE has ``status IN (...)`` for a query that binds the
-    # statuses as parameters, so the look-up needs an index whose WHERE its ``key = ?`` implies.
-    lookup_name: Optional[str] = None
-    lookup_where: Optional[str] = None
-
-
-_KEY_INDEXES = (
-    # An idempotency key names one job that is not cancelled.
-    _KeyIndex(
-        field="idempotency_key",
-        label="idempotency key",
-        scope="non-cancelled",
-        name="idx_qler_jobs_idempotency_uq",
-        where=(
-            "json_extract(data, '$.idempotency_key') IS NOT NULL "
-            "AND status != 'cancelled'"
-        ),
-        active=F("status") != JobStatus.CANCELLED.value,
-        legacy_name="idx_qler_jobs_idempotency",
-        legacy_where="json_extract(data, '$.idempotency_key') IS NOT NULL",
-    ),
-    # A unique key names one job that is pending or running.
-    _KeyIndex(
-        field="unique_key",
-        label="unique key",
-        scope="pending or running",
-        name=UNIQUE_KEY_INDEX,
-        where=(
-            "json_extract(data, '$.unique_key') IS NOT NULL "
-            "AND status IN ('pending', 'running')"
-        ),
-        active=F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value]),
-        legacy_name="idx_qler_jobs_unique",
-        legacy_where=(
-            "json_extract(data, '$.unique_key') IS NOT NULL "
-            "AND status IN ('pending', 'running')"
-        ),
-        lookup_name="idx_qler_jobs_unique_key",
-        lookup_where="json_extract(data, '$.unique_key') IS NOT NULL",
-    ),
-)
 
 
 class Queue:
@@ -210,7 +157,10 @@ class Queue:
             await self._db.adapter.auto_commit()
 
     async def _create_unique_indexes(self) -> None:
-        """Create explicit uniqueness guarantees for promoted columns."""
+        """Create the UNIQUE indexes on the ulid columns and the bucket key.
+
+        The idempotency-key and unique-key indexes are made by ``_create_key_index``.
+        """
         adapter = self._db.adapter
         indexes = [
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_jobs_ulid ON qler_jobs (ulid)",
@@ -336,7 +286,7 @@ class Queue:
             ),
             # 4. Attempt lookup: find attempts for a job
             "CREATE INDEX IF NOT EXISTS idx_qler_attempts_job ON qler_job_attempts (job_ulid)",
-            # 5. Idempotency and 7. uniqueness: see _create_key_indexes
+            # 5. Idempotency and 7. uniqueness: see _create_key_index
             # 6. DLQ: find failed jobs in a specific queue
             (
                 "CREATE INDEX IF NOT EXISTS idx_qler_jobs_dlq "
@@ -356,10 +306,10 @@ class Queue:
             cur = await adapter.execute(ddl)
             await cur.close()
         await adapter.auto_commit()
-        for spec in _KEY_INDEXES:
+        for spec in KEY_INDEXES:
             await self._create_key_index(spec)
 
-    async def _create_key_index(self, spec: "_KeyIndex") -> None:
+    async def _create_key_index(self, spec: "KeyIndex") -> None:
         """Make the UNIQUE partial index over one job key, or say why it cannot be made.
 
         The look for rows that already share a key and the making of the index are one
@@ -454,7 +404,7 @@ class Queue:
             if idempotency_key is not None:
                 existing = await jobs.filter(
                     (F("idempotency_key") == idempotency_key)
-                    & (F("status") != JobStatus.CANCELLED.value)
+                    & key_active("idempotency_key")
                 ).first()
                 if existing is not None:
                     return existing
@@ -462,8 +412,7 @@ class Queue:
             # Uniqueness check: return existing active (pending/running) job with same key
             if unique_key is not None:
                 existing = await jobs.filter(
-                    (F("unique_key") == unique_key)
-                    & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
+                    (F("unique_key") == unique_key) & key_active("unique_key")
                 ).first()
                 if existing is not None:
                     return existing
@@ -562,7 +511,7 @@ class Queue:
         Each dict accepts the same keys as enqueue():
             task_path (required), args, kwargs, queue_name, delay, eta,
             priority, max_retries, retry_delay, lease_duration,
-            idempotency_key, correlation_id, depends_on, timeout.
+            idempotency_key, unique_key, correlation_id, depends_on, timeout.
 
         Returns list of Job instances in the same order as input.
         """
@@ -592,7 +541,7 @@ class Queue:
                     chunk = all_idem_keys[off : off + param_chunk]
                     found = await jobs_q.filter(
                         F("idempotency_key").in_list(chunk)
-                        & (F("status") != JobStatus.CANCELLED.value)
+                        & key_active("idempotency_key")
                     ).all()
                     for j in found:
                         idem_existing[j.idempotency_key] = j
@@ -602,8 +551,7 @@ class Queue:
                 for off in range(0, len(all_unique_keys), param_chunk):
                     chunk = all_unique_keys[off : off + param_chunk]
                     found = await jobs_q.filter(
-                        F("unique_key").in_list(chunk)
-                        & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
+                        F("unique_key").in_list(chunk) & key_active("unique_key")
                     ).all()
                     for j in found:
                         unique_existing[j.unique_key] = j
@@ -1149,8 +1097,8 @@ class Queue:
     ) -> None:
         """Mark a job as completed.
 
-        Uses atomic update_one() with ownership guard instead of
-        refresh+save to avoid version mismatch after claim's update_one().
+        One transaction: the ownership-guarded status update, the dependents' counts and
+        the attempt's end. The lifecycle event, metric and wake-up follow the commit.
         """
         # Serialize result
         result_json: Optional[str] = None
@@ -1232,7 +1180,9 @@ class Queue:
     ) -> None:
         """Mark a job as failed, with optional retry.
 
-        Uses atomic update_one() with ownership guard.
+        One transaction: the ownership-guarded status update, the dependents'
+        cancellations and the attempt's end. The lifecycle event, metric and wake-ups
+        follow the commit.
         """
         now = now_epoch()
         can_retry = (

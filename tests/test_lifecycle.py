@@ -11,7 +11,6 @@ from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.task import task
 from sqler import F
-from sqler.models.async_queryset import AsyncSQLerQuerySet
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -296,23 +295,17 @@ class TestAttemptHistory:
         assert claimed.retry_count == 2  # unchanged on complete
 
 
-    async def test_complete_and_attempt_end_are_one_write(self, queue, monkeypatch):
+    async def test_complete_and_attempt_end_are_one_write(
+        self, queue, raise_on_nth_update
+    ):
         """The attempt's end fails once: the job stays running, the attempt too."""
         job = await queue.enqueue("my_task")
         claimed = await queue.claim_job("worker-1", ["default"])
 
-        original = AsyncSQLerQuerySet.update_one
-        seen = {"n": 0}
-
-        async def update_one(self, **fields):
-            # The attempt's end, not the job's completion (which carries the result).
-            if fields.get("status") == "completed" and "result_json" not in fields:
-                seen["n"] += 1
-                if seen["n"] == 1:
-                    raise sqlite3.OperationalError("database is locked")
-            return await original(self, **fields)
-
-        monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
+        # The attempt's end, not the job's completion (which carries the result).
+        raise_on_nth_update(
+            lambda fields: fields.get("status") == "completed" and "result_json" not in fields
+        )
 
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await queue.complete_job(claimed, "worker-1", result={"n": 1})
