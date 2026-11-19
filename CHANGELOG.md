@@ -2,6 +2,49 @@
 
 All notable changes to qler will be documented in this file.
 
+## [Unreleased]
+
+Requires `sqler>=1.2026.11.1`.
+
+### Upgrading from 0.5
+
+- A 0.5 database is upgraded in place the first time this version opens it. The upgrade is one-way: a 0.5 process cannot start on the upgraded file, so upgrade every process that shares a file together.
+- If the old file holds two active jobs under one `unique_key` or `idempotency_key`, the queue still starts and logs an error naming them. The database enforces that key only after the extra jobs are cancelled or removed.
+
+### Fixed
+
+- **A key makes one job.** Eight concurrent enqueues with one `idempotency_key` (or one `unique_key`) could create four jobs. Each key now has a UNIQUE index, and every enqueue of an active key returns the same job, across processes and inside one `enqueue_many` batch. Cron relies on this to fire a tick once across workers.
+- **A claim is one write.** `claim_job` and `claim_jobs` run in one transaction: an error leaves every job pending, with no attempt row. A claimed job is leased for its own `lease_duration`.
+- **Finishing a job is one write.** `complete_job`, `fail_job` and `cancel_job` commit the status, the waiting jobs' dependency counts or cancellations, the dead-letter move and the attempt's end together. Lease recovery does the same. Events, metrics and wake-ups follow the commit.
+- **A running job keeps its lease**, and a worker told to stop ends in bounded time.
+- **Shutdown no longer fails a long job for good.** A job still running after `shutdown_timeout` stays marked running and is run again when its lease ends. Before, it was failed whatever its `max_retries`.
+- **Retry takes a job out of the dead-letter queue.** `Job.retry()` on a dead-lettered job left it pending inside the dead-letter queue, where no worker claims it. It now returns to the queue it came from.
+- **The rate limiter decides and writes in one transaction.** Concurrent calls for one bucket raised `StaleVersionError` after the job was already marked running, and a clock that stepped back stored a negative token count.
+- **A rate limit follows a changed rate.** A bucket kept the limit it was created with for as long as the database file lived.
+- **A read gives its connection back.** Four tasks that had each read the queue depth left the pool empty, and the next enqueue hung. The worker's `/metrics` handler reads the depth on every scrape.
+- **Two queues in one process keep their own jobs.** The worker's cancel check, cron's last-run lookup and every CLI command read the jobs of whichever queue was initialised last.
+- **A failed finish is logged.** A `complete_job` or `fail_job` that raised inside the worker was dropped silently.
+- **Enqueue refuses a bad payload before it waits for the write lock.**
+- `complete_job`, `fail_job`, `cancel_job` and `replay_job` called before `init_db()` raise `RuntimeError("Queue not initialized. Call init_db() first.")` where they raised an `AttributeError` or a `TypeError`.
+- `qler jobs` and `qler status` print `1 job`, not `1 jobs`.
+
+### Changed
+
+- **Immediate mode runs only the jobs the call created.** An enqueue that returns an existing job for its key does not run it again.
+- **One enqueue path and one claim path.** `enqueue` and `enqueue_many` share one implementation, as do `claim_job` and `claim_jobs`, so the single and the batch call check the same things in the same order. When one batch has a bad payload in one entry and a bad dependency in another, the payload error is the one raised.
+- **The dependency edges are a sqler model** (`JobDependency`, table `qler_job_dependencies`), and the archive moves rows through sqler. The queue sets its database up through sqler's public calls.
+- **The command line is a package**, `qler.cli`, one module per group of commands. The commands and their output are unchanged.
+
+### Added
+
+- `UniqueKeyConflictError` is exported: `Job.retry()` and a dead-letter replay raise it when another active job holds the job's `unique_key`.
+- `Queue.jobs`, `Queue.attempts` and `Queue.archive`: sqler querysets over this queue's own tables.
+- Type checking: the package passes mypy (it ships `py.typed`), and lint covers ruff's `UP`, `SIM`, `ASYNC`, `RUF` and `B` rules.
+
+### Removed
+
+- `JobNotFoundError`, `TaskNotFoundError`, `SignatureMismatchError` and `ClaimConflictError`. Nothing ever raised them, so an `except` for one caught nothing. A missing task or a payload that does not fit the task's signature fails the job with `FailureKind.TASK_NOT_FOUND` or `FailureKind.SIGNATURE_MISMATCH`, as before.
+
 ## [0.5.1] — 2026-04-21
 
 ### Fixed
