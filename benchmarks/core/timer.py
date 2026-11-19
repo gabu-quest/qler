@@ -7,7 +7,7 @@ import math
 import statistics
 import time
 import warnings
-from typing import Callable
+from collections.abc import Callable
 
 from .base import TimingStats
 

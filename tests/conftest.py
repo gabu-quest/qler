@@ -16,9 +16,10 @@ def pytest_sessionfinish(session, exitstatus):
     lets pytest write its summary before we force-exit.
     """
     threading.Timer(5.0, os._exit, args=[exitstatus]).start()
-from qler.queue import Queue
 from sqler import AsyncSQLerDB
 from sqler.models.async_queryset import AsyncSQLerQuerySet
+
+from qler.queue import Queue
 
 
 @pytest_asyncio.fixture

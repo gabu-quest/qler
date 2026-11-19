@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 
@@ -208,7 +208,7 @@ def generate_report(data: dict) -> str:
     lines.append(f"- **Scale**: {config.get('scale', 'unknown')} "
                  f"(warmup={config.get('warmup', '?')}, "
                  f"iterations={config.get('iterations', '?')})")
-    lines.append(f"- **Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"- **Generated**: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("")
 
     # Caveats

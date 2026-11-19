@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, ClassVar, NamedTuple, Optional
+from typing import Any, ClassVar, NamedTuple
 
+from pydantic import Field
 from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, F, RebaseConfig
 from sqler.exceptions import UniqueConstraintError
 
@@ -41,7 +42,7 @@ class Job(AsyncSQLerSafeModel):
     queue_name: str = "default"
     priority: int = 0
     eta: int = 0
-    lease_expires_at: Optional[int] = None
+    lease_expires_at: int | None = None
     pending_dep_count: int = 0
 
     # JSON fields
@@ -49,26 +50,26 @@ class Job(AsyncSQLerSafeModel):
     worker_id: str = ""
     lease_duration: int = 300
     payload_json: str = "{}"
-    result_json: Optional[str] = None
-    last_error: Optional[str] = None
-    last_failure_kind: Optional[str] = None
+    result_json: str | None = None
+    last_error: str | None = None
+    last_failure_kind: str | None = None
     attempts: int = 0
     retry_count: int = 0
     max_retries: int = 0
     retry_delay: int = 60
-    last_attempt_id: Optional[str] = None
+    last_attempt_id: str | None = None
     correlation_id: str = ""
-    idempotency_key: Optional[str] = None
-    unique_key: Optional[str] = None
-    timeout: Optional[int] = None
-    progress: Optional[int] = None
+    idempotency_key: str | None = None
+    unique_key: str | None = None
+    timeout: int | None = None
+    progress: int | None = None
     progress_message: str = ""
     cancel_requested: bool = False
     original_queue: str = ""
-    dependencies: list[str] = []
+    dependencies: list[str] = Field(default_factory=list)
     created_at: int = 0
     updated_at: int = 0
-    finished_at: Optional[int] = None
+    finished_at: int | None = None
 
     @property
     def result(self) -> Any:
@@ -117,11 +118,11 @@ class Job(AsyncSQLerSafeModel):
 
     async def wait(
         self,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         poll_interval: float = 0.5,
         max_interval: float = 5.0,
         backoff: float = 1.5,
-    ) -> "Job":
+    ) -> Job:
         """Wait until the job reaches a terminal state.
 
         Uses an in-process asyncio.Event for instant wakeup when the Worker
@@ -181,7 +182,7 @@ class Job(AsyncSQLerSafeModel):
 
     async def wait_for_dependencies(
         self,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         poll_interval: float = 0.5,
         max_interval: float = 5.0,
         backoff: float = 1.5,
@@ -300,7 +301,7 @@ class Job(AsyncSQLerSafeModel):
         self._sync_from(updated)
         return True
 
-    def _sync_from(self, other: "Job") -> None:
+    def _sync_from(self, other: Job) -> None:
         """Update this instance's fields from another Job instance."""
         for fname in self.__class__.model_fields:
             setattr(self, fname, getattr(other, fname))
@@ -327,8 +328,8 @@ class KeyIndex(NamedTuple):
     # A plain index for the look-up, when the UNIQUE one cannot serve it: SQLite does not
     # take a partial index whose WHERE has ``status IN (...)`` for a query that binds the
     # statuses as parameters, so the look-up needs an index whose WHERE its ``key = ?`` implies.
-    lookup_name: Optional[str] = None
-    lookup_where: Optional[str] = None
+    lookup_name: str | None = None
+    lookup_where: str | None = None
 
 
 _UNIQUE_KEY_WHERE = (

@@ -63,7 +63,7 @@ build-backend = "uv_build"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["src/qler"]
+src = ["src"]
 
 [tool.ruff.lint]
 select = [
@@ -71,9 +71,21 @@ select = [
     "F",
     "I",
     "N",
+    "UP",
+    "SIM",
+    "ASYNC",
+    "RUF",
+    "B",
 ]
 ignore = [
     "E501",
+    # Public signatures keep `timeout=`: Job.wait, Job.wait_for_dependencies, Queue.enqueue
+    # (the job's run timeout); the test helpers copy that name.
+    "ASYNC109",
+    # The only hits are the en dash in "0–100", which set_progress's error text and its
+    # tests use on purpose.
+    "RUF001",
+    "RUF002",
 ]
 
 [tool.ruff.lint.per-file-ignores]

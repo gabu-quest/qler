@@ -183,7 +183,7 @@ class DependencyChain:
         for n_children in child_counts:
             gen = PayloadGenerator(seed=42)
 
-            async def do_deps(n_children=n_children):
+            async def do_deps(n_children=n_children, gen=gen):
                 tmp = tempfile.TemporaryDirectory()
                 self._tmp_dirs.append(tmp)
                 db_path = str(Path(tmp.name) / "bench.db")

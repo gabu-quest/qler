@@ -6,7 +6,7 @@ import asyncio
 import importlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import click
@@ -59,7 +59,7 @@ def _format_ts(epoch: int | None) -> str:
     """Epoch seconds → ISO 8601 UTC string."""
     if epoch is None:
         return "-"
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _format_duration(seconds: int) -> str:

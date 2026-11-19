@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from sqler import F
+from sqler.models.async_queryset import AsyncSQLerQuerySet
+
 from qler._time import now_epoch
 from qler.enums import JobStatus
 from qler.exceptions import DependencyError, JobCancelledError, JobFailedError
@@ -17,8 +20,6 @@ from qler.models.dependency import JobDependency
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
-from sqler import F
-from sqler.models.async_queryset import AsyncSQLerQuerySet
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required: @task rejects nested functions)
@@ -809,7 +810,7 @@ class TestDependencyStress:
     async def test_deep_chain_resolution(self, queue):
         """20-deep chain: complete root, all 19 descendants unblock one by one."""
         chain = [await queue.enqueue("my.task")]
-        for i in range(19):
+        for _ in range(19):
             child = await queue.enqueue("my.task", depends_on=[chain[-1].ulid])
             assert child.pending_dep_count == 1
             chain.append(child)
@@ -1011,7 +1012,7 @@ class TestDependencyStress:
         )
 
         # Complete first 5
-        for i in range(5):
+        for _ in range(5):
             claimed = await queue.claim_job("w1", ["default"])
             await queue.complete_job(claimed, "w1")
 
@@ -1464,7 +1465,7 @@ class TestDependencyEdgesModel:
             assert await JobDependency.using(q.db).count() == 0
             archived = [j.ulid for j in await q.archived_jobs()]
             assert len(archived) == 7
-            assert set(archived) == {roles[r] for r in finished + ["archived"]}
+            assert set(archived) == {roles[r] for r in [*finished, "archived"]}
             assert {j.ulid for j in await q.jobs.all()} == {roles["idem"], roles["uniq"]}
         finally:
             await q.close()
