@@ -6,6 +6,7 @@ import re
 import sqlite3
 
 import pytest
+from conftest import make_worker
 from sqler import F
 
 from qler._time import now_epoch
@@ -14,7 +15,6 @@ from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
-from qler.worker import Worker
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -275,18 +275,6 @@ async def _runs_for(seconds):
     return "second run"
 
 
-def _renewal_worker(queue, **kwargs):
-    defaults = {
-        "queues": ["default"],
-        "concurrency": 1,
-        "poll_interval": 0.01,
-        "lease_recovery_interval": 60.0,
-        "shutdown_timeout": 2.0,
-    }
-    defaults.update(kwargs)
-    return Worker(queue, **defaults)
-
-
 async def _stop(worker, worker_task):
     worker._running = False
     await asyncio.wait_for(worker_task, timeout=10.0)
@@ -326,7 +314,7 @@ class TestWorkerLeaseRenewal:
 
         monkeypatch.setattr(Job, "renew_lease", renew_failing_once)
 
-        w = _renewal_worker(queue)
+        w = make_worker(queue)
         worker_task = asyncio.create_task(w.run())
         try:
             await asyncio.wait_for(_renewal_started.wait(), timeout=5.0)
@@ -373,7 +361,7 @@ class TestWorkerLeaseRenewal:
 
         monkeypatch.setattr(Queue, "recover_expired_leases", recover_and_note)
 
-        w = _renewal_worker(queue, lease_recovery_interval=0.1)
+        w = make_worker(queue, lease_recovery_interval=0.1)
         with caplog.at_level(logging.INFO, logger="qler.lifecycle"):
             worker_task = asyncio.create_task(w.run())
             try:
@@ -409,11 +397,11 @@ class TestWorkerLeaseRenewal:
         wrapped = task(q)(_runs_for)
         job = await q.enqueue(wrapped.task_path, args=(6.0,), lease_duration=2)
 
-        w1 = _renewal_worker(q)
+        w1 = make_worker(q)
         w1_task = asyncio.create_task(w1.run())
         await asyncio.wait_for(_renewal_started.wait(), timeout=5.0)
         q.default_lease_duration = 60
-        w2 = _renewal_worker(q, lease_recovery_interval=0.1)
+        w2 = make_worker(q, lease_recovery_interval=0.1)
         w2_task = asyncio.create_task(w2.run())
         try:
             result = await job.wait(timeout=15.0, poll_interval=0.05)
