@@ -1063,12 +1063,13 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
         try:
             # 1. Schema exists
             try:
-                cur = await q.db.adapter.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name IN ('qler_jobs', 'qler_job_attempts')"
-                )
-                tables = [row[0] for row in await cur.fetchall()]
-                await cur.close()
+                tables = [
+                    row["name"]
+                    for row in await q.db.execute_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name IN ('qler_jobs', 'qler_job_attempts')"
+                    )
+                ]
                 has_jobs = "qler_jobs" in tables
                 has_attempts = "qler_job_attempts" in tables
                 checks.append({
@@ -1082,10 +1083,8 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
 
             # 2. WAL mode
             try:
-                cur = await q.db.adapter.execute("PRAGMA journal_mode")
-                row = await cur.fetchone()
-                await cur.close()
-                mode = row[0] if row else "unknown"
+                rows = await q.db.execute_sql("PRAGMA journal_mode")
+                mode = rows[0]["journal_mode"] if rows else "unknown"
                 checks.append({
                     "check": "wal_mode",
                     "ok": mode == "wal",

@@ -1,33 +1,31 @@
-"""Tests for the reverse dependency index (qler_job_deps table)."""
+"""Tests for the reverse dependency index (qler_job_dependencies table)."""
 
 import pytest
+from qler.models.dependency import JobDependency
 from qler.queue import Queue
+from sqler import F
 
 pytestmark = pytest.mark.asyncio
 
 
 class TestDepTable:
-    """Verify qler_job_deps table and index are created by init_db()."""
+    """Verify qler_job_dependencies table and index are created by init_db()."""
 
     async def test_dep_table_created(self, queue: Queue):
-        """qler_job_deps table exists after init_db()."""
-        cur = await queue._db.adapter.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='qler_job_deps'"
+        """qler_job_dependencies table exists after init_db(); the old table is not made."""
+        rows = await queue.db.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('qler_job_dependencies', 'qler_job_deps')"
         )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row is not None
-        assert row[0] == "qler_job_deps"
+        assert rows == [{"name": "qler_job_dependencies"}]
 
     async def test_dep_index_created(self, queue: Queue):
-        """idx_qler_job_deps_parent index exists after init_db()."""
-        cur = await queue._db.adapter.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_qler_job_deps_parent'"
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row is not None
-        assert row[0] == "idx_qler_job_deps_parent"
+        """The UNIQUE index over (parent_ulid, child_ulid) exists after init_db()."""
+        indexes = {
+            i["name"]: i for i in await queue.db.list_indexes("qler_job_dependencies")
+        }
+        assert "idx_qler_job_dependencies_edge" in indexes
+        assert indexes["idx_qler_job_dependencies_edge"]["unique"] is True
 
 
 class TestReverseMapPopulation:
@@ -40,15 +38,11 @@ class TestReverseMapPopulation:
             "my.task", queue_name="q", depends_on=[parent.ulid]
         )
 
-        cur = await queue._db.adapter.execute(
-            "SELECT parent_ulid, child_ulid FROM qler_job_deps ORDER BY child_ulid"
-        )
-        rows = await cur.fetchall()
-        await cur.close()
+        edges = await JobDependency.using(queue.db).all()
 
-        assert len(rows) == 1
-        assert rows[0][0] == parent.ulid
-        assert rows[0][1] == child.ulid
+        assert len(edges) == 1
+        assert edges[0].parent_ulid == parent.ulid
+        assert edges[0].child_ulid == child.ulid
 
     async def test_reverse_map_multiple_parents(self, queue: Queue):
         """A child depending on two parents creates two rows."""
@@ -58,16 +52,12 @@ class TestReverseMapPopulation:
             "my.task", queue_name="q", depends_on=[p1.ulid, p2.ulid]
         )
 
-        cur = await queue._db.adapter.execute(
-            "SELECT parent_ulid FROM qler_job_deps WHERE child_ulid = ? ORDER BY parent_ulid",
-            [child.ulid],
-        )
-        rows = await cur.fetchall()
-        await cur.close()
+        parent_ulids = await JobDependency.using(queue.db).filter(
+            F("child_ulid") == child.ulid
+        ).distinct_values("parent_ulid")
 
-        assert len(rows) == 2
-        parent_ulids = {r[0] for r in rows}
-        assert parent_ulids == {p1.ulid, p2.ulid}
+        assert len(parent_ulids) == 2
+        assert set(parent_ulids) == {p1.ulid, p2.ulid}
 
     async def test_reverse_map_populated_on_enqueue_many(self, queue: Queue):
         """enqueue_many() with deps creates reverse map rows."""
@@ -77,28 +67,18 @@ class TestReverseMapPopulation:
             {"task_path": "my.task", "queue_name": "q", "depends_on": [parent.ulid]},
         ])
 
-        cur = await queue._db.adapter.execute(
-            "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ? ORDER BY child_ulid",
-            [parent.ulid],
-        )
-        rows = await cur.fetchall()
-        await cur.close()
+        child_ulids = await JobDependency.using(queue.db).filter(
+            F("parent_ulid") == parent.ulid
+        ).distinct_values("child_ulid")
 
-        assert len(rows) == 2
-        child_ulids = {r[0] for r in rows}
-        assert child_ulids == {jobs[0].ulid, jobs[1].ulid}
+        assert len(child_ulids) == 2
+        assert set(child_ulids) == {jobs[0].ulid, jobs[1].ulid}
 
     async def test_reverse_map_no_rows_without_deps(self, queue: Queue):
         """enqueue() without depends_on creates no reverse map rows."""
         await queue.enqueue("my.task", queue_name="q")
 
-        cur = await queue._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_job_deps"
-        )
-        row = await cur.fetchone()
-        await cur.close()
-
-        assert row[0] == 0
+        assert await JobDependency.using(queue.db).count() == 0
 
 
 class TestArchivalCleansUpReverseMap:
@@ -125,21 +105,11 @@ class TestArchivalCleansUpReverseMap:
         )
 
         # Confirm dep row exists before archival
-        cur = await queue._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_job_deps"
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row[0] == 1
+        assert await JobDependency.using(queue.db).count() == 1
 
         # Archive
         archived = await queue.archive_jobs(older_than_seconds=300)
         assert archived == 1
 
         # Dep row should be cleaned up (parent was archived)
-        cur = await queue._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_job_deps"
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row[0] == 0
+        assert await JobDependency.using(queue.db).count() == 0

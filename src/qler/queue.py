@@ -26,6 +26,7 @@ from qler.exceptions import (
 from qler.lifecycle import emit as _lifecycle
 from qler.models.attempt import JobAttempt
 from qler.models.bucket import RateLimitBucket
+from qler.models.dependency import JobDependency
 from qler.models.job import (
     KEY_INDEXES,
     Job,
@@ -142,30 +143,31 @@ class Queue:
         """This queue's archived-jobs table, as a sqler queryset bound to its own database."""
         return Job.using(self.db, "qler_jobs_archive")
 
+    @property
+    def _dependency_edges(self) -> AsyncSQLerQuerySet[JobDependency]:
+        """The (parent, child) edges, as a sqler queryset bound to this queue's database."""
+        return JobDependency.using(self.db)
+
     async def _migrate_schema(self) -> None:
         """Apply qler-owned schema migrations before ensure/create steps."""
         await self._migrate_rate_limit_bucket_key_column()
 
     async def _migrate_rate_limit_bucket_key_column(self) -> None:
         """Rename the legacy reserved-word bucket column to ``bucket_key``."""
-        cur = await self._db.adapter.execute(
+        found = await self._db.execute_sql(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='qler_rate_limit_buckets';"
         )
-        try:
-            row = await cur.fetchone()
-        finally:
-            await cur.close()
-        if row is None:
+        if not found:
             return
 
-        cur = await self._db.adapter.execute('PRAGMA table_info("qler_rate_limit_buckets");')
-        try:
-            columns = {col[1] for col in await cur.fetchall()}
-        finally:
-            await cur.close()
+        columns = {
+            col["name"]
+            for col in await self._db.execute_sql('PRAGMA table_info("qler_rate_limit_buckets");')
+        }
 
         if "key" in columns and "bucket_key" not in columns:
-            # Upgrade step for databases made by qler 0.2.0 to 0.5.0; sqler has no column rename.
+            # Upgrade step for databases made by qler 0.2.0 to 0.5.0; sqler has no column rename,
+            # and execute_sql takes only reads, so the rename stays on the adapter.
             cur = await self._db.adapter.execute(
                 'ALTER TABLE "qler_rate_limit_buckets" RENAME COLUMN "key" TO bucket_key'
             )
@@ -226,17 +228,13 @@ class Queue:
             versioned=True,
         )
 
-        # Reverse dependency map for O(1) child lookups
-        cur = await self._db.adapter.execute(
-            "CREATE TABLE IF NOT EXISTS qler_job_deps ("
-            "parent_ulid TEXT NOT NULL, "
-            "child_ulid TEXT NOT NULL, "
-            "PRIMARY KEY (parent_ulid, child_ulid))"
+        # Reverse dependency map: the children of a parent, read through its UNIQUE index
+        await self._db.ensure_table(
+            JobDependency.__tablename__, promoted=JobDependency.__promoted__
         )
-        await cur.close()
-        await self._db.adapter.auto_commit()
 
         await self._create_indexes()
+        await self._upgrade_job_deps_from_0_5_1()
 
         # Create archive table with same schema (no indexes — read-only)
         await self._db.ensure_table(
@@ -292,14 +290,70 @@ class Queue:
             name="idx_qler_jobs_pending_deps",
             where="status = 'pending' AND pending_dep_count > 0",
         )
-        # 9. Reverse dependency map: find children by parent (qler_job_deps stays raw)
-        cur = await db.adapter.execute(
-            "CREATE INDEX IF NOT EXISTS idx_qler_job_deps_parent ON qler_job_deps (parent_ulid)"
+        # 9. Reverse dependency map: one edge per (parent, child); finds children by parent
+        await db.create_index(
+            JobDependency.__tablename__,
+            ["parent_ulid", "child_ulid"],
+            unique=True,
+            name="idx_qler_job_dependencies_edge",
         )
-        await cur.close()
-        await db.adapter.auto_commit()
         for spec in KEY_INDEXES:
             await self._create_key_index(spec)
+
+    async def _upgrade_job_deps_from_0_5_1(self) -> None:
+        """The upgrade from qler 0.5.1 and earlier: move the edges of the table ``qler_job_deps``
+        into ``qler_job_dependencies``, and leave a view under the old name.
+
+        ``qler_job_deps`` is not a sqler model, so these statements stay raw:
+
+        - ``SELECT parent_ulid, child_ulid FROM qler_job_deps WHERE NOT EXISTS (...)``, the
+          edges not yet in the new table, through ``db.execute_sql``; they are written with
+          ``JobDependency.save_many``;
+        - ``DROP TABLE qler_job_deps`` (its index goes with it) and ``CREATE VIEW qler_job_deps``,
+          through ``db.adapter.execute``: ``execute_sql`` takes only reads and sqler has no
+          public call that drops a table or makes a view.
+
+        The view is for a process still on qler 0.5.1 or earlier, which knows only the old
+        name. Without it, such a process starting on this file would make ``qler_job_deps``
+        again, empty, and never release a job that waits on another. With it, a process
+        already running reads the right children, every write of its own to the edges fails
+        with SQLite's "cannot modify qler_job_deps because it is a view", and a process
+        starting fails on its index ("views may not be indexed"). A file this code made
+        gets the view too.
+
+        The look for the old name, the copy, the drop and the view are one transaction, which
+        takes the write lock at its start: a second process starting on the same file at the
+        same time waits for it, then finds the view. Every edge is there once.
+        """
+        db = self._db
+        async with db.transaction():
+            found = await db.execute_sql(
+                "SELECT type FROM sqlite_master WHERE name='qler_job_deps'"
+            )
+            if found and found[0]["type"] == "view":
+                return
+            if found:
+                rows = await db.execute_sql(
+                    "SELECT parent_ulid, child_ulid FROM qler_job_deps AS old "
+                    "WHERE NOT EXISTS (SELECT 1 FROM qler_job_dependencies AS new "
+                    "WHERE new.parent_ulid = old.parent_ulid AND new.child_ulid = old.child_ulid) "
+                    "ORDER BY parent_ulid, child_ulid"
+                )
+                if rows:
+                    await JobDependency.save_many(
+                        [
+                            JobDependency(parent_ulid=r["parent_ulid"], child_ulid=r["child_ulid"])
+                            for r in rows
+                        ],
+                        db=db,
+                    )
+                cur = await db.adapter.execute("DROP TABLE qler_job_deps")
+                await cur.close()
+            cur = await db.adapter.execute(
+                "CREATE VIEW qler_job_deps AS "
+                "SELECT parent_ulid, child_ulid FROM qler_job_dependencies"
+            )
+            await cur.close()
 
     async def _create_key_index(self, spec: "KeyIndex") -> None:
         """Make the UNIQUE partial index over one job key, or say why it cannot be made.
@@ -471,13 +525,11 @@ class Queue:
             await job.save(db=self._db)
 
             if dep_list:
-                for dep_ulid in dep_list:
-                    cur = await self._db.adapter.execute(
-                        "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)",
-                        [dep_ulid, job.ulid],
-                    )
-                    await cur.close()
-                await self._db.adapter.auto_commit()
+                # dep_list holds each parent once: one edge per (parent, child)
+                await JobDependency.save_many(
+                    [JobDependency(parent_ulid=dep_ulid, child_ulid=job.ulid) for dep_ulid in dep_list],
+                    db=self._db,
+                )
 
         _lifecycle(
             "job.enqueued", job_id=job.ulid, queue=queue_name,
@@ -707,24 +759,15 @@ class Queue:
             if new_jobs:
                 await Job.save_many(new_jobs, db=self._db)
 
-            # Batch-insert all dependency edges (chunked for SQLite 999-param limit)
-            all_dep_edges: list[tuple[str, str]] = []
-            for job in new_jobs:
-                for dep_ulid in job.dependencies:
-                    all_dep_edges.append((dep_ulid, job.ulid))
-
+            # Batch-insert all dependency edges (save_many chunks the multi-row INSERT).
+            # Each job's dependencies list holds a parent once: one edge per (parent, child).
+            all_dep_edges = [
+                JobDependency(parent_ulid=dep_ulid, child_ulid=job.ulid)
+                for job in new_jobs
+                for dep_ulid in job.dependencies
+            ]
             if all_dep_edges:
-                dep_chunk = 499  # 2 params per edge, SQLite max 999
-                for offset in range(0, len(all_dep_edges), dep_chunk):
-                    chunk = all_dep_edges[offset : offset + dep_chunk]
-                    placeholders = ", ".join(["(?, ?)"] * len(chunk))
-                    params: list[str] = [v for edge in chunk for v in edge]
-                    cur = await self._db.adapter.execute(
-                        f"INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES {placeholders}",
-                        params,
-                    )
-                    await cur.close()
-                await self._db.adapter.auto_commit()
+                await JobDependency.save_many(all_dep_edges, db=self._db)
 
         for job in new_jobs:
             _lifecycle(
@@ -1322,6 +1365,14 @@ class Queue:
     # Dependencies
     # ------------------------------------------------------------------
 
+    async def _children_of(self, parent_ulid: str) -> list[str]:
+        """The ulids of the jobs that wait on ``parent_ulid``, ascending; builds no model."""
+        return sorted(
+            await self._dependency_edges.filter(
+                F("parent_ulid") == parent_ulid
+            ).distinct_values("child_ulid")
+        )
+
     async def _resolve_dependencies(self, completed_ulid: str) -> None:
         """Decrement pending_dep_count for jobs depending on the completed job.
 
@@ -1330,15 +1381,10 @@ class Queue:
         """
         jobs = Job.using(self._db, "qler_jobs")
         async with self._db.transaction():
-            cur = await self._db.adapter.execute(
-                "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
-                [completed_ulid],
-            )
-            children = await cur.fetchall()
-            await cur.close()
+            children = await self._children_of(completed_ulid)
 
             now = now_epoch()
-            for (child_ulid,) in children:
+            for child_ulid in children:
                 await jobs.filter(
                     (F("ulid") == child_ulid)
                     & (F("status") == JobStatus.PENDING.value)
@@ -1362,14 +1408,9 @@ class Queue:
             frontier = [failed_ulid]
             while frontier:
                 parent_ulid = frontier.pop(0)
-                cur = await self._db.adapter.execute(
-                    "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
-                    [parent_ulid],
-                )
-                children = await cur.fetchall()
-                await cur.close()
+                children = await self._children_of(parent_ulid)
 
-                for (child_ulid,) in children:
+                for child_ulid in children:
                     updated = await jobs.filter(
                         (F("ulid") == child_ulid)
                         & (F("status") == JobStatus.PENDING.value)
@@ -1560,34 +1601,28 @@ class Queue:
         await self._lazy_init()
         threshold = now_epoch() - older_than_seconds
 
-        _where = (
-            "WHERE status IN ('completed', 'failed', 'cancelled') "
-            "AND json_extract(data, '$.finished_at') IS NOT NULL "
-            "AND json_extract(data, '$.finished_at') < ?"
+        # A job with no finished_at reads NULL, and NULL < threshold matches nothing.
+        archivable = self.jobs.filter(
+            F("status").in_list(list(self._TERMINAL_STATUSES))
+            & (F("finished_at") < threshold)
         )
 
         async with self._db.transaction():
-            cur = await self._db.adapter.execute(
-                f"INSERT INTO qler_jobs_archive SELECT * FROM qler_jobs {_where}",
-                [threshold],
-            )
-            await cur.close()
+            moved = await archivable.distinct_values("ulid")
+            if not moved:
+                return 0
+            await archivable.copy_to("qler_jobs_archive")
 
-            # Clean up reverse dependency map for jobs being archived
-            cur = await self._db.adapter.execute(
-                f"DELETE FROM qler_job_deps WHERE parent_ulid IN "
-                f"(SELECT ulid FROM qler_jobs {_where}) "
-                f"OR child_ulid IN (SELECT ulid FROM qler_jobs {_where})",
-                [threshold, threshold],
-            )
-            await cur.close()
+            # Remove the edges that name an archived job as parent or child
+            edges = self._dependency_edges
+            chunk = 499  # two lists of the chunk per statement: under SQLite's old 999 limit
+            for offset in range(0, len(moved), chunk):
+                part = moved[offset : offset + chunk]
+                await edges.filter(
+                    F("parent_ulid").in_list(part) | F("child_ulid").in_list(part)
+                ).delete()
 
-            cur = await self._db.adapter.execute(
-                f"DELETE FROM qler_jobs {_where}",
-                [threshold],
-            )
-            count = cur.rowcount
-            await cur.close()
+            count = await archivable.delete()
 
         if count:
             _lifecycle(
