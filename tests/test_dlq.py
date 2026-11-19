@@ -331,8 +331,59 @@ class TestDLQReplay:
         assert updated.queue_name == "default"
 
 
-# ---------------------------------------------------------------------------
-# TestDLQWithDependencies
+class TestRetryLeavesDLQ:
+    """Job.retry() on a dead-lettered job must take it out of the DLQ."""
+
+    async def _dead_letter(self, dlq_queue, queue_name="work"):
+        job = await dlq_queue.enqueue("my.task", queue_name=queue_name, max_retries=0)
+        claimed = await dlq_queue.claim_job("w1", [queue_name])
+        await dlq_queue.fail_job(
+            claimed, "w1", ValueError("boom"), failure_kind=FailureKind.EXCEPTION
+        )
+        return await Job.query().filter(F("ulid") == job.ulid).first()
+
+    async def test_retry_returns_job_to_original_queue(self, dlq_queue):
+        dlq_job = await self._dead_letter(dlq_queue)
+        assert dlq_job.queue_name == "dead_letters"
+
+        assert await dlq_job.retry() is True
+        assert dlq_job.status == JobStatus.PENDING.value
+        assert dlq_job.queue_name == "work"
+        assert dlq_job.original_queue == ""
+
+        row = await Job.query().filter(F("ulid") == dlq_job.ulid).first()
+        assert row.queue_name == "work"
+        assert row.original_queue == ""
+
+        reclaimed = await dlq_queue.claim_job("w2", ["work"])
+        assert reclaimed is not None
+        assert reclaimed.ulid == dlq_job.ulid
+
+        in_dlq = await Job.query().filter(F("queue_name") == "dead_letters").all()
+        assert len(in_dlq) == 0
+
+    async def test_retry_twice_second_is_false_and_row_unchanged(self, dlq_queue):
+        dlq_job = await self._dead_letter(dlq_queue)
+        assert await dlq_job.retry() is True
+        before = await Job.query().filter(F("ulid") == dlq_job.ulid).first()
+
+        assert await dlq_job.retry() is False
+        after = await Job.query().filter(F("ulid") == dlq_job.ulid).first()
+        assert after.model_dump() == before.model_dump()
+
+    async def test_retry_never_dead_lettered_keeps_queue(self, queue):
+        job = await queue.enqueue("my.task", queue_name="work", max_retries=0)
+        claimed = await queue.claim_job("w1", ["work"])
+        await queue.fail_job(claimed, "w1", ValueError("boom"))
+        failed = await Job.query().filter(F("ulid") == job.ulid).first()
+        assert failed.status == JobStatus.FAILED.value
+
+        assert await failed.retry() is True
+        assert failed.status == JobStatus.PENDING.value
+        assert failed.queue_name == "work"
+        assert failed.original_queue == ""
+
+
 # ---------------------------------------------------------------------------
 
 
