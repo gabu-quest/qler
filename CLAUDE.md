@@ -119,7 +119,7 @@ uv run pytest -q
 ```
 src/qler/
 ├── __init__.py          # Public API and __all__
-├── queue.py             # Queue: enqueue, claim, complete, fail, schema set-up
+├── queue.py             # Queue: enqueue, claim, complete, fail
 ├── task.py              # @task decorator and TaskWrapper
 ├── cron.py              # @cron decorator and CronWrapper
 ├── worker.py            # Worker: claims jobs, runs tasks, manages leases
@@ -130,6 +130,7 @@ src/qler/
 ├── exceptions.py        # QlerError hierarchy
 ├── _context.py          # current_job() and the other context variables
 ├── _notify.py           # In-process wake-up for job.wait()
+├── _schema.py           # Schema set-up and upgrades: ensure_schema(db)
 ├── _sqler.py            # Private helpers for what sqler's annotations do not say
 ├── _time.py             # Time utilities
 ├── py.typed             # PEP 561 marker
