@@ -1,6 +1,6 @@
 # Claude Context: qler
 
-**Version:** 0.5.0
+**Version:** see `pyproject.toml`
 **Type:** Python library — background job queue on SQLite
 
 ---
@@ -20,16 +20,16 @@ qler is an **async-first background job queue** for Python, built on SQLite via 
 
 ## Project Status
 
-**Fully implemented.** v0.5.0 with timeouts, batch enqueue, progress, unique jobs, Prometheus metrics, logler logs CLI, structured lifecycle events. Production readiness features (pool health, archival CLI, memory watchdog) shipped in M26. 667+ passing tests.
+Fully implemented. The version is in `pyproject.toml`; what each release added is in `CHANGELOG.md`.
 
 | File | Purpose |
 |------|---------|
-| `ROADMAP.md` | **Milestone tracker** — M-2 through M14 complete |
-| `CHANGELOG.md` | Release history (v0.1.0, v0.2.0, v0.3.0) |
+| `ROADMAP.md` | One line per finished milestone |
+| `CHANGELOG.md` | Release history |
 | `NORTH_STAR.md` | Vision, philosophy, non-negotiable principles |
-| `SPEC.md` | v0.1.0 MVP build spec (historical reference) |
-| `SQLER_GAPS.md` | sqler prerequisites (historical — all resolved) |
-| `BRAINSTORM.md` | Early design exploration (historical reference) |
+| `README.md` | User-facing introduction |
+| `specs/performance-upgrades.md` | Spec for the performance upgrades |
+| `benchmarks/` | Benchmark suites and the Celery comparison |
 
 ---
 
@@ -57,7 +57,6 @@ All -ler libraries MUST integrate through their public APIs.
 | Queues | **qler** | Background job execution |
 | Logs | **logler** | Log aggregation, correlation IDs |
 | Processes | **procler** | Process management, health checks |
-| Future | **dagler** | DAG/pipeline orchestration (post qler v1.0) |
 
 ---
 
@@ -65,13 +64,13 @@ All -ler libraries MUST integrate through their public APIs.
 
 ### 1. Never bypass the -ler stack
 
-- All DB operations MUST go through sqler's model API — no raw SQL
+- Database work goes through sqler's public calls (models, querysets, `db.transaction()`). Raw SQL text is only for the schema upgrade steps and the `qler doctor` checks, where sqler has no call, and each such place says so in a comment.
 - If sqler can't express an operation, **fix sqler** — don't work around it
 
 ### 2. SQLite is the design center
 
 - NEVER add features that "work better with Postgres"
-- Use WAL mode, `UPDATE...RETURNING`, partial indexes — lean into SQLite strengths
+- Use WAL mode and partial indexes — lean into SQLite strengths
 
 ### 3. Debuggability over features
 
@@ -81,22 +80,37 @@ All -ler libraries MUST integrate through their public APIs.
 ### 4. Explicit over magic
 
 - No auto-discovery of tasks — explicit `@task` decorator required
-- Workers MUST specify which queues to process
+- A worker takes an explicit list of queues (`--queues`, default `default`)
 
 ---
 
 ## Tech Stack
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| Python | 3.12+ | Runtime |
-| asyncio | stdlib | Async foundation |
-| SQLite | WAL mode | Storage (via sqler) |
-| uv | latest | Package management |
-| sqler | latest | Database operations |
-| click | latest | CLI |
-| croniter | latest | Cron expression parsing |
-| python-ulid | latest | ULID generation |
+Versions are in `pyproject.toml`.
+
+| Tool | Purpose |
+|------|---------|
+| Python 3.12+ | Runtime |
+| asyncio | Async foundation |
+| SQLite (WAL mode) | Storage, through sqler |
+| uv | Package management |
+| sqler | Database operations |
+| click | CLI |
+| croniter | Cron expression parsing |
+| python-ulid | ULID generation |
+
+---
+
+## Checks
+
+Run these from the repository root before you hand work back:
+
+```
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+uv run pytest -q
+```
 
 ---
 
@@ -104,43 +118,68 @@ All -ler libraries MUST integrate through their public APIs.
 
 ```
 src/qler/
-├── __init__.py          # Public API: Queue, Worker, task, cron, current_job
-├── queue.py             # Queue class — enqueue, claim, complete, fail, retry
-├── task.py              # @task decorator, TaskWrapper
-├── cron.py              # @cron decorator, CronSchedule, CronWrapper
-├── worker.py            # Worker loop, lease renewal, recovery, cron scheduler
-├── rate_limit.py        # RateSpec, token bucket rate limiting
-├── cli/                 # Click CLI package, one module per command group (init, worker, status, jobs, cron, dlq, etc.)
-├── models/
-│   ├── job.py           # Job model (sqler AsyncSQLerSafeModel)
-│   ├── attempt.py       # JobAttempt model
-│   └── bucket.py        # RateLimitBucket model
+├── __init__.py          # Public API and __all__
+├── queue.py             # Queue: enqueue, claim, complete, fail, schema set-up
+├── task.py              # @task decorator and TaskWrapper
+├── cron.py              # @cron decorator and CronWrapper
+├── worker.py            # Worker: claims jobs, runs tasks, manages leases
+├── rate_limit.py        # Token bucket rate limiting
+├── lifecycle.py         # Structured lifecycle events for job state changes
+├── metrics.py           # Prometheus metrics (Queue(metrics=True))
 ├── enums.py             # JobStatus, AttemptStatus, FailureKind
-├── exceptions.py        # Error types (QlerError hierarchy)
-├── _context.py          # current_job() context variable
-├── _notify.py           # In-process asyncio.Event notification for instant wait() wakeup
-├── _time.py             # Timestamp utilities
-└── py.typed             # PEP 561 marker
+├── exceptions.py        # QlerError hierarchy
+├── _context.py          # current_job() and the other context variables
+├── _notify.py           # In-process wake-up for job.wait()
+├── _sqler.py            # Private helpers for what sqler's annotations do not say
+├── _time.py             # Time utilities
+├── py.typed             # PEP 561 marker
+├── cli/
+│   ├── __init__.py      # Imports the modules so their commands register
+│   ├── group.py         # The qler command group
+│   ├── helpers.py       # Shared helpers and constants
+│   ├── database.py      # init, backup
+│   ├── workers.py       # worker, health
+│   ├── reports.py       # status, jobs, job, attempts
+│   ├── control.py       # retry, cancel
+│   ├── deadletter.py    # dlq commands
+│   ├── maintenance.py   # archive, purge, doctor
+│   ├── schedules.py     # cron, tasks
+│   └── logs.py          # logs
+└── models/
+    ├── job.py           # Job: primary queue item, state machine
+    ├── attempt.py       # JobAttempt: audit record per execution attempt
+    ├── bucket.py        # RateLimitBucket: token bucket state
+    └── dependency.py    # JobDependency: which jobs wait on this one
 tests/
-├── conftest.py          # Shared fixtures
-├── test_scaffold.py     # Imports, public API surface
-├── test_models.py       # Job, JobAttempt, RateLimitBucket
-├── test_queue.py        # Enqueue, claim, payload validation
-├── test_task.py         # @task decorator, run_now()
-├── test_lifecycle.py    # Complete/fail/retry/cancel/wait
-├── test_worker.py       # Worker loop, concurrency, shutdown
-├── test_lease.py        # Lease renewal, recovery, expiry
-├── test_immediate.py    # Immediate mode
-├── test_cancellation.py # Cooperative cancellation
-├── test_cron.py         # @cron scheduler, dedup
-├── test_rate_limit.py   # Token bucket, requeue
-├── test_notify.py       # Event notification registry + integration
-├── test_cli.py          # All CLI commands
-└── test_context.py      # current_job context
+├── conftest.py              # Shared fixtures
+├── test_scaffold.py         # Package structure and public API
+├── test_models.py           # Job and JobAttempt fields, defaults, properties
+├── test_queue.py            # Queue init, enqueue, claim, complete, fail
+├── test_task.py             # @task and TaskWrapper
+├── test_lifecycle.py        # End-to-end job flows
+├── test_lifecycle_events.py # Structured lifecycle events
+├── test_worker.py           # Worker init, execution, concurrency, shutdown
+├── test_batch_claim.py      # Batch claiming and dispatch
+├── test_lease.py            # Lease recovery and renewal
+├── test_immediate.py        # Immediate mode
+├── test_cancellation.py     # Cooperative cancellation
+├── test_cron.py             # @cron and the scheduler loop
+├── test_rate_limit.py       # Rate limiting
+├── test_dependencies.py     # Job dependencies and chaining
+├── test_dep_index.py        # Reverse dependency table
+├── test_dlq.py              # Dead letter queue
+├── test_unique.py           # Unique jobs
+├── test_progress.py         # set_progress and progress fields
+├── test_archival.py         # Job archival
+├── test_pool_health.py      # Connection pool health
+├── test_metrics.py          # Prometheus metrics
+├── test_notify.py           # job.wait() wake-up registry
+├── test_context.py          # current_job() context access
+└── test_cli.py              # CLI commands
 ```
 
 ---
 
 ## Active Roadmaps
 
-- [ROADMAP.md](./ROADMAP.md) — M0–M26 complete (v0.5.0 + production readiness).
+- [ROADMAP.md](./ROADMAP.md) — every milestone is finished.

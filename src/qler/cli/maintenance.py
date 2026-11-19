@@ -121,7 +121,7 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
 
         q = await _get_queue(db)
         try:
-            # 1. Schema exists
+            # 1. Schema exists (raw SQL: sqler has no call that lists tables)
             try:
                 tables = [
                     row["name"]
@@ -143,7 +143,7 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             except Exception as exc:
                 checks.append({"check": "schema", "ok": False, "detail": str(exc)})
 
-            # 2. WAL mode
+            # 2. WAL mode (raw SQL: sqler has no call that reads a PRAGMA)
             try:
                 rows = await q.db.execute_sql("PRAGMA journal_mode")
                 mode = rows[0]["journal_mode"] if rows else "unknown"
