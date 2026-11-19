@@ -1,5 +1,8 @@
 """Tests for M10 — Job Dependencies/Chaining."""
 
+import asyncio
+import logging
+import sqlite3
 import time
 
 import pytest
@@ -11,6 +14,7 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from sqler import F
+from sqler.models.async_queryset import AsyncSQLerQuerySet
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required: @task rejects nested functions)
@@ -1082,3 +1086,234 @@ class TestDependencyStress:
         # X is still claimable
         claimed = await queue.claim_job("w1", ["default"])
         assert claimed.ulid == x.ulid
+
+
+# ---------------------------------------------------------------------------
+# TestFinishIsOneWrite — completing or failing a parent and settling its
+# children is one transaction: all of it lands, or none of it
+# ---------------------------------------------------------------------------
+
+
+def _raise_on_nth_update(monkeypatch, match, nth):
+    """Make the nth ``update_one`` whose fields satisfy ``match`` raise once.
+
+    Every other call, before and after, runs as usual.
+    """
+    original = AsyncSQLerQuerySet.update_one
+    seen = {"n": 0}
+
+    async def update_one(self, **fields):
+        if match(fields):
+            seen["n"] += 1
+            if seen["n"] == nth:
+                raise sqlite3.OperationalError("database is locked")
+        return await original(self, **fields)
+
+    monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
+    return seen
+
+
+def _is_decrement(fields):
+    return "pending_dep_count" in fields
+
+
+def _is_cascade_cancel(fields):
+    return fields.get("status") == JobStatus.CANCELLED.value and "last_error" in fields
+
+
+async def _job(ulid):
+    return await Job.query().filter(F("ulid") == ulid).first()
+
+
+class TestFinishIsOneWrite:
+    """A stop between the parent's write and its children's writes strands nothing."""
+
+    async def test_complete_rolls_back_when_a_decrement_fails(self, queue, monkeypatch):
+        parent = await queue.enqueue("my.task")
+        children = [await queue.enqueue("my.task", depends_on=[parent.ulid]) for _ in range(3)]
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed.ulid == parent.ulid
+
+        _raise_on_nth_update(monkeypatch, _is_decrement, 2)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await queue.complete_job(claimed, "worker-1")
+
+        p = await _job(parent.ulid)
+        assert p.status == JobStatus.RUNNING.value
+        assert p.worker_id == "worker-1"
+        assert [(await _job(c.ulid)).pending_dep_count for c in children] == [1, 1, 1]
+
+        await queue.complete_job(claimed, "worker-1")
+
+        p = await _job(parent.ulid)
+        assert p.status == JobStatus.COMPLETED.value
+        assert [(await _job(c.ulid)).pending_dep_count for c in children] == [0, 0, 0]
+        nxt = await queue.claim_job("worker-1", ["default"])
+        assert nxt.ulid == children[0].ulid
+
+    async def test_fail_rolls_back_when_a_cascade_cancel_fails(self, queue, monkeypatch):
+        parent = await queue.enqueue("my.task")
+        children = [await queue.enqueue("my.task", depends_on=[parent.ulid]) for _ in range(3)]
+        grandchild = await queue.enqueue("my.task", depends_on=[children[0].ulid])
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed.ulid == parent.ulid
+
+        _raise_on_nth_update(monkeypatch, _is_cascade_cancel, 2)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await queue.fail_job(claimed, "worker-1", ValueError("boom"))
+
+        p = await _job(parent.ulid)
+        assert p.status == JobStatus.RUNNING.value
+        assert p.worker_id == "worker-1"
+        dependents = [*children, grandchild]
+        assert [(await _job(j.ulid)).status for j in dependents] == [JobStatus.PENDING.value] * 4
+
+        await queue.fail_job(claimed, "worker-1", ValueError("boom"))
+
+        assert (await _job(parent.ulid)).status == JobStatus.FAILED.value
+        assert [(await _job(j.ulid)).status for j in dependents] == [JobStatus.CANCELLED.value] * 4
+
+    async def test_no_event_for_a_rolled_back_finish(self, queue, monkeypatch, caplog):
+        fired: list[str] = []
+        monkeypatch.setattr("qler.queue._notify_fire", fired.append)
+
+        def lifecycle_events():
+            return [r.event for r in caplog.records if r.name == "qler.lifecycle"]
+
+        done = await queue.enqueue("my.task")
+        done_children = [await queue.enqueue("my.task", depends_on=[done.ulid]) for _ in range(3)]
+        failed = await queue.enqueue("my.task")
+        failed_children = [
+            await queue.enqueue("my.task", depends_on=[failed.ulid]) for _ in range(3)
+        ]
+        claimed_done = await queue.claim_job("worker-1", ["default"])
+        claimed_failed = await queue.claim_job("worker-1", ["default"])
+        assert (claimed_done.ulid, claimed_failed.ulid) == (done.ulid, failed.ulid)
+
+        with caplog.at_level(logging.INFO, logger="qler.lifecycle"):
+            caplog.clear()
+            _raise_on_nth_update(monkeypatch, _is_decrement, 2)
+            with pytest.raises(sqlite3.OperationalError):
+                await queue.complete_job(claimed_done, "worker-1")
+            _raise_on_nth_update(monkeypatch, _is_cascade_cancel, 2)
+            with pytest.raises(sqlite3.OperationalError):
+                await queue.fail_job(claimed_failed, "worker-1", ValueError("boom"))
+            assert lifecycle_events() == []
+            assert fired == []
+
+            await queue.complete_job(claimed_done, "worker-1")
+            assert lifecycle_events() == ["job.completed"]
+            assert fired == [done.ulid]
+
+            caplog.clear()
+            fired.clear()
+            await queue.fail_job(claimed_failed, "worker-1", ValueError("boom"))
+            assert lifecycle_events() == ["job.failed"]
+            assert sorted(fired) == sorted([failed.ulid, *(c.ulid for c in failed_children)])
+        assert [(await _job(c.ulid)).pending_dep_count for c in done_children] == [0, 0, 0]
+
+    async def test_child_enqueued_during_complete_ends_claimable(self, queue, monkeypatch):
+        """Pin: the child's enqueue starts while the parent's completion is in flight."""
+        parent = await queue.enqueue("my.task")
+        claimed = await queue.claim_job("worker-1", ["default"])
+
+        in_flight, release, enqueue_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        resolve = Queue._resolve_dependencies
+
+        async def held_resolve(self, completed_ulid):
+            in_flight.set()
+            await release.wait()
+            return await resolve(self, completed_ulid)
+
+        monkeypatch.setattr(Queue, "_resolve_dependencies", held_resolve)
+
+        complete = asyncio.create_task(queue.complete_job(claimed, "worker-1"))
+        await in_flight.wait()
+
+        transaction = queue._db.transaction
+
+        def marked_transaction():
+            if asyncio.current_task() is not complete:
+                enqueue_started.set()
+            return transaction()
+
+        monkeypatch.setattr(queue._db, "transaction", marked_transaction)
+        enqueue = asyncio.create_task(queue.enqueue("my.task", depends_on=[parent.ulid]))
+        await enqueue_started.wait()
+        release.set()
+        await complete
+        child = await enqueue
+
+        assert (await _job(child.ulid)).pending_dep_count == 0
+        nxt = await queue.claim_job("worker-1", ["default"])
+        assert nxt.ulid == child.ulid
+
+    async def test_child_enqueued_just_before_complete_is_decremented(self, queue):
+        """Pin: the child's enqueue commits just before the parent's completion starts."""
+        parent = await queue.enqueue("my.task")
+        claimed = await queue.claim_job("worker-1", ["default"])
+
+        enqueued = asyncio.Event()
+
+        async def complete_after_enqueue():
+            await enqueued.wait()
+            await queue.complete_job(claimed, "worker-1")
+
+        complete = asyncio.create_task(complete_after_enqueue())
+        child = await queue.enqueue("my.task", depends_on=[parent.ulid])
+        assert child.pending_dep_count == 1
+        enqueued.set()
+        await complete
+
+        assert (await _job(parent.ulid)).status == JobStatus.COMPLETED.value
+        assert (await _job(child.ulid)).pending_dep_count == 0
+        nxt = await queue.claim_job("worker-1", ["default"])
+        assert nxt.ulid == child.ulid
+
+    async def test_parent_completed_twice_at_once_decrements_once(self, queue, monkeypatch):
+        """Pin: two tasks complete the same parent; each child loses one count."""
+        parent = await queue.enqueue("my.task")
+        other = await queue.enqueue("my.task", queue_name="elsewhere")
+        children = [
+            await queue.enqueue("my.task", depends_on=[parent.ulid, other.ulid]) for _ in range(3)
+        ]
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed.ulid == parent.ulid
+
+        in_flight, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        resolve = Queue._resolve_dependencies
+
+        async def held_resolve(self, completed_ulid):
+            if not in_flight.is_set():
+                in_flight.set()
+                await release.wait()
+            return await resolve(self, completed_ulid)
+
+        monkeypatch.setattr(Queue, "_resolve_dependencies", held_resolve)
+        first = asyncio.create_task(queue.complete_job(claimed, "worker-1"))
+        await in_flight.wait()
+
+        # The second completion has started its write: it asked for the transaction
+        # (or, without one, sent its guarded update).
+        transaction = queue._db.transaction
+        update_one = AsyncSQLerQuerySet.update_one
+
+        def marked_transaction():
+            if asyncio.current_task() is second:
+                second_started.set()
+            return transaction()
+
+        async def marked_update_one(self, **fields):
+            if asyncio.current_task() is second:
+                second_started.set()
+            return await update_one(self, **fields)
+
+        monkeypatch.setattr(queue._db, "transaction", marked_transaction)
+        monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", marked_update_one)
+        second = asyncio.create_task(queue.complete_job(claimed, "worker-1"))
+        await second_started.wait()
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert (await _job(parent.ulid)).status == JobStatus.COMPLETED.value
+        assert [(await _job(c.ulid)).pending_dep_count for c in children] == [1, 1, 1]
