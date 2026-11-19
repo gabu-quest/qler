@@ -435,3 +435,47 @@ class TestUniqueKeyMakesOneJob:
         row = await Job.query().filter(F("ulid") == failed.ulid).first()
         assert row is not None
         assert row.status == JobStatus.FAILED.value
+
+
+# ======================================================================
+# TestUniqueKeyInOneBatch — one batch, one unique key, one job
+# ======================================================================
+
+
+class TestUniqueKeyInOneBatch:
+    """Two specs of one enqueue_many call with one unique key are one job."""
+
+    async def test_two_specs_one_key(self, queue):
+        a, b = await queue.enqueue_many([
+            {"task_path": "t", "unique_key": "k1"},
+            {"task_path": "t", "unique_key": "k1"},
+        ])
+        assert a.ulid == b.ulid
+        assert await _unique_rows("k1") == 1
+
+    async def test_keys_a_b_a(self, queue):
+        res = await queue.enqueue_many([
+            {"task_path": "t", "unique_key": "a"},
+            {"task_path": "t", "unique_key": "b"},
+            {"task_path": "t", "unique_key": "a"},
+        ])
+        assert len(res) == 3
+        assert res[0].ulid == res[2].ulid
+        assert res[0].ulid != res[1].ulid
+        assert await _unique_rows("a") == 1
+        assert await _unique_rows("b") == 1
+        assert await Job.query().count() == 2
+
+    async def test_task_wrapper_unique_true(self, queue):
+        tw = TaskWrapper(_unique_noop, queue, unique=True)
+        res = await tw.enqueue_many([{}, {}])
+        assert len(res) == 2
+        assert res[0].ulid == res[1].ulid
+        assert await _unique_rows(tw.task_path) == 1
+
+    async def test_both_keys_repeated(self, queue):
+        spec = {"task_path": "t", "idempotency_key": "i1", "unique_key": "u1"}
+        a, b = await queue.enqueue_many([dict(spec), dict(spec)])
+        assert a.ulid == b.ulid
+        assert await _unique_rows("u1") == 1
+        assert await Job.query().count() == 1
