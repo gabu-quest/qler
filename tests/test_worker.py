@@ -102,6 +102,7 @@ async def timeout_fast_task():
 
 def timeout_sync_task():
     import time
+
     time.sleep(3)
     return "should not reach"
 
@@ -161,6 +162,7 @@ async def stubborn_task():
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest_asyncio.fixture
 async def worker_db():
     """In-memory sqler database for worker tests."""
@@ -209,6 +211,7 @@ async def _run_worker_until_job_done(worker, job, timeout=5.0):
 # TestWorkerInit
 # ---------------------------------------------------------------------------
 
+
 class TestWorkerInit:
     """Worker.__init__ validation and defaults."""
 
@@ -249,6 +252,7 @@ class TestWorkerInit:
 # ---------------------------------------------------------------------------
 # TestWorkerExecution
 # ---------------------------------------------------------------------------
+
 
 class TestWorkerExecution:
     """Worker claims and executes jobs correctly."""
@@ -376,9 +380,7 @@ class TestWorkerExecution:
         w = _make_worker(worker_queue)
         await _run_worker_until_job_done(w, job)
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.COMPLETED.value
         assert attempts[0].worker_id == w.worker_id
@@ -387,6 +389,7 @@ class TestWorkerExecution:
 # ---------------------------------------------------------------------------
 # TestWorkerConcurrency
 # ---------------------------------------------------------------------------
+
 
 class TestWorkerConcurrency:
     """Concurrency control via semaphore."""
@@ -450,6 +453,7 @@ class TestWorkerConcurrency:
 # TestWorkerShutdown
 # ---------------------------------------------------------------------------
 
+
 class TestWorkerShutdown:
     """Graceful shutdown behavior."""
 
@@ -499,6 +503,7 @@ class TestWorkerShutdown:
 # TestCorrelation
 # ---------------------------------------------------------------------------
 
+
 class TestCorrelation:
     """Correlation context wraps execution."""
 
@@ -537,6 +542,7 @@ class TestCorrelation:
 # TestLeaseRenewalLoop
 # ---------------------------------------------------------------------------
 
+
 class TestLeaseRenewalLoop:
     """Verify the background lease renewal loop extends leases mid-execution."""
 
@@ -568,8 +574,7 @@ class TestLeaseRenewalLoop:
             # Lease should have been extended beyond the original
             await job.refresh()
             assert job.lease_expires_at > original_expiry, (
-                f"Lease was not renewed: original={original_expiry}, "
-                f"current={job.lease_expires_at}"
+                f"Lease was not renewed: original={original_expiry}, current={job.lease_expires_at}"
             )
 
             # Job should still complete successfully despite taking 3s > 2s lease
@@ -587,6 +592,7 @@ class TestLeaseRenewalLoop:
 # ---------------------------------------------------------------------------
 # TestShutdownTimeout
 # ---------------------------------------------------------------------------
+
 
 class TestShutdownTimeout:
     """A job that outlives shutdown_timeout is left RUNNING for lease recovery."""
@@ -611,9 +617,7 @@ class TestShutdownTimeout:
         return await Job.query().filter(F("ulid") == job.ulid).first()
 
     async def _attempts(self, job):
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         return sorted(attempts, key=lambda a: a.attempt_number)
 
     async def test_job_outliving_timeout_is_left_running(self, worker_db, caplog):
@@ -637,10 +641,7 @@ class TestShutdownTimeout:
         assert after.last_failure_kind is None
         attempts = await self._attempts(job)
         assert [a.status for a in attempts] == [AttemptStatus.RUNNING.value]
-        assert (
-            "left 1 running for lease recovery, failed 0 as cancelled"
-            in caplog.text
-        )
+        assert "left 1 running for lease recovery, failed 0 as cancelled" in caplog.text
 
     async def test_left_job_is_recovered_and_run_again(self, worker_db):
         """After the lease ends, recovery returns it and a second worker completes it."""
@@ -699,9 +700,7 @@ class TestShutdownTimeout:
         assert result.status == JobStatus.COMPLETED.value
         assert _held_runs == 2
 
-    async def test_user_cancel_during_shutdown_still_fails_cancelled(
-        self, worker_db, caplog
-    ):
+    async def test_user_cancel_during_shutdown_still_fails_cancelled(self, worker_db, caplog):
         """A cancel the user asked for keeps today's outcome when shutdown cuts the job."""
         q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
         await q.init_db()
@@ -723,14 +722,9 @@ class TestShutdownTimeout:
         assert [(a.status, a.failure_kind) for a in attempts] == [
             (AttemptStatus.FAILED.value, FailureKind.CANCELLED.value),
         ]
-        assert (
-            "left 0 running for lease recovery, failed 1 as cancelled"
-            in caplog.text
-        )
+        assert "left 0 running for lease recovery, failed 1 as cancelled" in caplog.text
 
-    async def test_job_finishing_just_after_timeout_is_recorded_once(
-        self, worker_db, monkeypatch
-    ):
+    async def test_job_finishing_just_after_timeout_is_recorded_once(self, worker_db, monkeypatch):
         """A job writing its outcome when the timeout passes finishes the write, once."""
         q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
         await q.init_db()
@@ -795,6 +789,7 @@ class TestShutdownTimeout:
 # ---------------------------------------------------------------------------
 # TestMalformedPayload
 # ---------------------------------------------------------------------------
+
 
 class TestMalformedPayload:
     """Verify worker handles payloads with valid JSON but wrong structure."""
@@ -869,6 +864,7 @@ class TestMalformedPayload:
 # TestRetryExhaustion
 # ---------------------------------------------------------------------------
 
+
 class TestRetryExhaustion:
     """Verify the full retry exhaustion cycle through the worker."""
 
@@ -897,9 +893,7 @@ class TestRetryExhaustion:
         assert job.last_error == "boom"
 
         # Verify both attempt records
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).order_by("ulid").all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).order_by("ulid").all()
         assert len(attempts) == 2
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert attempts[0].attempt_number == 1
@@ -950,21 +944,15 @@ class TestHealthEndpoint:
     """Health endpoint: TCP and Unix socket, JSON response, lifecycle."""
 
     def test_constructor_rejects_both_port_and_socket(self, worker_queue):
-        with pytest.raises(
-            ConfigurationError, match="mutually exclusive"
-        ):
+        with pytest.raises(ConfigurationError, match="mutually exclusive"):
             Worker(worker_queue, health_port=9100, health_socket="/tmp/h.sock")
 
     def test_constructor_rejects_invalid_port_zero(self, worker_queue):
-        with pytest.raises(
-            ConfigurationError, match="health_port must be between 1 and 65535"
-        ):
+        with pytest.raises(ConfigurationError, match="health_port must be between 1 and 65535"):
             Worker(worker_queue, health_port=0)
 
     def test_constructor_rejects_invalid_port_too_high(self, worker_queue):
-        with pytest.raises(
-            ConfigurationError, match="health_port must be between 1 and 65535"
-        ):
+        with pytest.raises(ConfigurationError, match="health_port must be between 1 and 65535"):
             Worker(worker_queue, health_port=70000)
 
     def test_status_property_before_run(self, worker_queue):
@@ -985,10 +973,7 @@ class TestHealthEndpoint:
         await asyncio.sleep(0.05)
         try:
             # No health background task should exist (only lease renewal + recovery)
-            health_tasks = [
-                t for t in w._background_tasks
-                if "health" in (t.get_name() or "")
-            ]
+            health_tasks = [t for t in w._background_tasks if "health" in (t.get_name() or "")]
             # The health task won't have "health" in name by default, but
             # the total count should be exactly 2 (lease renewal + recovery)
             assert len(w._background_tasks) == 2
@@ -1057,6 +1042,7 @@ class TestHealthEndpoint:
         await asyncio.sleep(0.15)
 
         import pathlib
+
         assert pathlib.Path(sock_path).exists()
 
         w._running = False
@@ -1144,6 +1130,7 @@ class TestHealthEndpoint:
 # ---------------------------------------------------------------------------
 # TestTimeout
 # ---------------------------------------------------------------------------
+
 
 class TestTimeout:
     """Job timeout enforcement via asyncio.wait_for."""
@@ -1280,9 +1267,7 @@ class TestTimeout:
                 await worker_task
 
         await job.refresh()
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert "timed out" in attempts[0].error
@@ -1405,8 +1390,7 @@ class TestShutdownBounds:
         assert row.status == JobStatus.RUNNING.value
         assert row.worker_id == w.worker_id
         stuck_logs = [
-            r.getMessage() for r in caplog.records
-            if "did not stop within" in r.getMessage()
+            r.getMessage() for r in caplog.records if "did not stop within" in r.getMessage()
         ]
         assert len(stuck_logs) == 1
         assert job.ulid in stuck_logs[0]
@@ -1422,7 +1406,9 @@ class TestFinishFailureIsLogged:
             task(worker_queue)(failing_task),
         )
 
-    async def _run(self, worker_queue, monkeypatch, caplog, which, first_task, second_task, first_args=()):
+    async def _run(
+        self, worker_queue, monkeypatch, caplog, which, first_task, second_task, first_args=()
+    ):
         """Make the first finish of kind `which` raise once; return (first, second, records)."""
         first_finish_raised = asyncio.Event()
         second_completed = asyncio.Event()
@@ -1474,7 +1460,9 @@ class TestFinishFailureIsLogged:
             worker_queue, monkeypatch, caplog, "complete", succeeding, succeeding, (1,)
         )
 
-        errors = [r for r in caplog.records if r.name == "qler.worker" and r.levelno == logging.ERROR]
+        errors = [
+            r for r in caplog.records if r.name == "qler.worker" and r.levelno == logging.ERROR
+        ]
         assert len(errors) == 1
         message = errors[0].getMessage()
         assert first.ulid in message
@@ -1499,8 +1487,10 @@ class TestFinishFailureIsLogged:
         )
 
         errors = [
-            r for r in caplog.records
-            if r.name == "qler.worker" and r.levelno == logging.ERROR
+            r
+            for r in caplog.records
+            if r.name == "qler.worker"
+            and r.levelno == logging.ERROR
             and "lease recovery" in r.getMessage()
         ]
         assert len(errors) == 1

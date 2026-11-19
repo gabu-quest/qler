@@ -20,10 +20,13 @@ from qler.queue import Queue
 # qler cron
 # ---------------------------------------------------------------------------
 
+
 @cli.command("cron")
 @click.option("--db", envvar="QLER_DB", help="Database file path")
 @click.option("--app", "app_string", help="Queue instance as 'module:attribute'")
-@click.option("--module", "-m", "modules", multiple=True, help="Import module(s) to register cron tasks")
+@click.option(
+    "--module", "-m", "modules", multiple=True, help="Import module(s) to register cron tasks"
+)
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
 def cron_cmd(
     db: str | None,
@@ -50,19 +53,20 @@ def cron_cmd(
             for path, cw in q._cron_tasks.items():
                 # Count active jobs for this cron task
                 active_count = await q.jobs.filter(
-                    (F("task") == path)
-                    & F("status").in_list(["pending", "running"])
+                    (F("task") == path) & F("status").in_list(["pending", "running"])
                 ).count()
 
                 next_run = cw.next_run()
-                tasks.append({
-                    "task": path,
-                    "expression": cw.schedule.expression,
-                    "max_running": cw.schedule.max_running,
-                    "timezone": cw.schedule.timezone,
-                    "next_run": next_run.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "active_jobs": active_count,
-                })
+                tasks.append(
+                    {
+                        "task": path,
+                        "expression": cw.schedule.expression,
+                        "max_running": cw.schedule.max_running,
+                        "timezone": cw.schedule.timezone,
+                        "next_run": next_run.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "active_jobs": active_count,
+                    }
+                )
             return tasks
         finally:
             await q.close()
@@ -79,19 +83,22 @@ def cron_cmd(
         headers = ["Task", "Schedule", "Max Running", "Next Run", "Active"]
         rows = []
         for t in result:
-            rows.append([
-                t["task"],
-                t["expression"],
-                str(t["max_running"]),
-                t["next_run"],
-                str(t["active_jobs"]),
-            ])
+            rows.append(
+                [
+                    t["task"],
+                    t["expression"],
+                    str(t["max_running"]),
+                    t["next_run"],
+                    str(t["active_jobs"]),
+                ]
+            )
         _echo_table(headers, rows)
 
 
 # ---------------------------------------------------------------------------
 # qler tasks
 # ---------------------------------------------------------------------------
+
 
 @cli.command("tasks")
 @click.option("--db", envvar="QLER_DB", help="Database file path")
@@ -128,8 +135,7 @@ def tasks_cmd(
 
                 # Count active jobs (pending + running)
                 active_count = await q.jobs.filter(
-                    (F("task") == path)
-                    & F("status").in_list(["pending", "running"])
+                    (F("task") == path) & F("status").in_list(["pending", "running"])
                 ).count()
 
                 # Check if this task has a cron schedule
@@ -142,22 +148,24 @@ def tasks_cmd(
                 if tw.rate_spec is not None:
                     rate_str = f"{tw.rate_spec.limit}/{tw.rate_spec.window_seconds}s"
 
-                tasks.append({
-                    "task": path,
-                    "queue": tw.queue_name,
-                    "sync": tw.sync,
-                    "max_retries": tw.max_retries,
-                    "retry_delay": tw.retry_delay,
-                    "priority": tw.priority,
-                    "lease_duration": tw.lease_duration,
-                    "rate_limit": rate_str,
-                    "cron": cron_expr,
-                    "idempotency_key": tw.idempotency_key_fn is not None,
-                    "timeout": tw._timeout,
-                    "unique": tw._unique or tw.unique_key_fn is not None,
-                    "unique_key": tw.unique_key_fn is not None,
-                    "active_jobs": active_count,
-                })
+                tasks.append(
+                    {
+                        "task": path,
+                        "queue": tw.queue_name,
+                        "sync": tw.sync,
+                        "max_retries": tw.max_retries,
+                        "retry_delay": tw.retry_delay,
+                        "priority": tw.priority,
+                        "lease_duration": tw.lease_duration,
+                        "rate_limit": rate_str,
+                        "cron": cron_expr,
+                        "idempotency_key": tw.idempotency_key_fn is not None,
+                        "timeout": tw._timeout,
+                        "unique": tw._unique or tw.unique_key_fn is not None,
+                        "unique_key": tw.unique_key_fn is not None,
+                        "active_jobs": active_count,
+                    }
+                )
             return tasks
         finally:
             await q.close()
@@ -174,12 +182,14 @@ def tasks_cmd(
         headers = ["Task", "Queue", "Retries", "Rate", "Cron", "Active"]
         rows = []
         for t in result:
-            rows.append([
-                t["task"],
-                t["queue"],
-                str(t["max_retries"]),
-                t["rate_limit"] or "-",
-                t["cron"] or "-",
-                str(t["active_jobs"]),
-            ])
+            rows.append(
+                [
+                    t["task"],
+                    t["queue"],
+                    str(t["max_retries"]),
+                    t["rate_limit"] or "-",
+                    t["cron"] or "-",
+                    str(t["active_jobs"]),
+                ]
+            )
         _echo_table(headers, rows)

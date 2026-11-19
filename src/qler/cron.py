@@ -78,9 +78,11 @@ class CronWrapper:
         """
         from sqler import F
 
-        last_job = await self.task_wrapper.queue.jobs.filter(
-            F("task") == self.task_path
-        ).order_by("-ulid").first()
+        last_job = (
+            await self.task_wrapper.queue.jobs.filter(F("task") == self.task_path)
+            .order_by("-ulid")
+            .first()
+        )
 
         if last_job is None:
             return None
@@ -167,17 +169,11 @@ def _normalize_catchup(catchup: int | str | bool) -> tuple[int, bool]:
         return 1, True
     if isinstance(catchup, int):
         if catchup < 1:
-            raise ConfigurationError(
-                f"catchup must be >= 1, got {catchup}"
-            )
+            raise ConfigurationError(f"catchup must be >= 1, got {catchup}")
         if catchup > 100:
-            raise ConfigurationError(
-                f"catchup must be <= 100, got {catchup}"
-            )
+            raise ConfigurationError(f"catchup must be <= 100, got {catchup}")
         return catchup, False
-    raise ConfigurationError(
-        f"catchup must be False, 'latest', or int 1-100, got {catchup!r}"
-    )
+    raise ConfigurationError(f"catchup must be False, 'latest', or int 1-100, got {catchup!r}")
 
 
 def cron(
@@ -214,14 +210,10 @@ def cron(
     """
     # Validate cron expression at decoration time (fail-fast)
     if not croniter.is_valid(expression):
-        raise ConfigurationError(
-            f"Invalid cron expression: '{expression}'"
-        )
+        raise ConfigurationError(f"Invalid cron expression: '{expression}'")
 
     if max_running < 1:
-        raise ConfigurationError(
-            f"max_running must be >= 1, got {max_running}"
-        )
+        raise ConfigurationError(f"max_running must be >= 1, got {max_running}")
 
     catchup_int, is_latest = _normalize_catchup(catchup)
 
@@ -247,9 +239,7 @@ def cron(
 
         # Validate retry_delay
         if retry_delay is not None and retry_delay < 1:
-            raise ConfigurationError(
-                f"retry_delay must be >= 1, got {retry_delay}"
-            )
+            raise ConfigurationError(f"retry_delay must be >= 1, got {retry_delay}")
 
         # Create the inner TaskWrapper
         task_wrapper = TaskWrapper(

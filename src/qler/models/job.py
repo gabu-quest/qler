@@ -91,12 +91,14 @@ class Job(AsyncSQLerSafeModel):
         """
         # Try immediate cancellation (PENDING → CANCELLED)
         now = now_epoch()
-        updated = await Job.query().filter(
-            (F("ulid") == self.ulid) & (F("status") == JobStatus.PENDING.value)
-        ).update_one(
-            status=JobStatus.CANCELLED.value,
-            finished_at=now,
-            updated_at=now,
+        updated = (
+            await Job.query()
+            .filter((F("ulid") == self.ulid) & (F("status") == JobStatus.PENDING.value))
+            .update_one(
+                status=JobStatus.CANCELLED.value,
+                finished_at=now,
+                updated_at=now,
+            )
         )
         if updated is not None:
             self._sync_from(updated)
@@ -107,10 +109,11 @@ class Job(AsyncSQLerSafeModel):
 
     async def request_cancel(self) -> bool:
         """Request cancellation of a RUNNING job. Returns True if request was recorded."""
-        updated = await Job.query().filter(
-            (F("ulid") == self.ulid)
-            & (F("status") == JobStatus.RUNNING.value)
-        ).update_one(cancel_requested=True, updated_at=now_epoch())
+        updated = (
+            await Job.query()
+            .filter((F("ulid") == self.ulid) & (F("status") == JobStatus.RUNNING.value))
+            .update_one(cancel_requested=True, updated_at=now_epoch())
+        )
         if updated is None:
             return False
         self._sync_from(updated)
@@ -158,17 +161,13 @@ class Job(AsyncSQLerSafeModel):
                         ulid=self.ulid,
                     )
                 if timeout is not None and time.monotonic() - start >= timeout:
-                    raise TimeoutError(
-                        f"Job {self.ulid} did not complete within {timeout}s"
-                    )
+                    raise TimeoutError(f"Job {self.ulid} did not complete within {timeout}s")
                 # Wait for Event (instant wakeup) or fall back to poll
                 wait_duration = min(interval, max_interval)
                 if timeout is not None:
                     remaining = timeout - (time.monotonic() - start)
                     if remaining <= 0:
-                        raise TimeoutError(
-                            f"Job {self.ulid} did not complete within {timeout}s"
-                        )
+                        raise TimeoutError(f"Job {self.ulid} did not complete within {timeout}s")
                     wait_duration = min(wait_duration, remaining)
                 try:
                     await asyncio.wait_for(event.wait(), timeout=wait_duration)
@@ -202,9 +201,7 @@ class Job(AsyncSQLerSafeModel):
         start = time.monotonic()
         interval = poll_interval
         while True:
-            deps = await Job.query().filter(
-                F("ulid").in_list(self.dependencies)
-            ).all()
+            deps = await Job.query().filter(F("ulid").in_list(self.dependencies)).all()
 
             # Check for missing deps (deleted)
             found_ulids = {d.ulid for d in deps}
@@ -235,9 +232,7 @@ class Job(AsyncSQLerSafeModel):
                 return
 
             if timeout is not None and time.monotonic() - start >= timeout:
-                raise TimeoutError(
-                    f"Dependencies did not complete within {timeout}s"
-                )
+                raise TimeoutError(f"Dependencies did not complete within {timeout}s")
             await asyncio.sleep(min(interval, max_interval))
             interval *= backoff
 
@@ -260,12 +255,14 @@ class Job(AsyncSQLerSafeModel):
             return False
         now = now_epoch()
         try:
-            updated = await Job.query().filter(
-                (F("ulid") == self.ulid)
-                & (F("status") == JobStatus.FAILED.value)
-                & (F("original_queue") == current.original_queue)
-            ).update_one(
-                **failed_to_pending_fields(now, target_queue=current.original_queue)
+            updated = (
+                await Job.query()
+                .filter(
+                    (F("ulid") == self.ulid)
+                    & (F("status") == JobStatus.FAILED.value)
+                    & (F("original_queue") == current.original_queue)
+                )
+                .update_one(**failed_to_pending_fields(now, target_queue=current.original_queue))
             )
         except UniqueConstraintError as err:
             raise await unique_key_conflict(current, err) from err
@@ -288,13 +285,17 @@ class Job(AsyncSQLerSafeModel):
         """
         lease_seconds = duration if duration is not None else self.lease_duration
         now = now_epoch()
-        updated = await Job.query().filter(
-            (F("ulid") == self.ulid)
-            & (F("status") == JobStatus.RUNNING.value)
-            & (F("worker_id") == self.worker_id)
-        ).update_one(
-            lease_expires_at=now + lease_seconds,
-            updated_at=now,
+        updated = (
+            await Job.query()
+            .filter(
+                (F("ulid") == self.ulid)
+                & (F("status") == JobStatus.RUNNING.value)
+                & (F("worker_id") == self.worker_id)
+            )
+            .update_one(
+                lease_expires_at=now + lease_seconds,
+                updated_at=now,
+            )
         )
         if updated is None:
             return False
@@ -333,8 +334,7 @@ class KeyIndex(NamedTuple):
 
 
 _UNIQUE_KEY_WHERE = (
-    "json_extract(data, '$.unique_key') IS NOT NULL "
-    "AND status IN ('pending', 'running')"
+    "json_extract(data, '$.unique_key') IS NOT NULL AND status IN ('pending', 'running')"
 )
 
 KEY_INDEXES = (
@@ -344,10 +344,7 @@ KEY_INDEXES = (
         label="idempotency key",
         scope="non-cancelled",
         name="idx_qler_jobs_idempotency_uq",
-        where=(
-            "json_extract(data, '$.idempotency_key') IS NOT NULL "
-            "AND status != 'cancelled'"
-        ),
+        where=("json_extract(data, '$.idempotency_key') IS NOT NULL AND status != 'cancelled'"),
         active=F("status") != JobStatus.CANCELLED.value,
         legacy_name="idx_qler_jobs_idempotency",
         legacy_where="json_extract(data, '$.idempotency_key') IS NOT NULL",
@@ -376,9 +373,7 @@ def key_active(field: str) -> Any:
     raise KeyError(field)
 
 
-async def unique_key_conflict(
-    job: Job, err: UniqueConstraintError
-) -> UniqueKeyConflictError:
+async def unique_key_conflict(job: Job, err: UniqueConstraintError) -> UniqueKeyConflictError:
     """The error for a move of ``job`` back to pending that the unique-key index refused.
 
     Shared by ``Job.retry`` and ``Queue.replay_job``. Any other refusal is not this
@@ -386,9 +381,11 @@ async def unique_key_conflict(
     """
     if err.index != UNIQUE_KEY_INDEX:
         raise err
-    active = await Job.query().filter(
-        (F("unique_key") == job.unique_key) & key_active("unique_key")
-    ).first()
+    active = (
+        await Job.query()
+        .filter((F("unique_key") == job.unique_key) & key_active("unique_key"))
+        .first()
+    )
     active_ulid = active.ulid if active is not None else None
     return UniqueKeyConflictError(
         f"Job {job.ulid} stays failed: job {active_ulid} with unique key "

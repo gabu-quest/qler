@@ -154,10 +154,14 @@ async def test_cron_max_running_blocks(queue):
     await wrapped.enqueue()
 
     # Check running count matches expectation
-    count = await Job.query().filter(
-        (F("task") == wrapped.task_path)
-        & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
-    ).count()
+    count = (
+        await Job.query()
+        .filter(
+            (F("task") == wrapped.task_path)
+            & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
+        )
+        .count()
+    )
     assert count == 1
     assert count >= wrapped.schedule.max_running
 
@@ -168,10 +172,14 @@ async def test_cron_max_running_allows(queue):
 
     # Enqueue one — still below max_running of 2
     await wrapped.enqueue()
-    count = await Job.query().filter(
-        (F("task") == wrapped.task_path)
-        & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
-    ).count()
+    count = (
+        await Job.query()
+        .filter(
+            (F("task") == wrapped.task_path)
+            & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
+        )
+        .count()
+    )
     assert count == 1
     assert count < wrapped.schedule.max_running
 
@@ -247,9 +255,7 @@ async def test_cron_scheduler_loop_enqueues(queue):
         await worker_task
 
     # The scheduler should have created at least one job
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
     assert len(all_jobs) == 1
 
 
@@ -475,9 +481,7 @@ async def test_catchup_enqueues_missed(queue):
     await _run_worker_briefly(queue)
 
     # Should have the original + up to 5 catchup jobs (at least 2 hourly in 4h window)
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
     # Seed + catchup: 4 hours of hourly runs = seed + 3 catchups = 4, but timing can vary ±1
     assert 3 <= len(all_jobs) <= 5
     for job in all_jobs:
@@ -495,9 +499,7 @@ async def test_catchup_latest_only_one(queue):
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
     # The key check: exactly 1 catchup job (not 4-5), plus possibly the normal tick
     cron_timestamps = set()
     for job in all_jobs:
@@ -524,12 +526,9 @@ async def test_catchup_respects_max_running(queue):
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
     pending_running = [
-        j for j in all_jobs
-        if j.status in (JobStatus.PENDING.value, JobStatus.RUNNING.value)
+        j for j in all_jobs if j.status in (JobStatus.PENDING.value, JobStatus.RUNNING.value)
     ]
     # max_running guard should have prevented pile-up
     assert len(pending_running) <= 1
@@ -548,9 +547,7 @@ async def test_catchup_idempotent(queue):
     for _ in range(2):
         await _run_worker_briefly(queue, duration=0.2)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
     assert 2 <= len(all_jobs) <= 4  # seed + 1-2 catchups + possible normal tick
     # No duplicate idempotency keys
     keys = [j.idempotency_key for j in all_jobs]
@@ -563,9 +560,7 @@ async def test_catchup_no_history_skips(queue):
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
     # Should have exactly 1 job (from normal scheduling), not a flood
     assert len(all_jobs) == 1
 
@@ -587,13 +582,8 @@ async def test_catchup_latest_picks_most_recent(queue):
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
-    catchup_keys = {
-        int(j.idempotency_key.rsplit(":", 1)[1])
-        for j in all_jobs
-    }
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
+    catchup_keys = {int(j.idempotency_key.rsplit(":", 1)[1]) for j in all_jobs}
     catchup_keys.discard(old_ts)
 
     # The catchup job should be the most recent hour, not the oldest missed
@@ -616,13 +606,8 @@ async def test_catchup_trims_to_limit(queue):
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
-    catchup_keys = sorted(
-        int(j.idempotency_key.rsplit(":", 1)[1])
-        for j in all_jobs
-    )
+    all_jobs = await Job.query().filter(F("task") == wrapped.task_path).all()
+    catchup_keys = sorted(int(j.idempotency_key.rsplit(":", 1)[1]) for j in all_jobs)
 
     # Remove seed and any normal tick (within 60s of now)
     now_ts = int(now.timestamp())

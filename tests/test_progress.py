@@ -308,15 +308,17 @@ class TestProgressReset:
 
         # Simulate a claimed job with progress that has an expired lease
         now = now_epoch()
-        claimed = await Job.query().filter(
-            (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
-        ).update_one(
-            status=JobStatus.RUNNING.value,
-            worker_id="dead-worker",
-            lease_expires_at=now - 10,  # Already expired
-            progress=75,
-            progress_message="three quarters",
-            updated_at=now,
+        claimed = (
+            await Job.query()
+            .filter((F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value))
+            .update_one(
+                status=JobStatus.RUNNING.value,
+                worker_id="dead-worker",
+                lease_expires_at=now - 10,  # Already expired
+                progress=75,
+                progress_message="three quarters",
+                updated_at=now,
+            )
         )
         assert claimed is not None
         assert claimed.progress == 75

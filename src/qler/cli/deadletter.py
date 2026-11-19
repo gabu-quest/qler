@@ -24,6 +24,7 @@ from qler.queue import Queue
 # DLQ helpers
 # ---------------------------------------------------------------------------
 
+
 def _echo_result(
     data: Any = None,
     *,
@@ -67,6 +68,7 @@ def _echo_result(
 # ---------------------------------------------------------------------------
 # qler dlq (Dead Letter Queue)
 # ---------------------------------------------------------------------------
+
 
 @cli.group()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
@@ -233,28 +235,29 @@ def dlq_replay(
                     & (F("status") == JobStatus.FAILED.value)
                 ).first()
                 if j is None:
-                    raise click.ClickException(
-                        f"Job {ulid} not found in DLQ '{dlq_name}'"
-                    )
+                    raise click.ClickException(f"Job {ulid} not found in DLQ '{dlq_name}'")
                 updated = await q.replay_job(j, queue_name=target_queue)
                 if updated:
-                    replayed.append({
-                        "ulid": updated.ulid,
-                        "queue_name": updated.queue_name,
-                        "status": updated.status,
-                    })
+                    replayed.append(
+                        {
+                            "ulid": updated.ulid,
+                            "queue_name": updated.queue_name,
+                            "status": updated.status,
+                        }
+                    )
             else:
                 jobs = await q.jobs.filter(
-                    (F("queue_name") == dlq_name)
-                    & (F("status") == JobStatus.FAILED.value)
+                    (F("queue_name") == dlq_name) & (F("status") == JobStatus.FAILED.value)
                 ).all()
                 for j in jobs:
                     updated = await q.replay_job(j, queue_name=target_queue)
                     if updated:
-                        replayed.append({
-                            "ulid": updated.ulid,
-                            "queue_name": updated.queue_name,
-                        })
+                        replayed.append(
+                            {
+                                "ulid": updated.ulid,
+                                "queue_name": updated.queue_name,
+                            }
+                        )
             return replayed
         finally:
             await q.close()
@@ -305,9 +308,7 @@ def dlq_purge(ctx: click.Context, older_than: str | None, confirm: bool) -> None
                 return 0
 
             ulids = [j.ulid for j in matching_jobs]
-            await q.attempts.filter(
-                F("job_ulid").in_list(ulids)
-            ).delete_all()
+            await q.attempts.filter(F("job_ulid").in_list(ulids)).delete_all()
 
             return await q.jobs.filter(combined).delete_all()
         finally:
@@ -317,7 +318,9 @@ def dlq_purge(ctx: click.Context, older_than: str | None, confirm: bool) -> None
         if human:
             click.echo("Use --confirm to purge all DLQ jobs, or --older-than to filter.", err=True)
         else:
-            _echo_result(ok=False, error="Use --confirm to purge all DLQ jobs, or --older-than to filter")
+            _echo_result(
+                ok=False, error="Use --confirm to purge all DLQ jobs, or --older-than to filter"
+            )
         sys.exit(1)
 
     result = _run(_purge())

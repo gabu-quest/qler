@@ -29,10 +29,10 @@ class BenchmarkRunner:
 
         for i, scenario in enumerate(scenarios, 1):
             label = f"[{i}/{total}] {scenario.suite}/{scenario.name}"
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"  {label}")
             print(f"  {scenario.description}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             # GC between scenarios for clean baseline
             gc.collect()
@@ -55,11 +55,7 @@ class BenchmarkRunner:
 
                 if self.config.verbose:
                     for r in results:
-                        p95_str = (
-                            f"{r.timing.p95_ms:.2f}"
-                            if r.timing.reliable_p95
-                            else "n/a"
-                        )
+                        p95_str = f"{r.timing.p95_ms:.2f}" if r.timing.reliable_p95 else "n/a"
                         print(
                             f"     {r.parameter}={r.value}: "
                             f"median={r.timing.median_ms:.2f}ms "
@@ -109,14 +105,16 @@ class BenchmarkRunner:
         for r in results:
             if r.suite not in by_suite:
                 by_suite[r.suite] = []
-            by_suite[r.suite].append({
-                "scenario": r.scenario,
-                "parameter": r.parameter,
-                "value": r.value,
-                "median_ms": r.timing.median_ms,
-                "p95_ms": r.timing.p95_ms,
-                "throughput": r.throughput,
-            })
+            by_suite[r.suite].append(
+                {
+                    "scenario": r.scenario,
+                    "parameter": r.parameter,
+                    "value": r.value,
+                    "median_ms": r.timing.median_ms,
+                    "p95_ms": r.timing.p95_ms,
+                    "throughput": r.throughput,
+                }
+            )
         return {
             "total_scenarios": len({r.scenario for r in results}),
             "total_measurements": len(results),

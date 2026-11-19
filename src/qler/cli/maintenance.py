@@ -25,9 +25,12 @@ from qler.enums import JobStatus
 # qler archive
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
-@click.option("--older-than", default="5m", help="Age threshold, e.g. '5m', '1h', '7d' (default: 5m)")
+@click.option(
+    "--older-than", default="5m", help="Age threshold, e.g. '5m', '1h', '7d' (default: 5m)"
+)
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
 def archive(db: str, older_than: str, output_json: bool) -> None:
     """Move terminal jobs to archive table."""
@@ -52,12 +55,16 @@ def archive(db: str, older_than: str, output_json: bool) -> None:
 # qler purge
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
 @click.option("--older-than", required=True, help="Age threshold, e.g. '7d', '24h'")
-@click.option("--status", "filter_status",
-              type=click.Choice(["completed", "failed", "cancelled"], case_sensitive=False),
-              help="Only purge this status (default: all terminal)")
+@click.option(
+    "--status",
+    "filter_status",
+    type=click.Choice(["completed", "failed", "cancelled"], case_sensitive=False),
+    help="Only purge this status (default: all terminal)",
+)
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
 def purge(db: str, older_than: str, filter_status: str | None, output_json: bool) -> None:
     """Delete terminal jobs older than threshold."""
@@ -78,9 +85,7 @@ def purge(db: str, older_than: str, filter_status: str | None, output_json: bool
 
             # Delete attempts first (cascade)
             ulids = [j.ulid for j in matching_jobs]
-            await q.attempts.filter(
-                F("job_ulid").in_list(ulids)
-            ).delete_all()
+            await q.attempts.filter(F("job_ulid").in_list(ulids)).delete_all()
 
             # Delete jobs
             deleted = await q.jobs.filter(job_filter).delete_all()
@@ -100,10 +105,12 @@ def purge(db: str, older_than: str, filter_status: str | None, output_json: bool
 # qler doctor
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
-@click.option("--module", "-m", "modules", multiple=True,
-              help="Import module(s) for orphaned task check")
+@click.option(
+    "--module", "-m", "modules", multiple=True, help="Import module(s) for orphaned task check"
+)
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
 def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
     """Run health checks on the qler database."""
@@ -125,12 +132,14 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
                 ]
                 has_jobs = "qler_jobs" in tables
                 has_attempts = "qler_job_attempts" in tables
-                checks.append({
-                    "check": "schema",
-                    "ok": has_jobs and has_attempts,
-                    "detail": f"qler_jobs={'ok' if has_jobs else 'MISSING'}, "
-                              f"qler_job_attempts={'ok' if has_attempts else 'MISSING'}",
-                })
+                checks.append(
+                    {
+                        "check": "schema",
+                        "ok": has_jobs and has_attempts,
+                        "detail": f"qler_jobs={'ok' if has_jobs else 'MISSING'}, "
+                        f"qler_job_attempts={'ok' if has_attempts else 'MISSING'}",
+                    }
+                )
             except Exception as exc:
                 checks.append({"check": "schema", "ok": False, "detail": str(exc)})
 
@@ -138,11 +147,13 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             try:
                 rows = await q.db.execute_sql("PRAGMA journal_mode")
                 mode = rows[0]["journal_mode"] if rows else "unknown"
-                checks.append({
-                    "check": "wal_mode",
-                    "ok": mode == "wal",
-                    "detail": f"journal_mode={mode}",
-                })
+                checks.append(
+                    {
+                        "check": "wal_mode",
+                        "ok": mode == "wal",
+                        "detail": f"journal_mode={mode}",
+                    }
+                )
             except Exception as exc:
                 checks.append({"check": "wal_mode", "ok": False, "detail": str(exc)})
 
@@ -150,14 +161,15 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             try:
                 now = now_epoch()
                 expired = await q.jobs.filter(
-                    (F("status") == JobStatus.RUNNING.value)
-                    & (F("lease_expires_at") <= now)
+                    (F("status") == JobStatus.RUNNING.value) & (F("lease_expires_at") <= now)
                 ).all()
-                checks.append({
-                    "check": "expired_leases",
-                    "ok": len(expired) == 0,
-                    "detail": f"{len(expired)} expired lease(s)",
-                })
+                checks.append(
+                    {
+                        "check": "expired_leases",
+                        "ok": len(expired) == 0,
+                        "detail": f"{len(expired)} expired lease(s)",
+                    }
+                )
             except Exception as exc:
                 checks.append({"check": "expired_leases", "ok": False, "detail": str(exc)})
 
@@ -165,15 +177,15 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             if modules:
                 _import_modules(modules)
                 try:
-                    running = await q.jobs.filter(
-                        F("status") == JobStatus.RUNNING.value
-                    ).all()
+                    running = await q.jobs.filter(F("status") == JobStatus.RUNNING.value).all()
                     orphaned = [j for j in running if j.task not in q._tasks]
-                    checks.append({
-                        "check": "orphaned_tasks",
-                        "ok": len(orphaned) == 0,
-                        "detail": f"{len(orphaned)} running job(s) with unregistered tasks",
-                    })
+                    checks.append(
+                        {
+                            "check": "orphaned_tasks",
+                            "ok": len(orphaned) == 0,
+                            "detail": f"{len(orphaned)} running job(s) with unregistered tasks",
+                        }
+                    )
                 except Exception as exc:
                     checks.append({"check": "orphaned_tasks", "ok": False, "detail": str(exc)})
 
@@ -181,14 +193,15 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
             try:
                 stale_threshold = now_epoch() - 86400  # 24h
                 stale = await q.jobs.filter(
-                    (F("status") == JobStatus.PENDING.value)
-                    & (F("created_at") <= stale_threshold)
+                    (F("status") == JobStatus.PENDING.value) & (F("created_at") <= stale_threshold)
                 ).all()
-                checks.append({
-                    "check": "stale_pending",
-                    "ok": len(stale) == 0,
-                    "detail": f"{len(stale)} pending job(s) older than 24h",
-                })
+                checks.append(
+                    {
+                        "check": "stale_pending",
+                        "ok": len(stale) == 0,
+                        "detail": f"{len(stale)} pending job(s) older than 24h",
+                    }
+                )
             except Exception as exc:
                 checks.append({"check": "stale_pending", "ok": False, "detail": str(exc)})
 
@@ -197,12 +210,14 @@ def doctor(db: str, modules: tuple[str, ...], output_json: bool) -> None:
                 job_count = await q.jobs.count()
                 attempt_count = await q.attempts.count()
                 db_size = os.path.getsize(db) if os.path.exists(db) else 0
-                checks.append({
-                    "check": "database_size",
-                    "ok": True,
-                    "detail": f"{job_count} jobs, {attempt_count} attempts, "
-                              f"{db_size / 1024:.1f} KB",
-                })
+                checks.append(
+                    {
+                        "check": "database_size",
+                        "ok": True,
+                        "detail": f"{job_count} jobs, {attempt_count} attempts, "
+                        f"{db_size / 1024:.1f} KB",
+                    }
+                )
             except Exception as exc:
                 checks.append({"check": "database_size", "ok": False, "detail": str(exc)})
 

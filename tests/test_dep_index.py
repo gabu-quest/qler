@@ -22,9 +22,7 @@ class TestDepTable:
 
     async def test_dep_index_created(self, queue: Queue):
         """The UNIQUE index over (parent_ulid, child_ulid) exists after init_db()."""
-        indexes = {
-            i["name"]: i for i in await queue.db.list_indexes("qler_job_dependencies")
-        }
+        indexes = {i["name"]: i for i in await queue.db.list_indexes("qler_job_dependencies")}
         assert "idx_qler_job_dependencies_edge" in indexes
         assert indexes["idx_qler_job_dependencies_edge"]["unique"] is True
 
@@ -35,9 +33,7 @@ class TestReverseMapPopulation:
     async def test_reverse_map_populated_on_enqueue(self, queue: Queue):
         """enqueue() with depends_on creates (parent, child) rows."""
         parent = await queue.enqueue("my.task", queue_name="q")
-        child = await queue.enqueue(
-            "my.task", queue_name="q", depends_on=[parent.ulid]
-        )
+        child = await queue.enqueue("my.task", queue_name="q", depends_on=[parent.ulid])
 
         edges = await JobDependency.using(queue.db).all()
 
@@ -49,13 +45,13 @@ class TestReverseMapPopulation:
         """A child depending on two parents creates two rows."""
         p1 = await queue.enqueue("my.task", queue_name="q")
         p2 = await queue.enqueue("my.task", queue_name="q")
-        child = await queue.enqueue(
-            "my.task", queue_name="q", depends_on=[p1.ulid, p2.ulid]
-        )
+        child = await queue.enqueue("my.task", queue_name="q", depends_on=[p1.ulid, p2.ulid])
 
-        parent_ulids = await JobDependency.using(queue.db).filter(
-            F("child_ulid") == child.ulid
-        ).distinct_values("parent_ulid")
+        parent_ulids = (
+            await JobDependency.using(queue.db)
+            .filter(F("child_ulid") == child.ulid)
+            .distinct_values("parent_ulid")
+        )
 
         assert len(parent_ulids) == 2
         assert set(parent_ulids) == {p1.ulid, p2.ulid}
@@ -63,14 +59,18 @@ class TestReverseMapPopulation:
     async def test_reverse_map_populated_on_enqueue_many(self, queue: Queue):
         """enqueue_many() with deps creates reverse map rows."""
         parent = await queue.enqueue("my.task", queue_name="q")
-        jobs = await queue.enqueue_many([
-            {"task_path": "my.task", "queue_name": "q", "depends_on": [parent.ulid]},
-            {"task_path": "my.task", "queue_name": "q", "depends_on": [parent.ulid]},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "my.task", "queue_name": "q", "depends_on": [parent.ulid]},
+                {"task_path": "my.task", "queue_name": "q", "depends_on": [parent.ulid]},
+            ]
+        )
 
-        child_ulids = await JobDependency.using(queue.db).filter(
-            F("parent_ulid") == parent.ulid
-        ).distinct_values("child_ulid")
+        child_ulids = (
+            await JobDependency.using(queue.db)
+            .filter(F("parent_ulid") == parent.ulid)
+            .distinct_values("child_ulid")
+        )
 
         assert len(child_ulids) == 2
         assert set(child_ulids) == {jobs[0].ulid, jobs[1].ulid}
@@ -88,9 +88,7 @@ class TestArchivalCleansUpReverseMap:
     async def test_archive_cleans_up_reverse_map(self, queue: Queue):
         """archive_jobs() removes dep entries for archived jobs."""
         parent = await queue.enqueue("my.task", queue_name="q")
-        child = await queue.enqueue(
-            "my.task", queue_name="q", depends_on=[parent.ulid]
-        )
+        child = await queue.enqueue("my.task", queue_name="q", depends_on=[parent.ulid])
 
         # Complete the parent so it becomes archivable
         from sqler import F
@@ -100,10 +98,14 @@ class TestArchivalCleansUpReverseMap:
         from qler.models.job import Job
 
         now = now_epoch()
-        await Job.query().filter(F("ulid") == parent.ulid).update_one(
-            status=JobStatus.COMPLETED.value,
-            finished_at=now - 600,  # older than default 300s threshold
-            updated_at=now,
+        await (
+            Job.query()
+            .filter(F("ulid") == parent.ulid)
+            .update_one(
+                status=JobStatus.COMPLETED.value,
+                finished_at=now - 600,  # older than default 300s threshold
+                updated_at=now,
+            )
         )
 
         # Confirm dep row exists before archival

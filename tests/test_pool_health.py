@@ -180,15 +180,13 @@ class TestWorkerPoolHealth:
         assert set(_pool_log) == {f"e2e_{i}" for i in range(5)}
 
         # All jobs completed
-        completed = await Job.query().filter(
-            F("status") == JobStatus.COMPLETED.value
-        ).count()
+        completed = await Job.query().filter(F("status") == JobStatus.COMPLETED.value).count()
         assert completed == 5
 
         # All attempts finalized
-        running_attempts = await JobAttempt.query().filter(
-            F("status") == AttemptStatus.RUNNING.value
-        ).count()
+        running_attempts = (
+            await JobAttempt.query().filter(F("status") == AttemptStatus.RUNNING.value).count()
+        )
         assert running_attempts == 0
 
         await assert_pool_healthy(disk_db)
@@ -300,9 +298,7 @@ _READS = [
 
 class TestQueueReadsReleaseConnection:
     @pytest.mark.parametrize("read", _READS)
-    async def test_live_tasks_after_read_do_not_hold_connections(
-        self, disk_db, disk_queue, read
-    ):
+    async def test_live_tasks_after_read_do_not_hold_connections(self, disk_db, disk_queue, read):
         hold = asyncio.Event()
         have_read = [asyncio.Event() for _ in range(4)]
 
@@ -314,9 +310,7 @@ class TestQueueReadsReleaseConnection:
         tasks = [asyncio.create_task(reader(e)) for e in have_read]
         try:
             # Each reader says when its read has returned; no polling.
-            await asyncio.wait_for(
-                asyncio.gather(*(e.wait() for e in have_read)), 30
-            )
+            await asyncio.wait_for(asyncio.gather(*(e.wait() for e in have_read)), 30)
 
             job = await asyncio.wait_for(disk_queue.enqueue("m.f"), 2)
             assert job.status == JobStatus.PENDING.value
@@ -326,9 +320,7 @@ class TestQueueReadsReleaseConnection:
             await asyncio.gather(*tasks)
         await assert_pool_healthy(disk_db)
 
-    async def test_archived_jobs_does_not_redirect_other_tasks(
-        self, disk_db, disk_queue
-    ):
+    async def test_archived_jobs_does_not_redirect_other_tasks(self, disk_db, disk_queue):
         for i in range(3):
             await disk_queue.enqueue("m.f", args=(i,))
         claimed = await disk_queue.claim_job("w-test", ["default"])
