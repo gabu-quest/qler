@@ -110,7 +110,7 @@ src/qler/
 ├── cron.py              # @cron decorator, CronSchedule, CronWrapper
 ├── worker.py            # Worker loop, lease renewal, recovery, cron scheduler
 ├── rate_limit.py        # RateSpec, token bucket rate limiting
-├── cli.py               # Click CLI (init, worker, status, jobs, cron, etc.)
+├── cli/                 # Click CLI package, one module per command group (init, worker, status, jobs, cron, dlq, etc.)
 ├── models/
 │   ├── job.py           # Job model (sqler AsyncSQLerSafeModel)
 │   ├── attempt.py       # JobAttempt model
