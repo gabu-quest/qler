@@ -1,15 +1,19 @@
 """Tests for M10 — Job Dependencies/Chaining."""
 
 import asyncio
+import json
 import logging
+import shutil
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from qler._time import now_epoch
 from qler.enums import JobStatus
 from qler.exceptions import DependencyError, JobCancelledError, JobFailedError
+from qler.models.dependency import JobDependency
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
@@ -1304,3 +1308,216 @@ class TestFinishIsOneWrite:
 
         assert (await _job(parent.ulid)).status == JobStatus.COMPLETED.value
         assert [(await _job(c.ulid)).pending_dep_count for c in children] == [1, 1, 1]
+
+
+# ---------------------------------------------------------------------------
+# The edges are a sqler model; a database file of qler 0.5.1 is upgraded
+# ---------------------------------------------------------------------------
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _old_file(tmp_path: Path) -> tuple[str, dict[str, str]]:
+    """A copy of the queue database written by released qler 0.5.1 (see
+    ``fixtures/make_qler_0_5_1_db.py``), and the ulid of each of its jobs by role."""
+    path = tmp_path / "qler_0_5_1.db"
+    shutil.copy(FIXTURES / "qler_0_5_1.db", path)
+    roles = json.loads((FIXTURES / "qler_0_5_1.json").read_text())
+    return str(path), roles
+
+
+async def _edges(q: Queue) -> list[tuple[str, str]]:
+    return sorted(
+        (e.parent_ulid, e.child_ulid) for e in await JobDependency.using(q.db).all()
+    )
+
+
+async def _schema_names(q: Queue) -> set[tuple[str, str]]:
+    rows = await q.db.execute_sql(
+        "SELECT type, name FROM sqlite_master WHERE name LIKE 'qler_job_dep%' "
+        "OR name LIKE 'idx_qler_job_dep%'"
+    )
+    return {(r["type"], r["name"]) for r in rows}
+
+
+# What a database holds for the edges once this code has opened it
+EDGE_SCHEMA = {
+    ("table", "qler_job_dependencies"),
+    ("index", "idx_qler_job_dependencies_edge"),
+    ("view", "qler_job_deps"),
+}
+
+# The statements qler 0.5.1 sends for the edges (src/qler/queue.py at the tag v0.5.1)
+OLD_CREATE_TABLE = (
+    "CREATE TABLE IF NOT EXISTS qler_job_deps ("
+    "parent_ulid TEXT NOT NULL, "
+    "child_ulid TEXT NOT NULL, "
+    "PRIMARY KEY (parent_ulid, child_ulid))"
+)
+OLD_CREATE_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_qler_job_deps_parent ON qler_job_deps (parent_ulid)"
+)
+OLD_CHILDREN = "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?"
+OLD_ADD_EDGE = "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)"
+
+
+class TestDependencyEdgesModel:
+
+    async def test_file_of_qler_0_5_1_opens_and_keeps_its_edges(self, tmp_path):
+        path, roles = _old_file(tmp_path)
+        q = Queue(path)
+        await q.init_db()
+        try:
+            assert await _schema_names(q) == EDGE_SCHEMA
+            assert await _edges(q) == sorted(
+                [(roles["parent"], roles["child_a"]), (roles["parent"], roles["child_b"])]
+            )
+
+            parent = await q.claim_job("w", ["deps"])
+            assert parent is not None
+            assert parent.ulid == roles["parent"]
+            assert await q.claim_job("w", ["deps"]) is None
+            await q.complete_job(parent, "w", result=1)
+            children = [await q.claim_job("w", ["deps"]) for _ in range(2)]
+            assert sorted(c.ulid for c in children) == sorted(
+                [roles["child_a"], roles["child_b"]]
+            )
+
+            again = await q.enqueue("fixture.task", queue_name="keys", idempotency_key="fixture-idem")
+            assert again.ulid == roles["idem"]
+            again = await q.enqueue("fixture.task", queue_name="keys", unique_key="fixture-uniq")
+            assert again.ulid == roles["uniq"]
+            assert [j.ulid for j in await q.archived_jobs()] == [roles["archived"]]
+
+            for child in children:
+                await q.complete_job(child, "w", result=2)
+            # A threshold one second ahead takes the children finished in this second too.
+            moved = await q.archive_jobs(older_than_seconds=-1)
+            finished = ["done", "dead", "limited_done", "parent", "child_a", "child_b"]
+            assert moved == len(finished)
+            assert await JobDependency.using(q.db).count() == 0
+            archived = [j.ulid for j in await q.archived_jobs()]
+            assert len(archived) == 7
+            assert set(archived) == {roles[r] for r in finished + ["archived"]}
+            assert {j.ulid for j in await q.jobs.all()} == {roles["idem"], roles["uniq"]}
+        finally:
+            await q.close()
+
+    async def test_two_queues_upgrade_one_old_file_at_once(self, tmp_path):
+        path, roles = _old_file(tmp_path)
+        q1, q2 = Queue(path), Queue(path)
+        try:
+            await asyncio.gather(q1.init_db(), q2.init_db())
+            assert await _edges(q1) == sorted(
+                [(roles["parent"], roles["child_a"]), (roles["parent"], roles["child_b"])]
+            )
+            assert await _schema_names(q2) == EDGE_SCHEMA
+        finally:
+            await q1.close()
+            await q2.close()
+
+    async def test_qler_0_5_1_beside_this_code_reads_the_edges_and_cannot_write_them(
+        self, tmp_path
+    ):
+        path, roles = _old_file(tmp_path)
+        q = Queue(path)
+        await q.init_db()
+        await q.close()
+
+        old = sqlite3.connect(path)
+        try:
+            children = [row[0] for row in old.execute(OLD_CHILDREN, [roles["parent"]])]
+            assert sorted(children) == sorted([roles["child_a"], roles["child_b"]])
+            with pytest.raises(sqlite3.OperationalError, match="cannot modify qler_job_deps"):
+                old.execute(OLD_ADD_EDGE, [roles["parent"], roles["idem"]])
+        finally:
+            old.close()
+
+    async def test_qler_0_5_1_cannot_start_on_a_file_this_code_made(self, tmp_path):
+        path = str(tmp_path / "new.db")
+        q = Queue(path)
+        await q.init_db()
+        await q.close()
+
+        old = sqlite3.connect(path)
+        try:
+            old.execute(OLD_CREATE_TABLE)
+            with pytest.raises(sqlite3.OperationalError, match="views may not be indexed"):
+                old.execute(OLD_CREATE_INDEX)
+        finally:
+            old.close()
+
+    async def test_dependency_named_twice_is_one_edge_in_enqueue(self, queue):
+        parent = await queue.enqueue("t")
+        child = await queue.enqueue("t", depends_on=[parent.ulid, parent.ulid])
+        assert child.pending_dep_count == 1
+        assert await _edges(queue) == [(parent.ulid, child.ulid)]
+
+    async def test_dependency_named_twice_is_one_edge_in_enqueue_many(self, queue):
+        parent = await queue.enqueue("t")
+        first, child = await queue.enqueue_many([
+            {"task_path": "t"},
+            {"task_path": "t", "depends_on": [parent.ulid, 0, parent.ulid, 0]},
+        ])
+        assert child.pending_dep_count == 2
+        assert await _edges(queue) == sorted(
+            [(parent.ulid, child.ulid), (first.ulid, child.ulid)]
+        )
+
+    async def test_upgrade_waits_for_the_other_process_upgrading(self, tmp_path, monkeypatch):
+        """One queue is held inside its upgrade, after its look for the old table and before
+        it writes the edges; the second queue starts its upgrade then. The second one waits for
+        the first to finish (or, without the transaction, reads the old table and writes the
+        edges a second time). Either way it is released once it has started."""
+        path, roles = _old_file(tmp_path)
+        upgrade = Queue._upgrade_job_deps_from_0_5_1
+
+        async def no_upgrade(self):
+            return None
+
+        monkeypatch.setattr(Queue, "_upgrade_job_deps_from_0_5_1", no_upgrade)
+        q1, q2 = Queue(path), Queue(path)
+        await q1.init_db()
+        await q2.init_db()
+        monkeypatch.setattr(Queue, "_upgrade_job_deps_from_0_5_1", upgrade)
+        try:
+            held, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            save_many = JobDependency.save_many
+
+            async def held_save_many(instances, *, db=None):
+                if db is q1.db:
+                    held.set()
+                    await release.wait()
+                return await save_many(instances, db=db)
+
+            transaction = q2.db.transaction
+            execute_sql = q2.db.execute_sql
+
+            def marked_transaction():
+                second_started.set()
+                return transaction()
+
+            async def marked_execute_sql(query, params=None):
+                rows = await execute_sql(query, params)
+                if "FROM qler_job_deps AS old" in query:
+                    second_started.set()
+                return rows
+
+            monkeypatch.setattr(JobDependency, "save_many", held_save_many)
+            monkeypatch.setattr(q2.db, "transaction", marked_transaction)
+            monkeypatch.setattr(q2.db, "execute_sql", marked_execute_sql)
+
+            first = asyncio.create_task(q1._upgrade_job_deps_from_0_5_1())
+            await held.wait()
+            second = asyncio.create_task(q2._upgrade_job_deps_from_0_5_1())
+            await second_started.wait()
+            release.set()
+            await asyncio.gather(first, second)
+
+            assert await _edges(q1) == sorted(
+                [(roles["parent"], roles["child_a"]), (roles["parent"], roles["child_b"])]
+            )
+            assert await _schema_names(q1) == EDGE_SCHEMA
+        finally:
+            await q1.close()
+            await q2.close()

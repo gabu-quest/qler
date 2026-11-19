@@ -18,6 +18,7 @@ from qler.exceptions import (
 )
 from qler.models.attempt import JobAttempt
 from qler.models.bucket import RateLimitBucket
+from qler.models.dependency import JobDependency
 from qler.models.job import Job
 from qler.queue import Queue, _calculate_retry_eta
 from sqler import F
@@ -194,18 +195,9 @@ async def _idem_rows(key: str) -> int:
     return await Job.query().filter(F("idempotency_key") == key).count()
 
 
-def _raise_once_on_dep_edges(adapter):
-    """Wrap ``adapter.execute`` so the first insert into qler_job_deps raises."""
-    real = adapter.execute
-    state = {"raised": False}
-
-    async def execute(sql, *args, **kwargs):
-        if "qler_job_deps" in sql and sql.lstrip().startswith("INSERT") and not state["raised"]:
-            state["raised"] = True
-            raise RuntimeError("edge insert failed")
-        return await real(sql, *args, **kwargs)
-
-    return execute
+async def _failing_edge_save(*args, **kwargs):
+    """Stands in for ``JobDependency.save_many``: the write of the edges fails."""
+    raise RuntimeError("edge insert failed")
 
 
 class TestEnqueueOneJobPerIdempotencyKey:
@@ -264,16 +256,14 @@ class TestEnqueueOneJobPerIdempotencyKey:
 
     async def test_failed_edge_insert_leaves_no_job(self, disk_queue):
         parent = await disk_queue.enqueue("parent")
-        adapter = disk_queue.db.adapter
-        with patch.object(adapter, "execute", _raise_once_on_dep_edges(adapter)):
+        with patch.object(JobDependency, "save_many", _failing_edge_save):
             with pytest.raises(RuntimeError, match="edge insert failed"):
                 await disk_queue.enqueue("child", depends_on=[parent.ulid])
         assert await Job.query().count() == 1
 
     async def test_failed_edge_insert_in_enqueue_many_leaves_no_job(self, disk_queue):
         parent = await disk_queue.enqueue("parent")
-        adapter = disk_queue.db.adapter
-        with patch.object(adapter, "execute", _raise_once_on_dep_edges(adapter)):
+        with patch.object(JobDependency, "save_many", _failing_edge_save):
             with pytest.raises(RuntimeError, match="edge insert failed"):
                 await disk_queue.enqueue_many(
                     [{"task_path": "child", "depends_on": [parent.ulid]}]
@@ -1051,12 +1041,8 @@ class TestBatchEnqueuePerformance:
         assert elapsed < 10, f"enqueue_many(1K deps) took {elapsed:.1f}s, expected <10s"
 
         # Verify dep edges in the DB
-        cur = await queue._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_job_deps", []
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row[0] == 999  # 999 edges (each job depends on previous)
+        # 999 edges (each job depends on previous)
+        assert await JobDependency.using(queue.db).count() == 999
 
         # First job has no deps
         assert jobs[0].pending_dep_count == 0
@@ -1110,13 +1096,9 @@ class TestBatchEnqueuePerformance:
         assert len(jobs) == 500
 
         # All dep edges should exist
-        cur = await queue._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_job_deps WHERE parent_ulid = ?",
-            [parent.ulid],
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row[0] == 500
+        assert await JobDependency.using(queue.db).filter(
+            F("parent_ulid") == parent.ulid
+        ).count() == 500
 
         # Each child has exactly 1 pending dep (the parent)
         assert all(j.pending_dep_count == 1 for j in jobs)
