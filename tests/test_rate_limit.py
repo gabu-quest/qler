@@ -248,6 +248,43 @@ class TestTryAcquireConcurrent:
             await db_other.close()
 
 
+class TestChangedRate:
+
+    async def test_raised_limit_applies_one_window_later(self, queue, db, monkeypatch):
+        """A bucket emptied at 2/m, called at 5/m a window later, gives exactly 5 tokens."""
+        import qler.rate_limit as rate_limit_module
+
+        clock = [FROZEN_NOW]
+        monkeypatch.setattr(rate_limit_module, "now_epoch", lambda: clock[0])
+        old = parse_rate("2/m")
+        new = parse_rate("5/m")
+
+        assert [await try_acquire("test:raise", old, db=db) for _ in range(3)] == [
+            True,
+            True,
+            False,
+        ]
+        clock[0] += 60
+        results = [await try_acquire("test:raise", new, db=db) for _ in range(6)]
+
+        assert results == [True] * 5 + [False]
+        rows = await _bucket_rows(db, "test:raise")
+        assert [(r.max_tokens, r.refill_rate) for r in rows] == [(5, new.refill_rate)]
+
+    async def test_lowered_limit_applies_at_once(self, queue, db, frozen_clock):
+        """A bucket holding 4 tokens at 5/m, called at 2/m, is capped at 2 right away."""
+        old = parse_rate("5/m")
+        new = parse_rate("2/m")
+
+        assert await try_acquire("test:lower", old, db=db) is True
+        assert (await _bucket_rows(db, "test:lower"))[0].tokens == 4.0
+        results = [await try_acquire("test:lower", new, db=db) for _ in range(3)]
+
+        assert results == [True, True, False]
+        rows = await _bucket_rows(db, "test:lower")
+        assert [(r.max_tokens, r.refill_rate) for r in rows] == [(2, new.refill_rate)]
+
+
 # ------------------------------------------------------------------
 # @task rate_limit integration
 # ------------------------------------------------------------------
