@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import sqlite3
 import time
 from unittest.mock import patch
 
@@ -415,6 +416,83 @@ class TestClaim:
         job = await queue.claim_job("worker-1", ["default"])
         assert job is not None
         assert _ULID_PATTERN.match(job.last_attempt_id), f"Expected ULID, got {job.last_attempt_id!r}"
+
+
+class TestClaimIsOneWrite:
+    """A claim is one transaction, and leases the job for the job's own lease."""
+
+    async def test_attempt_save_failure_rolls_the_claim_back(self, queue, monkeypatch):
+        job = await queue.enqueue("my_task")
+        original_save = JobAttempt.save
+        calls = 0
+
+        async def save_locked_once(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return await original_save(self, *args, **kwargs)
+
+        monkeypatch.setattr(JobAttempt, "save", save_locked_once)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await queue.claim_job("worker-1", ["default"])
+
+        await job.refresh()
+        assert job.status == JobStatus.PENDING.value
+        assert job.attempts == 0
+        assert job.worker_id == ""
+        assert job.lease_expires_at is None
+        assert job.last_attempt_id is None
+        assert await JobAttempt.query().count() == 0
+
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed is not None
+        assert claimed.ulid == job.ulid
+        assert claimed.status == JobStatus.RUNNING.value
+        assert claimed.attempts == 1
+        assert await JobAttempt.query().count() == 1
+
+    @pytest.mark.parametrize("lease_duration", [600, 30])
+    async def test_claim_leases_for_the_jobs_own_lease(self, db, lease_duration):
+        q = Queue(db, default_lease_duration=300)
+        await q.init_db()
+        fixed_now = now_epoch()
+        with patch("qler.queue.now_epoch", return_value=fixed_now):
+            job = await q.enqueue("my_task", lease_duration=lease_duration)
+            claimed = await q.claim_job("worker-1", ["default"])
+
+        assert claimed is not None
+        assert claimed.ulid == job.ulid
+        assert claimed.lease_expires_at - fixed_now == lease_duration
+        stored = await Job.query().filter(F("ulid") == job.ulid).first()
+        assert stored.lease_expires_at - fixed_now == lease_duration
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        assert len(attempts) == 1
+        assert attempts[0].lease_expires_at - fixed_now == lease_duration
+
+    async def test_two_queues_on_one_file_never_claim_the_same_job(self, tmp_path):
+        path = str(tmp_path / "shared.db")
+        q1 = Queue(path)
+        q2 = Queue(path)
+        await q1.init_db()
+        await q2.init_db()
+        try:
+            enqueued = {(await q1.enqueue("my_task")).ulid for _ in range(20)}
+
+            async def drain(q: Queue, worker_id: str) -> list[str]:
+                got: list[str] = []
+                while (job := await q.claim_job(worker_id, ["default"])) is not None:
+                    got.append(job.ulid)
+                return got
+
+            first, second = await asyncio.gather(drain(q1, "w1"), drain(q2, "w2"))
+            assert set(first) & set(second) == set()
+            assert len(first) + len(second) == 20
+            assert set(first) | set(second) == enqueued
+        finally:
+            await q1.close()
+            await q2.close()
 
 
 class TestComplete:

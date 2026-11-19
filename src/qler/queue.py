@@ -940,49 +940,53 @@ class Queue:
         now_ts = now_epoch()
         attempt_id = generate_ulid()
 
-        # Atomic claim via update_one
-        job = await Job.query().filter(
-            (F("status") == JobStatus.PENDING.value)
-            & F("queue_name").in_list(queues)
-            & (F("eta") <= now_ts)
-            & (F("pending_dep_count") == 0)
-        ).order_by("-priority", "eta", "ulid").update_one(
-            status=JobStatus.RUNNING.value,
-            worker_id=worker_id,
-            attempts=F("attempts") + 1,
-            lease_expires_at=now_ts + self.default_lease_duration,
-            last_attempt_id=attempt_id,
-            updated_at=now_ts,
-        )
+        # One write: the claiming update, the poison-pill or rate-limit write and the
+        # attempt record commit together or not at all, so a claim that fails half-way
+        # leaves the job pending, never running with nobody running it.
+        async with self._db.transaction():
+            # The lease is the job's own lease_duration, read from its row by the update.
+            job = await Job.using(self._db, "qler_jobs").filter(
+                (F("status") == JobStatus.PENDING.value)
+                & F("queue_name").in_list(queues)
+                & (F("eta") <= now_ts)
+                & (F("pending_dep_count") == 0)
+            ).order_by("-priority", "eta", "ulid").update_one(
+                status=JobStatus.RUNNING.value,
+                worker_id=worker_id,
+                attempts=F("attempts") + 1,
+                lease_expires_at=F("lease_duration") + now_ts,
+                last_attempt_id=attempt_id,
+                updated_at=now_ts,
+            )
 
-        if job is None:
-            return None
-
-        # Poison pill check: validate payload is parseable
-        try:
-            json.loads(job.payload_json)
-        except (json.JSONDecodeError, TypeError):
-            # Mark as permanently failed — bad payload
-            await self._poison_pill(job, worker_id, attempt_id, now_ts)
-            return None
-
-        # Rate limit checks (queue-level, then task-level)
-        if not self.immediate:
-            rate_limited = await self._check_rate_limits(job, worker_id, now_ts)
-            if rate_limited:
+            if job is None:
                 return None
 
-        # Create the running attempt record
-        attempt = JobAttempt(
-            ulid=attempt_id,
-            job_ulid=job.ulid,
-            status=AttemptStatus.RUNNING.value,
-            attempt_number=job.attempts,
-            worker_id=worker_id,
-            started_at=now_ts,
-            lease_expires_at=now_ts + self.default_lease_duration,
-        )
-        await attempt.save()
+            # Poison pill check: validate payload is parseable
+            try:
+                json.loads(job.payload_json)
+            except (json.JSONDecodeError, TypeError):
+                # Mark as permanently failed — bad payload
+                await self._poison_pill(job, worker_id, attempt_id, now_ts)
+                return None
+
+            # Rate limit checks (queue-level, then task-level)
+            if not self.immediate:
+                rate_limited = await self._check_rate_limits(job, worker_id, now_ts)
+                if rate_limited:
+                    return None
+
+            # Create the running attempt record
+            attempt = JobAttempt(
+                ulid=attempt_id,
+                job_ulid=job.ulid,
+                status=AttemptStatus.RUNNING.value,
+                attempt_number=job.attempts,
+                worker_id=worker_id,
+                started_at=now_ts,
+                lease_expires_at=job.lease_expires_at,
+            )
+            await attempt.save(db=self._db)
 
         _lifecycle(
             "job.claimed", job_id=job.ulid, queue=job.queue_name,
@@ -1023,67 +1027,73 @@ class Queue:
             raise ConfigurationError("n must be >= 1")
 
         now_ts = now_epoch()
+        jobs_table = Job.using(self._db, "qler_jobs")
 
-        # Atomic batch claim
-        jobs = await Job.query().filter(
-            (F("status") == JobStatus.PENDING.value)
-            & F("queue_name").in_list(queues)
-            & (F("eta") <= now_ts)
-            & (F("pending_dep_count") == 0)
-        ).order_by("-priority", "eta", "ulid").update_n(
-            n,
-            status=JobStatus.RUNNING.value,
-            worker_id=worker_id,
-            attempts=F("attempts") + 1,
-            lease_expires_at=now_ts + self.default_lease_duration,
-            updated_at=now_ts,
-        )
-
-        if not jobs:
-            return []
-
+        # One write: the batch update, each job's attempt id, the poison-pill and
+        # rate-limit writes and every attempt record commit together or not at all, so a
+        # failure at any job leaves every job of the batch pending as before the claim.
         claimed: list[Job] = []
-        for job in jobs:
-            attempt_id = generate_ulid()
-
-            # Set last_attempt_id per-job (unique per job, can't batch)
-            await Job.query().filter(
-                (F("ulid") == job.ulid)
-                & (F("status") == JobStatus.RUNNING.value)
-            ).update_one(
-                last_attempt_id=attempt_id,
+        async with self._db.transaction():
+            # The lease is each job's own lease_duration, read from its row by the update.
+            jobs = await jobs_table.filter(
+                (F("status") == JobStatus.PENDING.value)
+                & F("queue_name").in_list(queues)
+                & (F("eta") <= now_ts)
+                & (F("pending_dep_count") == 0)
+            ).order_by("-priority", "eta", "ulid").update_n(
+                n,
+                status=JobStatus.RUNNING.value,
+                worker_id=worker_id,
+                attempts=F("attempts") + 1,
+                lease_expires_at=F("lease_duration") + now_ts,
                 updated_at=now_ts,
             )
-            # Keep in-memory object in sync for _terminalize_attempt
-            job.last_attempt_id = attempt_id
 
-            # Poison pill check
-            try:
-                json.loads(job.payload_json)
-            except (json.JSONDecodeError, TypeError):
-                await self._poison_pill(job, worker_id, attempt_id, now_ts)
-                continue
+            for job in jobs:
+                attempt_id = generate_ulid()
 
-            # Rate limit check
-            if not self.immediate:
-                rate_limited = await self._check_rate_limits(
-                    job, worker_id, now_ts,
+                # Set last_attempt_id per-job (unique per job, can't batch)
+                await jobs_table.filter(
+                    (F("ulid") == job.ulid)
+                    & (F("status") == JobStatus.RUNNING.value)
+                ).update_one(
+                    last_attempt_id=attempt_id,
+                    updated_at=now_ts,
                 )
-                if rate_limited:
+                # Keep in-memory object in sync for _terminalize_attempt
+                job.last_attempt_id = attempt_id
+
+                # Poison pill check
+                try:
+                    json.loads(job.payload_json)
+                except (json.JSONDecodeError, TypeError):
+                    await self._poison_pill(job, worker_id, attempt_id, now_ts)
                     continue
 
-            # Create attempt record
-            attempt = JobAttempt(
-                ulid=attempt_id,
-                job_ulid=job.ulid,
-                status=AttemptStatus.RUNNING.value,
-                attempt_number=job.attempts,
-                worker_id=worker_id,
-                started_at=now_ts,
-                lease_expires_at=now_ts + self.default_lease_duration,
-            )
-            await attempt.save()
+                # Rate limit check
+                if not self.immediate:
+                    rate_limited = await self._check_rate_limits(
+                        job, worker_id, now_ts,
+                    )
+                    if rate_limited:
+                        continue
 
+                # Create attempt record
+                attempt = JobAttempt(
+                    ulid=attempt_id,
+                    job_ulid=job.ulid,
+                    status=AttemptStatus.RUNNING.value,
+                    attempt_number=job.attempts,
+                    worker_id=worker_id,
+                    started_at=now_ts,
+                    lease_expires_at=job.lease_expires_at,
+                )
+                await attempt.save(db=self._db)
+
+                claimed.append(job)
+
+        # Events and metrics only for the jobs the committed claim returns.
+        for job in claimed:
             _lifecycle(
                 "job.claimed", job_id=job.ulid, queue=job.queue_name,
                 task=job.task, correlation_id=job.correlation_id,
@@ -1093,15 +1103,13 @@ class Queue:
             if self._metrics:
                 self._metrics.inc_claimed(job.queue_name, job.task)
 
-            claimed.append(job)
-
         return claimed
 
     async def _poison_pill(
         self, job: Job, worker_id: str, attempt_id: str, now_ts: int
     ) -> None:
-        """Handle a job with an unparseable payload."""
-        await Job.query().filter(
+        """Handle a job with an unparseable payload (inside the claim's transaction)."""
+        await Job.using(self._db, "qler_jobs").filter(
             (F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value)
         ).update_one(
             status=JobStatus.FAILED.value,
@@ -1124,7 +1132,7 @@ class Queue:
             failure_kind=FailureKind.PAYLOAD_INVALID.value,
             error="Payload is not valid JSON",
         )
-        await attempt.save()
+        await attempt.save(db=self._db)
 
     # ------------------------------------------------------------------
     # Complete
@@ -1478,7 +1486,7 @@ class Queue:
     ) -> None:
         """Requeue a rate-limited job back to PENDING with a delayed ETA."""
         delay = max(1, int(1.0 / rate.refill_rate)) if rate.refill_rate > 0 else 1
-        await Job.query().filter(
+        await Job.using(self._db, "qler_jobs").filter(
             (F("ulid") == job.ulid)
             & (F("status") == JobStatus.RUNNING.value)
             & (F("worker_id") == worker_id)
