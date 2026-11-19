@@ -6,16 +6,18 @@ connection pool — the exact path that was invisible with :memory: DBs
 """
 
 import asyncio
+import contextlib
 import re
 
 import pytest
 from conftest import assert_pool_healthy
+from sqler import F
+
 from qler.enums import AttemptStatus, JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.task import task
 from qler.worker import Worker
-from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -77,10 +79,8 @@ async def _run_worker_until_idle(worker, expected_count, timeout=10.0):
         worker._running = False
         await asyncio.sleep(0.05)
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +156,8 @@ class TestWorkerPoolHealth:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # Child should be cascade-cancelled
         await child.refresh()

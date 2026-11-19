@@ -6,7 +6,7 @@ import gc
 import json
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 from .base import BenchmarkResult, Scenario
@@ -77,7 +77,7 @@ class BenchmarkRunner:
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         suffix = f"_{tag}" if tag else ""
         filename = f"bench_{self.config.scale.name}{suffix}_{ts}.json"
         path = output_dir / filename

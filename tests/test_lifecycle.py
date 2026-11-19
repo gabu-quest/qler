@@ -5,12 +5,13 @@ import re
 import sqlite3
 
 import pytest
+from sqler import F
+
 from qler._time import now_epoch
 from qler.exceptions import JobCancelledError, JobFailedError
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.task import task
-from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -190,9 +191,10 @@ class TestWait:
             await asyncio.sleep(0.05)
             await queue.complete_job(claimed, "worker-1", result="ok")
 
-        asyncio.create_task(complete_later())
+        later_task = asyncio.create_task(complete_later())
         result = await job.wait(timeout=2.0, poll_interval=0.02)
         assert result.status == "completed"
+        await later_task
 
     async def test_wait_failed_raises(self, queue):
         job = await queue.enqueue("my_task", max_retries=0)
@@ -202,9 +204,10 @@ class TestWait:
             await asyncio.sleep(0.05)
             await queue.fail_job(claimed, "worker-1", ValueError("boom"))
 
-        asyncio.create_task(fail_later())
+        later_task = asyncio.create_task(fail_later())
         with pytest.raises(JobFailedError, match="failed"):
             await job.wait(timeout=2.0, poll_interval=0.02)
+        await later_task
 
     async def test_wait_cancelled_raises(self, queue):
         job = await queue.enqueue("my_task")
@@ -213,9 +216,10 @@ class TestWait:
             await asyncio.sleep(0.05)
             await job.cancel()
 
-        asyncio.create_task(cancel_later())
+        later_task = asyncio.create_task(cancel_later())
         with pytest.raises(JobCancelledError, match="cancelled"):
             await job.wait(timeout=2.0, poll_interval=0.02)
+        await later_task
 
     async def test_wait_timeout(self, queue):
         job = await queue.enqueue("my_task")

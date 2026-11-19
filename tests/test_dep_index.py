@@ -1,9 +1,10 @@
 """Tests for the reverse dependency index (qler_job_dependencies table)."""
 
 import pytest
+from sqler import F
+
 from qler.models.dependency import JobDependency
 from qler.queue import Queue
-from sqler import F
 
 pytestmark = pytest.mark.asyncio
 
@@ -92,10 +93,11 @@ class TestArchivalCleansUpReverseMap:
         )
 
         # Complete the parent so it becomes archivable
+        from sqler import F
+
         from qler._time import now_epoch
         from qler.enums import JobStatus
         from qler.models.job import Job
-        from sqler import F
 
         now = now_epoch()
         await Job.query().filter(F("ulid") == parent.ulid).update_one(

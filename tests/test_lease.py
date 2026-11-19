@@ -6,6 +6,8 @@ import re
 import sqlite3
 
 import pytest
+from sqler import F
+
 from qler._time import now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.models.attempt import JobAttempt
@@ -13,7 +15,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
