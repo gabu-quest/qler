@@ -34,6 +34,15 @@ except ImportError:
 
 logger = logging.getLogger("qler.worker")
 
+# After the shutdown cuts the jobs still in their task function, how long it
+# waits for the cut tasks to end before it leaves them and returns. A task that
+# swallows the cancel and keeps going would otherwise hold the worker forever.
+SHUTDOWN_CUT_GRACE = 5.0
+
+# Shortest sleep of the lease-renewal loop, so a renewal that keeps failing is
+# retried a few times a second rather than in a busy loop.
+_RENEWAL_MIN_SLEEP = 0.25
+
 
 class Worker:
     """Async worker that claims and executes jobs from one or more queues.
@@ -110,6 +119,9 @@ class Worker:
         self._active_jobs: dict[str, Any] = {}  # ulid -> Job
         self._active_tasks: set[asyncio.Task] = set()
         self._background_tasks: list[asyncio.Task] = []
+        # Kept apart from the other background tasks: _shutdown stops it only
+        # after the drain, so running jobs keep their leases while they finish.
+        self._renewal_task: Optional[asyncio.Task] = None
         # ulid -> task, for jobs whose task function is being awaited right now
         # (not resolving, not writing their outcome).
         self._in_task_body: dict[str, asyncio.Task] = {}
@@ -268,8 +280,9 @@ class Worker:
                 logger.info("Recovered %d expired leases on startup", recovered)
 
             # Start background tasks
+            self._renewal_task = asyncio.create_task(self._lease_renewal_loop())
             self._background_tasks = [
-                asyncio.create_task(self._lease_renewal_loop()),
+                self._renewal_task,
                 asyncio.create_task(self._lease_recovery_loop()),
             ]
             if self.queue._cron_tasks:
@@ -505,26 +518,50 @@ class Worker:
         row = await Job.query().filter(F("ulid") == job.ulid).first()
         return bool(row is not None and row.cancel_requested)
 
-    async def _lease_renewal_loop(self) -> None:
-        """Background task: periodically renew leases for active jobs."""
-        while self._running:
-            interval = max(self.queue.default_lease_duration / 3, 1.0)
-            await asyncio.sleep(interval)
+    @staticmethod
+    def _renewal_due(job: Any) -> float:
+        """Epoch second at which a job's lease is renewed: half its lease_duration before it ends."""
+        return job.lease_expires_at - job.lease_duration / 2
 
+    async def _lease_renewal_loop(self) -> None:
+        """Background task: renew each active job's lease before it can end.
+
+        Runs until _shutdown cancels it, which it does only after the drain.
+        Each pass renews the jobs that are due, then sleeps until the earliest
+        due moment among the active jobs, and never longer than
+        default_lease_duration / 3. That cap covers a job claimed while the loop
+        sleeps: a claim leases for default_lease_duration, so the loop sees the
+        job while two thirds of its claim lease remain and from then on wakes
+        by the job's own due moment.
+        """
+        while True:
             for ulid, job in list(self._active_jobs.items()):
-                if not self._running:
-                    break
-                now = now_epoch()
-                if (
-                    job.lease_expires_at is not None
-                    and job.lease_expires_at - now < job.lease_duration / 3
-                ):
+                if job.lease_expires_at is None:
+                    continue
+                if time.time() < self._renewal_due(job):
+                    continue
+                try:
                     renewed = await job.renew_lease()
-                    if not renewed:
-                        logger.warning(
-                            "Lost ownership of job %s during renewal", ulid
-                        )
-                        self._active_jobs.pop(ulid, None)
+                except Exception as exc:
+                    # Per job: the others are still renewed this pass, and this
+                    # one is tried again on the next.
+                    logger.warning(
+                        "Lease renewal failed for job %s: %s: %s; "
+                        "trying again on the next pass",
+                        ulid, type(exc).__name__, exc,
+                    )
+                    continue
+                if not renewed:
+                    logger.warning(
+                        "Lost ownership of job %s during renewal", ulid
+                    )
+                    self._active_jobs.pop(ulid, None)
+
+            wake = time.time() + self.queue.default_lease_duration / 3
+            for job in list(self._active_jobs.values()):
+                if job.lease_expires_at is not None:
+                    wake = min(wake, self._renewal_due(job))
+            await asyncio.sleep(max(wake - time.time(), _RENEWAL_MIN_SLEEP))
 
     async def _lease_recovery_loop(self) -> None:
         """Background task: periodically scan for expired leases."""
@@ -673,38 +710,27 @@ class Worker:
             await asyncio.sleep(self.poll_interval)
 
     async def _shutdown(self) -> None:
-        """Graceful shutdown: cancel background tasks, wait for active jobs."""
+        """Graceful shutdown: stop background tasks, drain active jobs, then stop renewal."""
         logger.info("Worker shutting down...")
 
-        # Cancel background tasks
-        for t in self._background_tasks:
+        # Cancel background tasks, all but lease renewal: the jobs still
+        # running keep their leases until the drain is over, so no other
+        # worker recovers and starts a job this worker is still running.
+        renewal = self._renewal_task
+        others = [t for t in self._background_tasks if t is not renewal]
+        for t in others:
             t.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        self._background_tasks.clear()
+        if others:
+            await asyncio.gather(*others, return_exceptions=True)
 
-        # Wait for active job tasks to finish
-        if self._active_tasks:
-            _done, pending = await asyncio.wait(
-                self._active_tasks, timeout=self.shutdown_timeout
-            )
-            # Cut only the jobs still inside their task function. A job that is
-            # writing its outcome is left to finish the write, so no row is
-            # left half recorded. No await between the wait and the cuts, so
-            # _in_task_body is the state at the moment the timeout passed.
-            for ulid, t in list(self._in_task_body.items()):
-                if t in pending:
-                    self._cut_by_shutdown.add(ulid)
-                    t.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-                logger.warning(
-                    "Shutdown timeout of %ss passed with %d job(s) unfinished: "
-                    "left %d running for lease recovery, failed %d as cancelled "
-                    "because their cancel was requested",
-                    self.shutdown_timeout, len(pending),
-                    len(self._left_for_recovery), len(self._failed_on_cut),
-                )
+        try:
+            await self._drain()
+        finally:
+            if renewal is not None:
+                renewal.cancel()
+                await asyncio.gather(renewal, return_exceptions=True)
+            self._renewal_task = None
+            self._background_tasks.clear()
 
         # Remove signal handlers
         loop = asyncio.get_running_loop()
@@ -715,3 +741,45 @@ class Worker:
                 pass
 
         logger.info("Worker shutdown complete")
+
+    async def _drain(self) -> None:
+        """Wait for active jobs; cut those still running after shutdown_timeout.
+
+        After the cut, wait at most SHUTDOWN_CUT_GRACE for the cut tasks to end.
+        A task still going then (it swallowed the cancel) is logged by job id
+        and left; its row stays RUNNING for lease recovery.
+        """
+        if not self._active_tasks:
+            return
+        _done, pending = await asyncio.wait(
+            self._active_tasks, timeout=self.shutdown_timeout
+        )
+        # Cut only the jobs still inside their task function. A job that is
+        # writing its outcome is left to finish the write, so no row is
+        # left half recorded. No await between the wait and the cuts, so
+        # _in_task_body is the state at the moment the timeout passed.
+        cut: dict[asyncio.Task, str] = {}
+        for ulid, t in list(self._in_task_body.items()):
+            if t in pending:
+                self._cut_by_shutdown.add(ulid)
+                cut[t] = ulid
+                t.cancel()
+        if not pending:
+            return
+        _ended, still_going = await asyncio.wait(
+            pending, timeout=SHUTDOWN_CUT_GRACE
+        )
+        not_stopped = sorted(cut.get(t, "<writing its outcome>") for t in still_going)
+        logger.warning(
+            "Shutdown timeout of %ss passed with %d job(s) unfinished: "
+            "left %d running for lease recovery, failed %d as cancelled "
+            "because their cancel was requested",
+            self.shutdown_timeout, len(pending),
+            len(self._left_for_recovery), len(self._failed_on_cut),
+        )
+        if not_stopped:
+            logger.warning(
+                "%d job(s) did not stop within the %ss grace after the cut and "
+                "were left running for lease recovery: %s",
+                len(not_stopped), SHUTDOWN_CUT_GRACE, ", ".join(not_stopped),
+            )

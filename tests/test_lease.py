@@ -1,11 +1,17 @@
-"""Tests for lease recovery and renewal mechanics — no Worker needed."""
+"""Tests for lease recovery and renewal mechanics, and the worker's renewal loop."""
 
+import asyncio
 import re
+import sqlite3
 
+import pytest
 from qler._time import now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.models.attempt import JobAttempt
 from qler.models.job import Job
+from qler.queue import Queue
+from qler.task import task
+from qler.worker import Worker
 from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
@@ -190,3 +196,146 @@ class TestRenewLease:
         # Try to renew a completed job
         result = await job.renew_lease()
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Worker._lease_renewal_loop: a running job keeps its lease
+# ---------------------------------------------------------------------------
+
+_renewal_release: asyncio.Event | None = None
+_renewal_started: asyncio.Event | None = None
+_renewal_runs = 0
+
+
+async def _held_until_released():
+    """First run waits for the test's release; a later run returns at once."""
+    global _renewal_runs
+    _renewal_runs += 1
+    if _renewal_runs == 1:
+        _renewal_started.set()
+        await _renewal_release.wait()
+        return "first run"
+    return "second run"
+
+
+async def _runs_for(seconds):
+    """First run takes `seconds`; a later run (a second worker's) returns at once."""
+    global _renewal_runs
+    _renewal_runs += 1
+    if _renewal_runs == 1:
+        _renewal_started.set()
+        await asyncio.sleep(seconds)
+        return "first run"
+    return "second run"
+
+
+def _renewal_worker(queue, **kwargs):
+    defaults = {
+        "queues": ["default"],
+        "concurrency": 1,
+        "poll_interval": 0.01,
+        "lease_recovery_interval": 60.0,
+        "shutdown_timeout": 2.0,
+    }
+    defaults.update(kwargs)
+    return Worker(queue, **defaults)
+
+
+async def _stop(worker, worker_task):
+    worker._running = False
+    await asyncio.wait_for(worker_task, timeout=10.0)
+
+
+class TestWorkerLeaseRenewal:
+    """The worker renews every running job's lease before it can end."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        global _renewal_release, _renewal_started, _renewal_runs
+        _renewal_release = asyncio.Event()
+        _renewal_started = asyncio.Event()
+        _renewal_runs = 0
+        yield
+
+    async def test_renewal_error_is_logged_and_next_pass_renews(
+        self, db, monkeypatch, caplog
+    ):
+        """One locked-database error is logged with the job id; the next pass renews."""
+        queue = Queue(db, default_lease_duration=2)
+        await queue.init_db()
+        wrapped = task(queue)(_held_until_released)
+        job = await wrapped.enqueue()
+
+        real_renew = Job.renew_lease
+        calls = []
+        renewed_after_error = asyncio.Event()
+        lease_after = []
+
+        async def renew_failing_once(self, duration=None):
+            calls.append(self.ulid)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            result = await real_renew(self, duration)
+            lease_after.append(self.lease_expires_at)
+            renewed_after_error.set()
+            return result
+
+        monkeypatch.setattr(Job, "renew_lease", renew_failing_once)
+
+        w = _renewal_worker(queue)
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.wait_for(_renewal_started.wait(), timeout=5.0)
+            claimed = await Job.query().filter(F("ulid") == job.ulid).first()
+            claim_lease = claimed.lease_expires_at
+            with caplog.at_level("WARNING", logger="qler.worker"):
+                await asyncio.wait_for(renewed_after_error.wait(), timeout=5.0)
+            row = await Job.query().filter(F("ulid") == job.ulid).first()
+        finally:
+            _renewal_release.set()
+            await _stop(w, worker_task)
+
+        assert calls[:2] == [job.ulid, job.ulid]
+        assert row.status == JobStatus.RUNNING.value
+        assert row.lease_expires_at == lease_after[0]
+        assert row.lease_expires_at > claim_lease
+        failures = [
+            r for r in caplog.records
+            if r.name == "qler.worker" and "Lease renewal failed" in r.getMessage()
+        ]
+        assert len(failures) == 1
+        assert job.ulid in failures[0].getMessage()
+        assert "database is locked" in failures[0].getMessage()
+
+    async def test_short_lease_job_is_never_recovered_while_running(self, db):
+        """A job whose lease is far shorter than the queue default keeps it.
+
+        The claim leases for the queue default, so the queue starts with a
+        default equal to the job's 2 s lease and is raised to 60 s once the job
+        runs: from there the job lives on its own lease while the loop's old
+        wake-up (default / 3 = 20 s) is ten lease lengths away.
+        """
+        q = Queue(db, default_lease_duration=2, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(_runs_for)
+        job = await q.enqueue(wrapped.task_path, args=(6.0,), lease_duration=2)
+
+        w1 = _renewal_worker(q)
+        w1_task = asyncio.create_task(w1.run())
+        await asyncio.wait_for(_renewal_started.wait(), timeout=5.0)
+        q.default_lease_duration = 60
+        w2 = _renewal_worker(q, lease_recovery_interval=0.1)
+        w2_task = asyncio.create_task(w2.run())
+        try:
+            result = await job.wait(timeout=15.0, poll_interval=0.05)
+        finally:
+            await _stop(w2, w2_task)
+            await _stop(w1, w1_task)
+
+        assert result.status == JobStatus.COMPLETED.value
+        assert result.result == "first run"
+        assert _renewal_runs == 1
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        assert [(a.status, a.worker_id) for a in attempts] == [
+            (AttemptStatus.COMPLETED.value, w1.worker_id),
+        ]
