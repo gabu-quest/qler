@@ -1,12 +1,12 @@
 """Unified exception hierarchy for qler."""
 
-from typing import Any, Optional
+from typing import Any
 
 
 class QlerError(Exception):
     """Base exception for all qler errors."""
 
-    def __init__(self, message: str, *, details: Optional[dict[str, Any]] = None):
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.message = message
         self.details = details or {}
@@ -22,8 +22,8 @@ class JobNotFoundError(QlerError):
         self,
         message: str,
         *,
-        ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        ulid: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.ulid = ulid
@@ -36,9 +36,9 @@ class JobFailedError(QlerError):
         self,
         message: str,
         *,
-        ulid: Optional[str] = None,
-        failure_kind: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        ulid: str | None = None,
+        failure_kind: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.ulid = ulid
@@ -52,8 +52,8 @@ class JobCancelledError(QlerError):
         self,
         message: str,
         *,
-        ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        ulid: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.ulid = ulid
@@ -69,8 +69,8 @@ class TaskNotFoundError(QlerError):
         self,
         message: str,
         *,
-        task_path: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        task_path: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.task_path = task_path
@@ -83,8 +83,8 @@ class TaskNotRegisteredError(QlerError):
         self,
         message: str,
         *,
-        task_path: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        task_path: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.task_path = task_path
@@ -97,8 +97,8 @@ class SignatureMismatchError(QlerError):
         self,
         message: str,
         *,
-        task_path: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        task_path: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.task_path = task_path
@@ -114,9 +114,9 @@ class PayloadTooLargeError(QlerError):
         self,
         message: str,
         *,
-        size: Optional[int] = None,
-        max_size: Optional[int] = None,
-        details: Optional[dict[str, Any]] = None,
+        size: int | None = None,
+        max_size: int | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.size = size
@@ -130,7 +130,7 @@ class PayloadNotSerializableError(QlerError):
         self,
         message: str,
         *,
-        details: Optional[dict[str, Any]] = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
 
@@ -145,8 +145,8 @@ class ClaimConflictError(QlerError):
         self,
         message: str,
         *,
-        ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        ulid: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.ulid = ulid
@@ -162,8 +162,8 @@ class DependencyError(QlerError):
         self,
         message: str,
         *,
-        dependency_ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        dependency_ulid: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.dependency_ulid = dependency_ulid
@@ -189,10 +189,10 @@ class UniqueKeyConflictError(QlerError):
         self,
         message: str,
         *,
-        ulid: Optional[str] = None,
-        unique_key: Optional[str] = None,
-        active_ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        ulid: str | None = None,
+        unique_key: str | None = None,
+        active_ulid: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.ulid = ulid

@@ -8,6 +8,8 @@ import time
 from unittest.mock import patch
 
 import pytest
+from sqler import F
+
 from qler._time import now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.exceptions import (
@@ -21,7 +23,6 @@ from qler.models.bucket import RateLimitBucket
 from qler.models.dependency import JobDependency
 from qler.models.job import Job
 from qler.queue import Queue, _calculate_retry_eta
-from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -371,18 +372,22 @@ class TestEnqueueOneJobPerIdempotencyKey:
 
     async def test_failed_edge_insert_leaves_no_job(self, disk_queue):
         parent = await disk_queue.enqueue("parent")
-        with patch.object(JobDependency, "save_many", _failing_edge_save):
-            with pytest.raises(RuntimeError, match="edge insert failed"):
-                await disk_queue.enqueue("child", depends_on=[parent.ulid])
+        with (
+            patch.object(JobDependency, "save_many", _failing_edge_save),
+            pytest.raises(RuntimeError, match="edge insert failed"),
+        ):
+            await disk_queue.enqueue("child", depends_on=[parent.ulid])
         assert await Job.query().count() == 1
 
     async def test_failed_edge_insert_in_enqueue_many_leaves_no_job(self, disk_queue):
         parent = await disk_queue.enqueue("parent")
-        with patch.object(JobDependency, "save_many", _failing_edge_save):
-            with pytest.raises(RuntimeError, match="edge insert failed"):
-                await disk_queue.enqueue_many(
-                    [{"task_path": "child", "depends_on": [parent.ulid]}]
-                )
+        with (
+            patch.object(JobDependency, "save_many", _failing_edge_save),
+            pytest.raises(RuntimeError, match="edge insert failed"),
+        ):
+            await disk_queue.enqueue_many(
+                [{"task_path": "child", "depends_on": [parent.ulid]}]
+            )
         assert await Job.query().count() == 1
 
     async def test_start_with_duplicate_keys(self, tmp_path, caplog):
@@ -935,7 +940,7 @@ class TestQueueClose:
     def test_db_property_raises_before_init(self):
         q = Queue("/tmp/nonexistent.db")
         with pytest.raises(RuntimeError, match="not initialized"):
-            q.db
+            _ = q.db
 
 
 class TestErrorTruncation:

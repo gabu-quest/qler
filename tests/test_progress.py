@@ -1,9 +1,12 @@
 """Tests for job progress — set_progress(), progress fields, reset on retry."""
 
 import asyncio
+import contextlib
 
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB, F
+
 from qler._context import _current_job, set_progress
 from qler._time import now_epoch
 from qler.enums import JobStatus
@@ -11,7 +14,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions
@@ -92,10 +94,8 @@ async def _run_worker_until_job_done(worker, job, timeout=5.0):
         worker._running = False
         await asyncio.sleep(0.05)
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +226,8 @@ class TestProgressReset:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     async def test_manual_retry_resets_progress(self, progress_queue):
         """job.retry() on a FAILED job clears progress fields."""
@@ -253,10 +251,8 @@ class TestProgressReset:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # Now manually retry — progress should be cleared
         ok = await job.retry()
@@ -291,10 +287,8 @@ class TestProgressReset:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # Replay from DLQ — progress should be cleared
         replayed = await q.replay_job(job)

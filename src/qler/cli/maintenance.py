@@ -68,10 +68,7 @@ def purge(db: str, older_than: str, filter_status: str | None, output_json: bool
     async def _purge() -> int:
         q = await _get_queue(db)
         try:
-            if filter_status:
-                statuses = [filter_status]
-            else:
-                statuses = list(TERMINAL_STATUSES)
+            statuses = [filter_status] if filter_status else list(TERMINAL_STATUSES)
 
             job_filter = F("status").in_list(statuses) & (F("created_at") <= threshold)
             matching_jobs = await q.jobs.filter(job_filter).all()

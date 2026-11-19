@@ -11,6 +11,8 @@ import pytest_asyncio
 prometheus_client = pytest.importorskip("prometheus_client")
 
 from prometheus_client import CollectorRegistry
+from sqler import AsyncSQLerDB, F
+
 from qler._time import now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.metrics import QlerMetrics
@@ -18,7 +20,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required — @task rejects nested functions)
@@ -122,9 +123,8 @@ def _sample_value(registry, name, labels=None):
     """Extract a single sample value from a registry."""
     for metric in registry.collect():
         for sample in metric.samples:
-            if sample.name == name:
-                if labels is None or sample.labels == labels:
-                    return sample.value
+            if sample.name == name and (labels is None or sample.labels == labels):
+                return sample.value
     return None
 
 
@@ -173,9 +173,11 @@ class TestOptIn:
         assert q._metrics.registry is reg
 
     async def test_metrics_true_without_prometheus_raises(self, db):
-        with patch.dict("sys.modules", {"prometheus_client": None}):
-            with pytest.raises(ImportError):
-                QlerMetrics()
+        with (
+            patch.dict("sys.modules", {"prometheus_client": None}),
+            pytest.raises(ImportError),
+        ):
+            QlerMetrics()
 
     async def test_metrics_invalid_type_raises(self, db):
         from qler.exceptions import ConfigurationError

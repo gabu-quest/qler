@@ -1,12 +1,15 @@
 """Tests for batch claiming — Queue.claim_jobs() and Worker batch dispatch."""
 
 import asyncio
+import contextlib
 import re
 import sqlite3
 from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB, F
+
 from qler._time import now_epoch
 from qler.enums import AttemptStatus, JobStatus
 from qler.exceptions import ConfigurationError
@@ -15,7 +18,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -378,7 +380,5 @@ class TestWorkerBatchDispatch:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass

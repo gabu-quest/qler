@@ -12,9 +12,9 @@ import platform
 import signal
 import socket
 import time
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from qler._context import _current_job, _current_queue
 from qler._time import generate_ulid, now_epoch
@@ -114,13 +114,13 @@ class Worker:
 
         self._running = False
         self._started_at = now_epoch()
-        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._semaphore: asyncio.Semaphore | None = None
         self._active_jobs: dict[str, Any] = {}  # ulid -> Job
         self._active_tasks: set[asyncio.Task] = set()
         self._background_tasks: list[asyncio.Task] = []
         # Kept apart from the other background tasks: _shutdown stops it only
         # after the drain, so running jobs keep their leases while they finish.
-        self._renewal_task: Optional[asyncio.Task] = None
+        self._renewal_task: asyncio.Task | None = None
         # ulid -> task, for jobs whose task function is being awaited right now
         # (not resolving, not writing their outcome).
         self._in_task_body: dict[str, asyncio.Task] = {}
@@ -319,7 +319,7 @@ class Worker:
                 await asyncio.wait_for(
                     self._semaphore.acquire(), timeout=self.poll_interval
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             if not self._running:
@@ -439,7 +439,7 @@ class Worker:
                             result = await coro
                 finally:
                     self._in_task_body.pop(job.ulid, None)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error(
                     "Task %s timed out after %ss (job %s)",
                     job.task, timeout, job.ulid,
@@ -667,7 +667,7 @@ class Worker:
                     logger.exception("Error querying catchup anchor for %s", path)
 
         while self._running:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             now_ts = int(now.timestamp())
 
             for path, cw in self.queue._cron_tasks.items():
@@ -757,10 +757,8 @@ class Worker:
         # Remove signal handlers
         loop = asyncio.get_running_loop()
         for sig in self._original_handlers:
-            try:
+            with suppress(NotImplementedError, OSError, RuntimeError):
                 loop.remove_signal_handler(sig)
-            except (NotImplementedError, OSError, RuntimeError):
-                pass
 
         logger.info("Worker shutdown complete")
 

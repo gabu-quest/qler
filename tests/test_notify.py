@@ -1,17 +1,19 @@
 """Tests for the _notify module — in-process Event-based job.wait() wakeup."""
 
 import asyncio
+import contextlib
 import time
 
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB
+
 from qler._notify import _registry, clear, fire, register
 from qler.enums import JobStatus
 from qler.exceptions import JobCancelledError, JobFailedError
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB
 
 # ---------------------------------------------------------------------------
 # Helper: shut down worker cleanly
@@ -22,10 +24,8 @@ async def _stop_worker(w, w_task):
     w._running = False
     await asyncio.sleep(0.05)
     w_task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await w_task
-    except asyncio.CancelledError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +76,13 @@ class TestRegistry:
             await ev.wait()
             woken.set()
 
-        asyncio.create_task(waiter())
+        waiter_task = asyncio.create_task(waiter())
         await asyncio.sleep(0)  # Let waiter start
         assert not woken.is_set()
         fire("ULID_A")
         await asyncio.sleep(0)  # Let waiter wake
         assert woken.is_set()
+        await waiter_task
 
     def test_fire_idempotent_on_already_set(self):
         ev = register("ULID_A")

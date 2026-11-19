@@ -7,7 +7,7 @@ import json
 import logging
 import random
 import traceback as tb_module
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from sqler import AsyncSQLerDB, AsyncSQLerQuerySet, F
 from sqler.exceptions import UniqueConstraintError
@@ -68,13 +68,13 @@ class Queue:
         default_max_retries: int = 0,
         default_retry_delay: int = 60,
         max_payload_size: int = 1_000_000,
-        rate_limits: Optional[dict[str, str]] = None,
-        dlq: Optional[str] = None,
-        metrics: Union[bool, "CollectorRegistry"] = False,
+        rate_limits: dict[str, str] | None = None,
+        dlq: str | None = None,
+        metrics: bool | CollectorRegistry = False,
     ) -> None:
         if isinstance(db, str):
-            self._db_path: Optional[str] = db
-            self._db: Optional[AsyncSQLerDB] = None
+            self._db_path: str | None = db
+            self._db: AsyncSQLerDB | None = None
             self._owns_db = True
         else:
             self._db_path = None
@@ -93,7 +93,7 @@ class Queue:
         self.max_payload_size = max_payload_size
         self._tasks: dict[str, TaskWrapper] = {}
         self._cron_tasks: dict[str, CronWrapper] = {}
-        self._dlq: Optional[str] = dlq
+        self._dlq: str | None = dlq
         self._rate_limits: dict[str, RateSpec] = {}
         if rate_limits:
             for queue_name, spec in rate_limits.items():
@@ -101,14 +101,14 @@ class Queue:
         self._initialized = False
 
         # Metrics (opt-in)
-        self._metrics: Optional[QlerMetrics] = None
+        self._metrics: QlerMetrics | None = None
         if metrics is not False:
             try:
                 from qler.metrics import QlerMetrics as _QM  # noqa: N814
-            except ImportError:
+            except ImportError as exc:
                 raise ConfigurationError(
                     "prometheus-client required: pip install 'qler[metrics]'"
-                )
+                ) from exc
             if metrics is True:
                 self._metrics = _QM()
             else:
@@ -355,7 +355,7 @@ class Queue:
             )
             await cur.close()
 
-    async def _create_key_index(self, spec: "KeyIndex") -> None:
+    async def _create_key_index(self, spec: KeyIndex) -> None:
         """Make the UNIQUE partial index over one job key, or say why it cannot be made.
 
         The look for rows that already share a key and the making of the index are one
@@ -406,20 +406,20 @@ class Queue:
         self,
         task_path: str,
         args: tuple = (),
-        kwargs: Optional[dict[str, Any]] = None,
+        kwargs: dict[str, Any] | None = None,
         *,
         queue_name: str = "default",
-        delay: Optional[int] = None,
-        eta: Optional[int] = None,
+        delay: int | None = None,
+        eta: int | None = None,
         priority: int = 0,
-        max_retries: Optional[int] = None,
-        retry_delay: Optional[int] = None,
-        lease_duration: Optional[int] = None,
-        idempotency_key: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-        depends_on: Optional[list[str]] = None,
-        timeout: Optional[int] = None,
-        unique_key: Optional[str] = None,
+        max_retries: int | None = None,
+        retry_delay: int | None = None,
+        lease_duration: int | None = None,
+        idempotency_key: str | None = None,
+        correlation_id: str | None = None,
+        depends_on: list[str] | None = None,
+        timeout: int | None = None,
+        unique_key: str | None = None,
     ) -> Job:
         """Enqueue a new job. Returns the created Job instance.
 
@@ -528,7 +528,7 @@ class Queue:
                 # that job: idempotency key first, then unique key.
                 idempotency_key = spec.get("idempotency_key")
                 unique_key = spec.get("unique_key")
-                matched: Optional[Job] = None
+                matched: Job | None = None
                 if idempotency_key is not None:
                     matched = idem_existing.get(idempotency_key, batch_idem.get(idempotency_key))
                 if matched is None and unique_key is not None:
@@ -733,7 +733,7 @@ class Queue:
                     result = await asyncio.wait_for(coro, timeout=timeout)
             else:
                 result = await coro
-        except asyncio.TimeoutError:
+        except TimeoutError:
             task_exc = TimeoutError(
                 f"Task {job.task} timed out after {timeout}s"
             )
@@ -766,7 +766,7 @@ class Queue:
         self,
         worker_id: str,
         queues: list[str],
-    ) -> Optional[Job]:
+    ) -> Job | None:
         """Atomically claim the next eligible job. Returns Job or None.
 
         The first element of ``claim_jobs(worker_id, queues, 1)``, or None.
@@ -923,7 +923,7 @@ class Queue:
         the attempt's end. The lifecycle event, metric and wake-up follow the commit.
         """
         # Serialize result
-        result_json: Optional[str] = None
+        result_json: str | None = None
         if result is not None:
             try:
                 result_json = json.dumps(result)
@@ -997,7 +997,7 @@ class Queue:
         self,
         job: Job,
         worker_id: str,
-        exc: Optional[BaseException] = None,
+        exc: BaseException | None = None,
         failure_kind: FailureKind = FailureKind.EXCEPTION,
     ) -> None:
         """Mark a job as failed, with optional retry.
@@ -1258,8 +1258,8 @@ class Queue:
         return True
 
     async def replay_job(
-        self, job: Job, *, queue_name: Optional[str] = None
-    ) -> Optional[Job]:
+        self, job: Job, *, queue_name: str | None = None
+    ) -> Job | None:
         """Replay a FAILED DLQ job back to its original queue.
 
         Resets the job to PENDING with retry_count=0 and clears the DLQ fields.
@@ -1343,13 +1343,13 @@ class Queue:
 
     async def _terminalize_attempt(
         self,
-        attempt_id: Optional[str],
+        attempt_id: str | None,
         status: str,
         finished_at: int,
         *,
-        error: Optional[str] = None,
-        traceback: Optional[str] = None,
-        failure_kind: Optional[str] = None,
+        error: str | None = None,
+        traceback: str | None = None,
+        failure_kind: str | None = None,
     ) -> None:
         """Update the attempt record to its terminal state via atomic update_one."""
         if attempt_id is None:

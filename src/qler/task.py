@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from qler.exceptions import ConfigurationError, PayloadNotSerializableError
 from qler.rate_limit import RateSpec, parse_rate
@@ -23,17 +24,17 @@ class TaskWrapper:
         fn: Callable,
         queue: Queue,
         *,
-        queue_name: Optional[str] = None,
-        max_retries: Optional[int] = None,
-        retry_delay: Optional[int] = None,
-        priority: Optional[int] = None,
-        lease_duration: Optional[int] = None,
+        queue_name: str | None = None,
+        max_retries: int | None = None,
+        retry_delay: int | None = None,
+        priority: int | None = None,
+        lease_duration: int | None = None,
         sync: bool = False,
-        rate_limit: Optional[str] = None,
-        idempotency_key: Optional[Callable[..., str]] = None,
-        timeout: Optional[int] = None,
+        rate_limit: str | None = None,
+        idempotency_key: Callable[..., str] | None = None,
+        timeout: int | None = None,
         unique: bool = False,
-        unique_key: Optional[Callable[..., str]] = None,
+        unique_key: Callable[..., str] | None = None,
     ) -> None:
         self.fn = fn
         self.queue = queue
@@ -47,7 +48,7 @@ class TaskWrapper:
         self.unique_key_fn = unique_key
         self.sync = sync
         self.task_path = f"{fn.__module__}.{fn.__qualname__}"
-        self.rate_spec: Optional[RateSpec] = parse_rate(rate_limit) if rate_limit else None
+        self.rate_spec: RateSpec | None = parse_rate(rate_limit) if rate_limit else None
         self.idempotency_key_fn = idempotency_key
 
         # Register on queue
@@ -84,16 +85,16 @@ class TaskWrapper:
     async def enqueue(
         self,
         *args: Any,
-        _delay: Optional[int] = None,
-        _eta: Optional[int] = None,
-        _priority: Optional[int] = None,
-        _idempotency_key: Optional[str] = None,
-        _correlation_id: Optional[str] = None,
-        _depends_on: Optional[list[str]] = None,
-        _timeout: Optional[int] = None,
-        _unique_key: Optional[str] = None,
+        _delay: int | None = None,
+        _eta: int | None = None,
+        _priority: int | None = None,
+        _idempotency_key: str | None = None,
+        _correlation_id: str | None = None,
+        _depends_on: list[str] | None = None,
+        _timeout: int | None = None,
+        _unique_key: str | None = None,
         **kwargs: Any,
-    ) -> "Job":
+    ) -> Job:
         """Enqueue this task for background execution."""
         if _idempotency_key is None and self.idempotency_key_fn is not None:
             _idempotency_key = self.idempotency_key_fn(*args, **kwargs)
@@ -134,7 +135,7 @@ class TaskWrapper:
     async def enqueue_many(
         self,
         arg_list: list[tuple | dict],
-    ) -> list["Job"]:
+    ) -> list[Job]:
         """Enqueue multiple instances of this task at once.
 
         Each element can be:
@@ -218,17 +219,17 @@ class TaskWrapper:
 def task(
     queue: Queue,
     *,
-    queue_name: Optional[str] = None,
-    max_retries: Optional[int] = None,
-    retry_delay: Optional[int] = None,
-    priority: Optional[int] = None,
-    lease_duration: Optional[int] = None,
+    queue_name: str | None = None,
+    max_retries: int | None = None,
+    retry_delay: int | None = None,
+    priority: int | None = None,
+    lease_duration: int | None = None,
     sync: bool = False,
-    rate_limit: Optional[str] = None,
-    idempotency_key: Optional[Callable[..., str]] = None,
-    timeout: Optional[int] = None,
+    rate_limit: str | None = None,
+    idempotency_key: Callable[..., str] | None = None,
+    timeout: int | None = None,
     unique: bool = False,
-    unique_key: Optional[Callable[..., str]] = None,
+    unique_key: Callable[..., str] | None = None,
 ) -> Callable[[Callable], TaskWrapper]:
     """Decorator to register a function as a qler task.
 
