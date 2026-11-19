@@ -634,3 +634,22 @@ async def test_catchup_trims_to_limit(queue):
     assert len(catchup_only) == 2
     assert catchup_only == sorted(catchup_only)  # oldest first
     assert catchup_only[0] == old_ts + 3600  # first missed hour after seed
+
+
+async def test_find_last_enqueued_ts_reads_its_own_queue_after_another_was_initialised_last(
+    tmp_path,
+):
+    """The last-run lookup goes through the queue the cron task was registered on."""
+    qa = Queue(str(tmp_path / "a.db"))
+    await qa.init_db()
+    wrapped = cron(qa, "0 * * * *", catchup=1)(catchup_task)
+    ts = int(datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+    await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(ts))
+
+    qb = Queue(str(tmp_path / "b.db"))
+    await qb.init_db()  # binds the class-wide handle to B last
+    try:
+        assert await wrapped._find_last_enqueued_ts() == ts
+    finally:
+        await qa.close()
+        await qb.close()

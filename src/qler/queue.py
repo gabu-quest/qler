@@ -9,7 +9,7 @@ import random
 import traceback as tb_module
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-from sqler import AsyncSQLerDB, F
+from sqler import AsyncSQLerDB, AsyncSQLerQuerySet, F
 from sqler.exceptions import UniqueConstraintError
 
 from qler._context import _current_job
@@ -126,6 +126,21 @@ class Queue:
         if self._db is None:
             raise RuntimeError("Queue not initialized. Call init_db() first.")
         return self._db
+
+    @property
+    def jobs(self) -> AsyncSQLerQuerySet[Job]:
+        """This queue's jobs table, as a sqler queryset bound to its own database."""
+        return Job.using(self.db, "qler_jobs")
+
+    @property
+    def attempts(self) -> AsyncSQLerQuerySet[JobAttempt]:
+        """This queue's job-attempts table, as a sqler queryset bound to its own database."""
+        return JobAttempt.using(self.db, "qler_job_attempts")
+
+    @property
+    def archive(self) -> AsyncSQLerQuerySet[Job]:
+        """This queue's archived-jobs table, as a sqler queryset bound to its own database."""
+        return Job.using(self.db, "qler_jobs_archive")
 
     async def _migrate_schema(self) -> None:
         """Apply qler-owned schema migrations before ensure/create steps."""

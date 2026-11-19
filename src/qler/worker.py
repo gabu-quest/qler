@@ -21,7 +21,6 @@ from qler._time import generate_ulid, now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.exceptions import ConfigurationError
 from qler.lifecycle import emit as _lifecycle
-from qler.models.job import Job
 
 try:
     from logler.context import correlation_context
@@ -138,7 +137,7 @@ class Worker:
 
     def _health_response(self) -> dict[str, Any]:
         """Build the JSON health response from live instance state."""
-        adapter = self.queue.db.adapter
+        stats = self.queue.db.pool_stats()
         return {
             "status": self.status,
             "worker_id": self.worker_id,
@@ -148,9 +147,9 @@ class Worker:
             "queues": self.queues,
             "started_at": self._started_at,
             "pool": {
-                "size": adapter._pool_size,
-                "available": adapter._pool.qsize(),
-                "healthy": adapter._pool.qsize() == adapter._pool_size,
+                "size": stats.max_connections,
+                "available": stats.available_connections,
+                "healthy": stats.available_connections == stats.max_connections,
             },
         }
 
@@ -538,7 +537,7 @@ class Worker:
         """Return True if the user has asked to cancel this job (cancel_requested)."""
         from sqler import F
 
-        row = await Job.query().filter(F("ulid") == job.ulid).first()
+        row = await self.queue.jobs.filter(F("ulid") == job.ulid).first()
         return bool(row is not None and row.cancel_requested)
 
     @staticmethod
@@ -691,7 +690,7 @@ class Worker:
                             for ts in missed:
                                 # max_running guard
                                 if cw.schedule.max_running > 0:
-                                    running_count = await Job.query().filter(
+                                    running_count = await self.queue.jobs.filter(
                                         (F("task") == path)
                                         & F("status").in_list([
                                             JobStatus.PENDING.value,
@@ -713,7 +712,7 @@ class Worker:
 
                     # max_running guard: check pending/running count
                     if cw.schedule.max_running > 0:
-                        running_count = await Job.query().filter(
+                        running_count = await self.queue.jobs.filter(
                             (F("task") == path)
                             & F("status").in_list([
                                 JobStatus.PENDING.value,
