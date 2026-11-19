@@ -348,7 +348,7 @@ class TestWorkerLeaseRenewal:
         self, queue, monkeypatch, caplog
     ):
         """The loop, not the start-up pass, resets a job claimed by a worker that is gone."""
-        job = await queue.enqueue("my_task", queue_name="orphans", lease_duration=1)
+        job = await queue.enqueue("my_task", queue_name="orphans", lease_duration=2)
         claimed = await queue.claim_job("ghost-worker", ["orphans"])
         assert claimed is not None and claimed.ulid == job.ulid
 
