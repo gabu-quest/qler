@@ -1416,13 +1416,8 @@ class Queue:
         if self._db is None:
             return []
         try:
-            cur = await self._db.adapter.execute(
-                "SELECT queue_name, status, COUNT(*) "
-                "FROM qler_jobs GROUP BY queue_name, status"
-            )
-            rows = await cur.fetchall()
-            await cur.close()
-            return rows
+            groups = await Job.query().group_by("queue_name", "status").count()
+            return [(g["queue_name"], g["status"], g["count"]) for g in groups]
         except Exception:
             return []
 
@@ -1489,42 +1484,33 @@ class Queue:
     ) -> list[Job]:
         """Query archived jobs (read-only)."""
         await self._lazy_init()
-        Job.set_db(self._db, "qler_jobs_archive")
-        try:
-            query = Job.query()
-            filters = []
-            if queue_name:
-                filters.append(F("queue_name") == queue_name)
-            if status:
-                filters.append(F("status") == status)
-            if filters:
-                combined = filters[0]
-                for f in filters[1:]:
-                    combined = combined & f
-                query = query.filter(combined)
-            return await query.order_by("-ulid").limit(limit).all()
-        finally:
-            Job.set_db(self._db, "qler_jobs")
+        query = Job.using(self._db, "qler_jobs_archive")
+        filters = []
+        if queue_name:
+            filters.append(F("queue_name") == queue_name)
+        if status:
+            filters.append(F("status") == status)
+        if filters:
+            combined = filters[0]
+            for f in filters[1:]:
+                combined = combined & f
+            query = query.filter(combined)
+        return await query.order_by("-ulid").limit(limit).all()
 
     async def pool_health(self) -> dict[str, Any]:
         """Report connection pool state for monitoring."""
         await self._lazy_init()
-        adapter = self._db.adapter
+        stats = self._db.pool_stats()
         return {
-            "pool_size": adapter._pool_size,
-            "available": adapter._pool.qsize(),
-            "healthy": adapter._pool.qsize() == adapter._pool_size,
+            "pool_size": stats.max_connections,
+            "available": stats.available_connections,
+            "healthy": stats.available_connections == stats.max_connections,
         }
 
     async def archive_count(self) -> int:
         """Return total number of archived jobs."""
         await self._lazy_init()
-        cur = await self._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_jobs_archive"
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        return row[0] if row else 0
+        return await Job.using(self._db, "qler_jobs_archive").count()
 
     async def close(self) -> None:
         """Close the database connection if we own it."""
