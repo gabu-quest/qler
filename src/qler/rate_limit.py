@@ -67,6 +67,11 @@ async def try_acquire(key: str, rate: RateSpec, *, db: AsyncSQLerDB) -> bool:
     concurrent callers within one window get exactly ``rate.limit`` True answers. The
     first caller of a key inserts its row inside that same transaction.
 
+    The bucket always follows the rate it is given: when the stored ``max_tokens`` or
+    ``refill_rate`` differ, the write that takes the token stores the new values, and the
+    tokens carried over are refilled for the elapsed time at the new rate and capped at
+    the new maximum.
+
     A clock that steps back refills nothing and never moves ``last_refill_at`` back,
     so it can neither hand out a token twice nor drive the count below zero.
 
@@ -107,8 +112,10 @@ async def _take_token(
     # A clock that went back refills nothing and leaves the refill mark where it was.
     elapsed = max(0, now - bucket.last_refill_at)
     new_tokens = min(
-        bucket.tokens + elapsed * bucket.refill_rate, float(bucket.max_tokens)
+        bucket.tokens + elapsed * rate.refill_rate, float(rate.limit)
     )
+    bucket.max_tokens = rate.limit
+    bucket.refill_rate = rate.refill_rate
     allowed = new_tokens >= 1.0
     bucket.tokens = new_tokens - 1.0 if allowed else new_tokens
     bucket.last_refill_at = max(now, bucket.last_refill_at)
