@@ -15,20 +15,6 @@ class QlerError(Exception):
 # Job lifecycle errors
 
 
-class JobNotFoundError(QlerError):
-    """Raised when a job with the given ULID does not exist."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        ulid: str | None = None,
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, details=details)
-        self.ulid = ulid
-
-
 class JobFailedError(QlerError):
     """Raised when waiting on a job that has permanently failed."""
 
@@ -62,36 +48,8 @@ class JobCancelledError(QlerError):
 # Task resolution errors
 
 
-class TaskNotFoundError(QlerError):
-    """Raised when the task module/function cannot be imported."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        task_path: str | None = None,
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, details=details)
-        self.task_path = task_path
-
-
 class TaskNotRegisteredError(QlerError):
     """Raised when a task path exists but is not decorated with @task."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        task_path: str | None = None,
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, details=details)
-        self.task_path = task_path
-
-
-class SignatureMismatchError(QlerError):
-    """Raised when job payload args don't match the task's signature."""
 
     def __init__(
         self,
@@ -136,20 +94,6 @@ class PayloadNotSerializableError(QlerError):
 
 
 # Concurrency errors
-
-
-class ClaimConflictError(QlerError):
-    """Raised when a job claim fails due to concurrent modification."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        ulid: str | None = None,
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, details=details)
-        self.ulid = ulid
 
 
 # Dependency errors
