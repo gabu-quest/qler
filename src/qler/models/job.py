@@ -315,7 +315,7 @@ class Job(AsyncSQLerSafeModel):
 
 
 # The UNIQUE index over the unique key of pending and running jobs, made from
-# KEY_INDEXES by Queue._create_key_index.
+# KEY_INDEXES by qler._schema._create_key_index.
 UNIQUE_KEY_INDEX = "idx_qler_jobs_unique_uq"
 
 
