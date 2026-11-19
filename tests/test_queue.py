@@ -199,6 +199,33 @@ class _EnqueuedEvents(logging.Handler):
             self.records.append(record)
 
 
+class TestPayloadIsCheckedBeforeTheWriteLock:
+    """A payload that cannot be stored is refused without waiting for the database."""
+
+    @pytest.mark.parametrize("entry", ["enqueue", "enqueue_many"])
+    async def test_bad_payload_is_refused_while_another_write_is_open(self, disk_queue, entry):
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def hold_the_write_lock():
+            async with disk_queue.db.transaction():
+                held.set()
+                await release.wait()
+
+        holder = asyncio.create_task(hold_the_write_lock())
+        await held.wait()
+        try:
+            if entry == "enqueue":
+                call = disk_queue.enqueue("t", args=(object(),))
+            else:
+                call = disk_queue.enqueue_many([{"task_path": "t", "args": (object(),)}])
+            with pytest.raises(PayloadNotSerializableError, match="not JSON-serializable"):
+                await asyncio.wait_for(call, 1)
+        finally:
+            release.set()
+            await holder
+        assert await Job.query().count() == 0
+
+
 class TestBatchOfOneIsTheSingleCall:
     """enqueue_many([spec]) gives what enqueue(**spec) gives, in a list, with batch=True."""
 
@@ -504,26 +531,6 @@ async def _claim_one(queue, how):
 
 class TestClaimOfOne:
     """claim_job is claim_jobs(n=1): same result, same state left behind."""
-
-    @pytest.mark.parametrize("how", ["claim_job", "claim_jobs"])
-    async def test_poison_pill_returns_nothing_and_fails_the_job(self, queue, how):
-        job = await queue.enqueue("my_task")
-        # No public call writes a bad payload: corrupt it as TestPoisonPill does.
-        await Job.query().filter(F("ulid") == job.ulid).update_one(payload_json="{{{")
-
-        claimed = await _claim_one(queue, how)
-
-        assert claimed == (None if how == "claim_job" else [])
-        await job.refresh()
-        assert job.status == JobStatus.FAILED.value
-        assert job.attempts == 1
-        assert job.worker_id == ""
-        assert job.lease_expires_at is None
-        assert job.last_failure_kind == FailureKind.PAYLOAD_INVALID.value
-        attempts = await JobAttempt.query().all()
-        assert len(attempts) == 1
-        assert attempts[0].ulid == job.last_attempt_id
-        assert attempts[0].status == "failed"
 
     @pytest.mark.parametrize("how", ["claim_job", "claim_jobs"])
     async def test_rate_limited_returns_nothing_and_requeues_the_job(self, db, how):
