@@ -32,12 +32,20 @@ async def _make_running_job(queue, *, lease_offset: int = 300, worker_id: str = 
     # Force lease_expires_at to the desired value
     now = now_epoch()
     target_expiry = now + lease_offset
-    await Job.query().filter(F("ulid") == claimed.ulid).update_one(
-        lease_expires_at=target_expiry,
+    await (
+        Job.query()
+        .filter(F("ulid") == claimed.ulid)
+        .update_one(
+            lease_expires_at=target_expiry,
+        )
     )
     # Also update the attempt's lease_expires_at for consistency
-    await JobAttempt.query().filter(F("job_ulid") == claimed.ulid).update_one(
-        lease_expires_at=target_expiry,
+    await (
+        JobAttempt.query()
+        .filter(F("job_ulid") == claimed.ulid)
+        .update_one(
+            lease_expires_at=target_expiry,
+        )
     )
     await claimed.refresh()
     return claimed
@@ -68,9 +76,7 @@ class TestRecoverExpiredLeases:
         await queue.recover_expired_leases()
         after = now_epoch()
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.LEASE_EXPIRED.value
         assert attempts[0].failure_kind == FailureKind.LEASE_EXPIRED.value
@@ -95,9 +101,7 @@ class TestRecoverExpiredLeases:
         assert count == 3
 
         # Remaining 2 still running
-        remaining = await Job.query().filter(
-            F("status") == JobStatus.RUNNING.value
-        ).all()
+        remaining = await Job.query().filter(F("status") == JobStatus.RUNNING.value).all()
         assert len(remaining) == 2
 
     async def test_recover_no_expired(self, queue):
@@ -131,13 +135,14 @@ class TestRecoverExpiredLeases:
             assert j.status == "pending"
             assert j.worker_id == ""
 
-
     async def test_recover_expired_lease_resets_progress(self, queue):
         """Progress fields are cleared when a lease-expired job is recovered."""
         job = await _make_running_job(queue, lease_offset=-10)
         # Set progress on the running job
-        await Job.query().filter(F("ulid") == job.ulid).update_one(
-            progress=75, progress_message="three quarters"
+        await (
+            Job.query()
+            .filter(F("ulid") == job.ulid)
+            .update_one(progress=75, progress_message="three quarters")
         )
         recovered = await queue.recover_expired_leases()
         assert recovered == 1
@@ -146,9 +151,7 @@ class TestRecoverExpiredLeases:
         assert refreshed.progress is None
         assert refreshed.progress_message == ""
 
-    async def test_reset_and_attempt_end_are_one_write(
-        self, queue, raise_on_nth_update, caplog
-    ):
+    async def test_reset_and_attempt_end_are_one_write(self, queue, raise_on_nth_update, caplog):
         """The attempt's end fails once: nothing is reset, no event; the next call recovers it."""
         job = await _make_running_job(queue, lease_offset=-10)
 
@@ -158,7 +161,8 @@ class TestRecoverExpiredLeases:
 
         def recovered_events():
             return [
-                r for r in caplog.records
+                r
+                for r in caplog.records
                 if r.name == "qler.lifecycle" and r.event == "job.lease_recovered"
             ]
 
@@ -217,8 +221,12 @@ class TestRenewLease:
         """Wrong worker → False."""
         job = await _make_running_job(queue, lease_offset=60)
         # Change worker_id to simulate ownership loss
-        await Job.query().filter(F("ulid") == job.ulid).update_one(
-            worker_id="other-worker",
+        await (
+            Job.query()
+            .filter(F("ulid") == job.ulid)
+            .update_one(
+                worker_id="other-worker",
+            )
         )
         await job.refresh()
         job.worker_id = "worker-1"  # pretend we still think we own it
@@ -295,9 +303,7 @@ class TestWorkerLeaseRenewal:
         _renewal_runs = 0
         yield
 
-    async def test_renewal_error_is_logged_and_next_pass_renews(
-        self, db, monkeypatch, caplog
-    ):
+    async def test_renewal_error_is_logged_and_next_pass_renews(self, db, monkeypatch, caplog):
         """One locked-database error is logged with the job id; the next pass renews."""
         queue = Queue(db, default_lease_duration=2)
         await queue.init_db()
@@ -338,7 +344,8 @@ class TestWorkerLeaseRenewal:
         assert row.lease_expires_at == lease_after[0]
         assert row.lease_expires_at > claim_lease
         failures = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.name == "qler.worker" and "Lease renewal failed" in r.getMessage()
         ]
         assert len(failures) == 1
@@ -383,7 +390,8 @@ class TestWorkerLeaseRenewal:
         attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
         assert [a.status for a in attempts] == [AttemptStatus.LEASE_EXPIRED.value]
         events = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.name == "qler.lifecycle" and r.event == "job.lease_recovered"
         ]
         assert [r.job_id for r in events] == [job.ulid]

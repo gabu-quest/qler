@@ -109,8 +109,7 @@ class TaskWrapper:
                 _unique_key = self.unique_key_fn(*args, **kwargs)
                 if not isinstance(_unique_key, str):
                     raise TypeError(
-                        f"unique_key function must return str, "
-                        f"got {type(_unique_key).__name__}"
+                        f"unique_key function must return str, got {type(_unique_key).__name__}"
                     )
             elif self._unique:
                 _unique_key = self.task_path
@@ -151,9 +150,7 @@ class TaskWrapper:
             elif isinstance(item, dict):
                 spec = dict(item)
             else:
-                raise TypeError(
-                    f"Each item must be a tuple or dict, got {type(item).__name__}"
-                )
+                raise TypeError(f"Each item must be a tuple or dict, got {type(item).__name__}")
 
             spec.setdefault("task_path", self.task_path)
             spec.setdefault("queue_name", self.queue_name)
@@ -171,8 +168,7 @@ class TaskWrapper:
                 key = self.idempotency_key_fn(*args, **kwargs)
                 if not isinstance(key, str):
                     raise TypeError(
-                        f"idempotency_key function must return str, "
-                        f"got {type(key).__name__}"
+                        f"idempotency_key function must return str, got {type(key).__name__}"
                     )
                 spec["idempotency_key"] = key
 
@@ -184,8 +180,7 @@ class TaskWrapper:
                     ukey = self.unique_key_fn(*args, **kwargs)
                     if not isinstance(ukey, str):
                         raise TypeError(
-                            f"unique_key function must return str, "
-                            f"got {type(ukey).__name__}"
+                            f"unique_key function must return str, got {type(ukey).__name__}"
                         )
                     spec["unique_key"] = ukey
                 elif self._unique:
@@ -201,9 +196,7 @@ class TaskWrapper:
         try:
             json.dumps(payload)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise PayloadNotSerializableError(
-                f"Payload is not JSON-serializable: {exc}"
-            ) from exc
+            raise PayloadNotSerializableError(f"Payload is not JSON-serializable: {exc}") from exc
 
         if self.sync:
             return await asyncio.to_thread(self.fn, *args, **kwargs)
@@ -257,9 +250,7 @@ def task(
         )
 
     if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
-        raise ConfigurationError(
-            f"timeout must be a positive integer, got {timeout!r}"
-        )
+        raise ConfigurationError(f"timeout must be a positive integer, got {timeout!r}")
 
     if unique and unique_key is not None:
         raise ConfigurationError(
@@ -267,9 +258,7 @@ def task(
         )
 
     if unique_key is not None and not callable(unique_key):
-        raise ConfigurationError(
-            f"unique_key must be callable, got {type(unique_key).__name__}"
-        )
+        raise ConfigurationError(f"unique_key must be callable, got {type(unique_key).__name__}")
 
     def decorator(fn: Callable) -> TaskWrapper:
         # Reject nested functions (methods, closures, inner functions)
@@ -293,9 +282,7 @@ def task(
 
         # Validate retry_delay
         if retry_delay is not None and retry_delay < 1:
-            raise ConfigurationError(
-                f"retry_delay must be >= 1, got {retry_delay}"
-            )
+            raise ConfigurationError(f"retry_delay must be >= 1, got {retry_delay}")
 
         return TaskWrapper(
             fn,

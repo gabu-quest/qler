@@ -26,11 +26,13 @@ _SINCE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _MAX_SINCE_SECONDS = 10 * 365 * 86400  # 10 years
 _MODULE_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*$")
 
-TERMINAL_STATUSES = frozenset({
-    JobStatus.COMPLETED.value,
-    JobStatus.FAILED.value,
-    JobStatus.CANCELLED.value,
-})
+TERMINAL_STATUSES = frozenset(
+    {
+        JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value,
+        JobStatus.CANCELLED.value,
+    }
+)
 
 
 def _run(coro: Any) -> Any:
@@ -129,9 +131,7 @@ def _import_app(app_string: str) -> Queue:
     try:
         obj = getattr(mod, attr)
     except AttributeError as exc:
-        raise click.BadParameter(
-            f"Module '{module_path}' has no attribute '{attr}'"
-        ) from exc
+        raise click.BadParameter(f"Module '{module_path}' has no attribute '{attr}'") from exc
     if not isinstance(obj, Queue):
         raise click.BadParameter(f"'{app_string}' is not a Queue instance")
     return obj

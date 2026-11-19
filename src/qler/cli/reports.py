@@ -28,6 +28,7 @@ from qler.models.job import Job
 # qler status
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
 @click.option("--include-archive", is_flag=True, help="Include archived jobs in counts")
@@ -45,8 +46,11 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
                 queue_name, job_status = row["queue_name"], row["status"]
                 if queue_name not in queues:
                     queues[queue_name] = {
-                        "pending": 0, "running": 0,
-                        "completed": 0, "failed": 0, "cancelled": 0,
+                        "pending": 0,
+                        "running": 0,
+                        "completed": 0,
+                        "failed": 0,
+                        "cancelled": 0,
                     }
                 queues[queue_name][job_status] = row["count"]
 
@@ -57,7 +61,9 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
                     queue_name, job_status = row["queue_name"], row["status"]
                     if queue_name not in archived:
                         archived[queue_name] = {
-                            "completed": 0, "failed": 0, "cancelled": 0,
+                            "completed": 0,
+                            "failed": 0,
+                            "cancelled": 0,
                         }
                     archived[queue_name][job_status] = row["count"]
 
@@ -82,14 +88,16 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
         headers = ["Queue", "Pending", "Running", "Completed", "Failed", "Cancelled"]
         rows = []
         for name, counts in sorted(active.items()):
-            rows.append([
-                name,
-                str(counts["pending"]),
-                str(counts["running"]),
-                str(counts["completed"]),
-                str(counts["failed"]),
-                str(counts["cancelled"]),
-            ])
+            rows.append(
+                [
+                    name,
+                    str(counts["pending"]),
+                    str(counts["running"]),
+                    str(counts["completed"]),
+                    str(counts["failed"]),
+                    str(counts["cancelled"]),
+                ]
+            )
         _echo_table(headers, rows)
         click.echo(f"\nTotal: {total} jobs")
         if include_archive and archived:
@@ -97,12 +105,14 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
             headers = ["Queue", "Completed", "Failed", "Cancelled"]
             rows = []
             for name, counts in sorted(archived.items()):
-                rows.append([
-                    name,
-                    str(counts.get("completed", 0)),
-                    str(counts.get("failed", 0)),
-                    str(counts.get("cancelled", 0)),
-                ])
+                rows.append(
+                    [
+                        name,
+                        str(counts.get("completed", 0)),
+                        str(counts.get("failed", 0)),
+                        str(counts.get("cancelled", 0)),
+                    ]
+                )
             _echo_table(headers, rows)
 
 
@@ -110,12 +120,17 @@ def status(db: str, include_archive: bool, output_json: bool) -> None:
 # qler jobs
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
-@click.option("--status", "filter_status", type=click.Choice(
-    ["pending", "running", "completed", "failed", "cancelled"],
-    case_sensitive=False,
-))
+@click.option(
+    "--status",
+    "filter_status",
+    type=click.Choice(
+        ["pending", "running", "completed", "failed", "cancelled"],
+        case_sensitive=False,
+    ),
+)
 @click.option("--queue", "filter_queue", help="Filter by queue name")
 @click.option("--task", "filter_task", help="Filter by task path")
 @click.option("--since", "since", help="Time window, e.g. '1h', '30m', '7d'")
@@ -189,24 +204,28 @@ def jobs(
         rows = []
         for j in active:
             error = (j.last_error or "")[:40]
-            rows.append([
-                j.ulid[:12] + "...",
-                j.status,
-                j.queue_name,
-                j.task,
-                _format_ts(j.created_at),
-                error,
-            ])
+            rows.append(
+                [
+                    j.ulid[:12] + "...",
+                    j.status,
+                    j.queue_name,
+                    j.task,
+                    _format_ts(j.created_at),
+                    error,
+                ]
+            )
         for j in archived:
             error = (j.last_error or "")[:40]
-            rows.append([
-                j.ulid[:12] + "...",
-                j.status + " (archived)",
-                j.queue_name,
-                j.task,
-                _format_ts(j.created_at),
-                error,
-            ])
+            rows.append(
+                [
+                    j.ulid[:12] + "...",
+                    j.status + " (archived)",
+                    j.queue_name,
+                    j.task,
+                    _format_ts(j.created_at),
+                    error,
+                ]
+            )
         _echo_table(headers, rows)
         shown = len(all_jobs)
         msg = f"\n{shown} jobs shown"
@@ -218,6 +237,7 @@ def jobs(
 # ---------------------------------------------------------------------------
 # qler job <id>
 # ---------------------------------------------------------------------------
+
 
 @cli.command()
 @click.argument("ulid")
@@ -288,6 +308,7 @@ def job(ulid: str, db: str, output_json: bool) -> None:
 # qler attempts <id>
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.argument("ulid")
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
@@ -299,9 +320,7 @@ def attempts(ulid: str, db: str, output_json: bool) -> None:
     async def _attempts() -> list[JobAttempt]:
         q = await _get_queue(db)
         try:
-            return await q.attempts.filter(
-                F("job_ulid") == ulid
-            ).order_by("ulid").all()
+            return await q.attempts.filter(F("job_ulid") == ulid).order_by("ulid").all()
         finally:
             await q.close()
 
@@ -317,12 +336,14 @@ def attempts(ulid: str, db: str, output_json: bool) -> None:
         rows = []
         for a in result:
             error = (a.error or "")[:40]
-            rows.append([
-                str(a.attempt_number),
-                a.status,
-                a.worker_id[:20] + "..." if len(a.worker_id) > 20 else a.worker_id,
-                _format_ts(a.started_at),
-                _format_ts(a.finished_at),
-                error,
-            ])
+            rows.append(
+                [
+                    str(a.attempt_number),
+                    a.status,
+                    a.worker_id[:20] + "..." if len(a.worker_id) > 20 else a.worker_id,
+                    _format_ts(a.started_at),
+                    _format_ts(a.finished_at),
+                    error,
+                ]
+            )
         _echo_table(headers, rows)

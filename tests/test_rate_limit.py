@@ -49,7 +49,6 @@ async def queue(db):
 
 
 class TestParseRate:
-
     def test_per_second(self):
         spec = parse_rate("5/s")
         assert spec.limit == 5
@@ -89,7 +88,6 @@ class TestParseRate:
 
 
 class TestTryAcquire:
-
     async def test_allows_fresh_bucket(self, queue, db):
         """First request on a new bucket should succeed."""
         rate = parse_rate("10/m")
@@ -147,7 +145,6 @@ def frozen_clock(monkeypatch):
 
 
 class TestTryAcquireConcurrent:
-
     async def test_first_use_from_eight_tasks(self, disk_queue, disk_db, frozen_clock):
         """Eight tasks race on a key nobody used yet: exactly the limit pass, one row."""
         rate = parse_rate("3/m")
@@ -160,9 +157,7 @@ class TestTryAcquireConcurrent:
         assert len(rows) == 1
         assert rows[0].tokens == 0.0
 
-    async def test_existing_bucket_from_eight_tasks(
-        self, disk_queue, disk_db, frozen_clock
-    ):
+    async def test_existing_bucket_from_eight_tasks(self, disk_queue, disk_db, frozen_clock):
         """Eight tasks race on a full bucket that already exists: exactly the limit pass."""
         rate = parse_rate("3/m")
         await RateLimitBucket(
@@ -250,7 +245,6 @@ class TestTryAcquireConcurrent:
 
 
 class TestChangedRate:
-
     async def test_raised_limit_applies_one_window_later(self, queue, db, monkeypatch):
         """A bucket emptied at 2/m, called at 5/m a window later, gives exactly 5 tokens."""
         import qler.rate_limit as rate_limit_module
@@ -292,7 +286,6 @@ class TestChangedRate:
 
 
 class TestTaskRateLimit:
-
     async def test_decorator_stores_rate_spec(self, queue):
         """@task(rate_limit='10/m') stores RateSpec on TaskWrapper."""
         wrapped = task(queue, rate_limit="10/m")(send_email)
@@ -317,7 +310,6 @@ class TestTaskRateLimit:
 
 
 class TestClaimRateLimit:
-
     async def test_rate_limited_requeues(self, queue):
         """Exhausted task-level bucket requeues job with delayed ETA."""
         wrapped = task(queue, rate_limit="1/m")(send_email)
@@ -337,9 +329,7 @@ class TestClaimRateLimit:
         assert claimed2 is None  # Rate limited, returned None
 
         # The requeued job should have a delayed ETA
-        remaining = await Job.query().filter(
-            F("status") == JobStatus.PENDING.value
-        ).all()
+        remaining = await Job.query().filter(F("status") == JobStatus.PENDING.value).all()
         assert len(remaining) == 2
         # At least one should have a future ETA (delayed)
         future_etas = [j for j in remaining if j.eta > j1.eta]

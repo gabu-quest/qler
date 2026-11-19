@@ -68,33 +68,21 @@ class Worker:
         if queues is not None and len(queues) == 0:
             raise ConfigurationError("queues list must not be empty")
         if concurrency < 1:
-            raise ConfigurationError(
-                f"concurrency must be >= 1, got {concurrency}"
-            )
+            raise ConfigurationError(f"concurrency must be >= 1, got {concurrency}")
         if shutdown_timeout <= 0:
-            raise ConfigurationError(
-                f"shutdown_timeout must be > 0, got {shutdown_timeout}"
-            )
+            raise ConfigurationError(f"shutdown_timeout must be > 0, got {shutdown_timeout}")
         if health_port is not None and health_socket is not None:
-            raise ConfigurationError(
-                "health_port and health_socket are mutually exclusive"
-            )
+            raise ConfigurationError("health_port and health_socket are mutually exclusive")
         if health_port is not None and not (1 <= health_port <= 65535):
-            raise ConfigurationError(
-                f"health_port must be between 1 and 65535, got {health_port}"
-            )
+            raise ConfigurationError(f"health_port must be between 1 and 65535, got {health_port}")
         if archive_interval is not None and archive_interval < 1.0:
             raise ConfigurationError(
                 f"archive_interval must be >= 1.0 seconds, got {archive_interval}"
             )
         if archive_after < 0:
-            raise ConfigurationError(
-                f"archive_after must be >= 0, got {archive_after}"
-            )
+            raise ConfigurationError(f"archive_after must be >= 0, got {archive_after}")
         if memory_limit_mb is not None and memory_limit_mb < 1:
-            raise ConfigurationError(
-                f"memory_limit_mb must be >= 1, got {memory_limit_mb}"
-            )
+            raise ConfigurationError(f"memory_limit_mb must be >= 1, got {memory_limit_mb}")
 
         self.queue = queue
         self.queues = queues or ["default"]
@@ -228,18 +216,14 @@ class Worker:
                 server = await asyncio.start_unix_server(
                     self._handle_health_request, path=self.health_socket
                 )
-                logger.info(
-                    "Health endpoint listening on unix:%s", self.health_socket
-                )
+                logger.info("Health endpoint listening on unix:%s", self.health_socket)
             else:
                 server = await asyncio.start_server(
                     self._handle_health_request,
                     host="127.0.0.1",
                     port=self.health_port,
                 )
-                logger.info(
-                    "Health endpoint listening on 127.0.0.1:%d", self.health_port
-                )
+                logger.info("Health endpoint listening on 127.0.0.1:%d", self.health_port)
 
             # Serve until cancelled by _shutdown(). This means the health
             # endpoint stays up during graceful drain so procler can see
@@ -285,21 +269,13 @@ class Worker:
                 asyncio.create_task(self._lease_recovery_loop()),
             ]
             if self.queue._cron_tasks:
-                self._background_tasks.append(
-                    asyncio.create_task(self._cron_scheduler_loop())
-                )
+                self._background_tasks.append(asyncio.create_task(self._cron_scheduler_loop()))
             if self.health_port is not None or self.health_socket is not None:
-                self._background_tasks.append(
-                    asyncio.create_task(self._health_server_loop())
-                )
+                self._background_tasks.append(asyncio.create_task(self._health_server_loop()))
             if self.archive_interval is not None:
-                self._background_tasks.append(
-                    asyncio.create_task(self._archival_loop())
-                )
+                self._background_tasks.append(asyncio.create_task(self._archival_loop()))
             if self.memory_limit_mb is not None:
-                self._background_tasks.append(
-                    asyncio.create_task(self._memory_watchdog_loop())
-                )
+                self._background_tasks.append(asyncio.create_task(self._memory_watchdog_loop()))
 
             # Main claim loop
             await self._claim_loop()
@@ -316,9 +292,7 @@ class Worker:
         while self._running:
             # Wait for at least one free slot
             try:
-                await asyncio.wait_for(
-                    self._semaphore.acquire(), timeout=self.poll_interval
-                )
+                await asyncio.wait_for(self._semaphore.acquire(), timeout=self.poll_interval)
             except TimeoutError:
                 continue
 
@@ -334,7 +308,9 @@ class Worker:
 
             try:
                 jobs = await self.queue.claim_jobs(
-                    self.worker_id, self.queues, n=batch_size,
+                    self.worker_id,
+                    self.queues,
+                    n=batch_size,
                 )
             except Exception:
                 for _ in range(batch_size):
@@ -402,7 +378,9 @@ class Worker:
             except TypeError as exc:
                 logger.error(
                     "Signature mismatch for %s (job %s): %s",
-                    job.task, job.ulid, exc,
+                    job.task,
+                    job.ulid,
+                    exc,
                 )
                 await self._finish(
                     "fail",
@@ -442,23 +420,20 @@ class Worker:
             except TimeoutError:
                 logger.error(
                     "Task %s timed out after %ss (job %s)",
-                    job.task, timeout, job.ulid,
+                    job.task,
+                    timeout,
+                    job.ulid,
                 )
                 await self._finish(
                     "fail",
                     job,
                     self.worker_id,
-                    TimeoutError(
-                        f"Task {job.task} timed out after {timeout}s"
-                    ),
+                    TimeoutError(f"Task {job.task} timed out after {timeout}s"),
                     failure_kind=FailureKind.TIMEOUT,
                 )
                 return
             except asyncio.CancelledError:
-                if (
-                    job.ulid in self._cut_by_shutdown
-                    and not await self._cancel_was_requested(job)
-                ):
+                if job.ulid in self._cut_by_shutdown and not await self._cancel_was_requested(job):
                     # The worker's own shutdown cut this job, not the user. The
                     # row stays RUNNING with this worker's id and lease, so lease
                     # recovery hands it to a worker once the lease ends.
@@ -466,14 +441,16 @@ class Worker:
                     logger.warning(
                         "Shutdown stopped task %s (job %s) before it finished; "
                         "left it running for lease recovery",
-                        job.task, job.ulid,
+                        job.task,
+                        job.ulid,
                     )
                     raise
                 if job.ulid in self._cut_by_shutdown:
                     self._failed_on_cut.append(job.ulid)
                 logger.warning(
                     "Task %s cancelled (job %s), marking failed",
-                    job.task, job.ulid,
+                    job.task,
+                    job.ulid,
                 )
                 await self._finish(
                     "fail",
@@ -485,7 +462,9 @@ class Worker:
             except Exception as exc:
                 logger.error(
                     "Task %s failed (job %s): %s",
-                    job.task, job.ulid, exc,
+                    job.task,
+                    job.ulid,
+                    exc,
                 )
                 await self._finish(
                     "fail",
@@ -502,14 +481,15 @@ class Worker:
         finally:
             duration = time.monotonic() - start_time
             _lifecycle(
-                "job.executed", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id or job.ulid,
+                "job.executed",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id or job.ulid,
                 duration=round(duration, 4),
             )
             if self.queue._metrics:
-                self.queue._metrics.observe_duration(
-                    job.queue_name, job.task, duration
-                )
+                self.queue._metrics.observe_duration(job.queue_name, job.task, duration)
             _current_job.reset(token)
             _current_queue.reset(queue_token)
             self._active_jobs.pop(job.ulid, None)
@@ -530,7 +510,10 @@ class Worker:
         except Exception:
             logger.error(
                 "Could not %s job %s (task %s); left it running for lease recovery",
-                which, job.ulid, job.task, exc_info=True,
+                which,
+                job.ulid,
+                job.task,
+                exc_info=True,
             )
 
     async def _cancel_was_requested(self, job: Any) -> bool:
@@ -568,15 +551,14 @@ class Worker:
                     # Per job: the others are still renewed this pass, and this
                     # one is tried again on the next.
                     logger.warning(
-                        "Lease renewal failed for job %s: %s: %s; "
-                        "trying again on the next pass",
-                        ulid, type(exc).__name__, exc,
+                        "Lease renewal failed for job %s: %s: %s; trying again on the next pass",
+                        ulid,
+                        type(exc).__name__,
+                        exc,
                     )
                     continue
                 if not renewed:
-                    logger.warning(
-                        "Lost ownership of job %s during renewal", ulid
-                    )
+                    logger.warning("Lost ownership of job %s during renewal", ulid)
                     self._active_jobs.pop(ulid, None)
 
             wake = time.time() + self.queue.default_lease_duration / 3
@@ -605,9 +587,7 @@ class Worker:
             if not self._running:
                 break
             try:
-                count = await self.queue.archive_jobs(
-                    older_than_seconds=self.archive_after
-                )
+                count = await self.queue.archive_jobs(older_than_seconds=self.archive_after)
                 if count:
                     logger.info("Archived %d terminal jobs", count)
             except Exception:
@@ -639,9 +619,7 @@ class Worker:
                     )
                     count = await self.queue.archive_jobs(older_than_seconds=0)
                     if count:
-                        logger.info(
-                            "Memory watchdog: archived %d jobs", count
-                        )
+                        logger.info("Memory watchdog: archived %d jobs", count)
             except Exception:
                 logger.exception("Error in memory watchdog loop")
 
@@ -684,7 +662,8 @@ class Worker:
                                 missed = missed[-1:]
                             else:
                                 missed = cw.missed_runs(
-                                    anchor, now_ts,
+                                    anchor,
+                                    now_ts,
                                     limit=cw.schedule.catchup,
                                 )
                             for ts in missed:
@@ -692,10 +671,12 @@ class Worker:
                                 if cw.schedule.max_running > 0:
                                     running_count = await self.queue.jobs.filter(
                                         (F("task") == path)
-                                        & F("status").in_list([
-                                            JobStatus.PENDING.value,
-                                            JobStatus.RUNNING.value,
-                                        ])
+                                        & F("status").in_list(
+                                            [
+                                                JobStatus.PENDING.value,
+                                                JobStatus.RUNNING.value,
+                                            ]
+                                        )
                                     ).count()
                                     if running_count >= cw.schedule.max_running:
                                         break
@@ -714,10 +695,12 @@ class Worker:
                     if cw.schedule.max_running > 0:
                         running_count = await self.queue.jobs.filter(
                             (F("task") == path)
-                            & F("status").in_list([
-                                JobStatus.PENDING.value,
-                                JobStatus.RUNNING.value,
-                            ])
+                            & F("status").in_list(
+                                [
+                                    JobStatus.PENDING.value,
+                                    JobStatus.RUNNING.value,
+                                ]
+                            )
                         ).count()
                         if running_count >= cw.schedule.max_running:
                             continue
@@ -771,9 +754,7 @@ class Worker:
         """
         if not self._active_tasks:
             return
-        _done, pending = await asyncio.wait(
-            self._active_tasks, timeout=self.shutdown_timeout
-        )
+        _done, pending = await asyncio.wait(self._active_tasks, timeout=self.shutdown_timeout)
         # Cut only the jobs still inside their task function. A job that is
         # writing its outcome is left to finish the write, so no row is
         # left half recorded. No await between the wait and the cuts, so
@@ -786,20 +767,22 @@ class Worker:
                 t.cancel()
         if not pending:
             return
-        _ended, still_going = await asyncio.wait(
-            pending, timeout=SHUTDOWN_CUT_GRACE
-        )
+        _ended, still_going = await asyncio.wait(pending, timeout=SHUTDOWN_CUT_GRACE)
         not_stopped = sorted(cut.get(t, "<writing its outcome>") for t in still_going)
         logger.warning(
             "Shutdown timeout of %ss passed with %d job(s) unfinished: "
             "left %d running for lease recovery, failed %d as cancelled "
             "because their cancel was requested",
-            self.shutdown_timeout, len(pending),
-            len(self._left_for_recovery), len(self._failed_on_cut),
+            self.shutdown_timeout,
+            len(pending),
+            len(self._left_for_recovery),
+            len(self._failed_on_cut),
         )
         if not_stopped:
             logger.warning(
                 "%d job(s) did not stop within the %ss grace after the cut and "
                 "were left running for lease recovery: %s",
-                len(not_stopped), SHUTDOWN_CUT_GRACE, ", ".join(not_stopped),
+                len(not_stopped),
+                SHUTDOWN_CUT_GRACE,
+                ", ".join(not_stopped),
             )

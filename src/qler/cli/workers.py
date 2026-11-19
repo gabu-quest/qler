@@ -23,6 +23,7 @@ from qler.queue import Queue
 # qler worker
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", envvar="QLER_DB", help="Database file path")
 @click.option("--app", "app_string", help="Queue instance as 'module:attribute'")
@@ -32,10 +33,27 @@ from qler.queue import Queue
 @click.option("--poll-interval", default=1.0, type=float, help="Poll interval in seconds")
 @click.option("--shutdown-timeout", default=30.0, type=float, help="Shutdown timeout in seconds")
 @click.option("--health-port", type=int, default=None, help="TCP port for health endpoint")
-@click.option("--health-socket", type=str, default=None, help="Unix socket path for health endpoint")
-@click.option("--archive-interval", type=float, default=None, help="Archival sweep interval in seconds (disabled by default)")
-@click.option("--archive-after", type=int, default=300, help="Archive jobs older than N seconds (default: 300)")
-@click.option("--memory-limit-mb", type=int, default=None, help="RSS limit in MB — triggers emergency archival (disabled by default)")
+@click.option(
+    "--health-socket", type=str, default=None, help="Unix socket path for health endpoint"
+)
+@click.option(
+    "--archive-interval",
+    type=float,
+    default=None,
+    help="Archival sweep interval in seconds (disabled by default)",
+)
+@click.option(
+    "--archive-after",
+    type=int,
+    default=300,
+    help="Archive jobs older than N seconds (default: 300)",
+)
+@click.option(
+    "--memory-limit-mb",
+    type=int,
+    default=None,
+    help="RSS limit in MB — triggers emergency archival (disabled by default)",
+)
 def worker(
     db: str | None,
     app_string: str | None,
@@ -96,9 +114,12 @@ def worker(
 # qler health
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--port", type=int, default=None, help="TCP port of health endpoint")
-@click.option("--socket", "socket_path", type=str, default=None, help="Unix socket path of health endpoint")
+@click.option(
+    "--socket", "socket_path", type=str, default=None, help="Unix socket path of health endpoint"
+)
 @click.option("--host", default="127.0.0.1", help="Host for TCP health endpoint")
 @click.option("--timeout", default=5.0, type=float, help="Connection timeout in seconds")
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")

@@ -21,6 +21,7 @@ from qler.queue import Queue
 # qler init
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
@@ -65,9 +66,12 @@ def init(db: str, output_json: bool) -> None:
 # qler backup
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--db", required=True, envvar="QLER_DB", help="Database file path")
-@click.option("--to", "destination", required=True, type=click.Path(), help="Backup destination path")
+@click.option(
+    "--to", "destination", required=True, type=click.Path(), help="Backup destination path"
+)
 @click.option("--json", "output_json", is_flag=True, help="Output JSON")
 def backup(db: str, destination: str, output_json: bool) -> None:
     """Create a safe online backup of the qler database."""

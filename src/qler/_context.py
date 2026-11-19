@@ -67,12 +67,14 @@ async def set_progress(percent: int, message: str = "") -> None:
             "This function can only be used inside a @task-decorated function."
         )
 
-    await Job.query().filter(
-        (F("ulid") == job.ulid) & (F("worker_id") == job.worker_id)
-    ).update_one(
-        progress=percent,
-        progress_message=message,
-        updated_at=now_epoch(),
+    await (
+        Job.query()
+        .filter((F("ulid") == job.ulid) & (F("worker_id") == job.worker_id))
+        .update_one(
+            progress=percent,
+            progress_message=message,
+            updated_at=now_epoch(),
+        )
     )
     # Update local instance too
     job.progress = percent

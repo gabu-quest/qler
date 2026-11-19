@@ -47,23 +47,27 @@ def populated_db(db_path):
         # 1 completed
         j = await q.enqueue("myapp.tasks.done", queue_name="default")
         now = now_epoch()
-        await Job.query().filter(
-            (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-        ).update_one(
-            status=JobStatus.COMPLETED.value,
-            finished_at=now,
-            updated_at=now,
+        await (
+            Job.query()
+            .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+            .update_one(
+                status=JobStatus.COMPLETED.value,
+                finished_at=now,
+                updated_at=now,
+            )
         )
         # 1 failed
         j2 = await q.enqueue("myapp.tasks.fail", queue_name="default")
-        await Job.query().filter(
-            (F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value)
-        ).update_one(
-            status=JobStatus.FAILED.value,
-            last_error="Something went wrong",
-            last_failure_kind=FailureKind.EXCEPTION.value,
-            finished_at=now,
-            updated_at=now,
+        await (
+            Job.query()
+            .filter((F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value))
+            .update_one(
+                status=JobStatus.FAILED.value,
+                last_error="Something went wrong",
+                last_failure_kind=FailureKind.EXCEPTION.value,
+                finished_at=now,
+                updated_at=now,
+            )
         )
         await q.close()
 
@@ -637,9 +641,11 @@ class TestJobs:
             j = await q.enqueue("tasks.old", queue_name="default")
             # Manually set created_at to 2 hours ago
             old_ts = now_epoch() - 7200
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(created_at=old_ts, updated_at=old_ts)
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(created_at=old_ts, updated_at=old_ts)
+            )
             await q.close()
 
         asyncio.run(_setup())
@@ -686,7 +692,7 @@ class TestJob:
         # Payload is pretty-printed JSON with indent=2
         assert '"args"' in result.output
         assert "1," in result.output  # first arg
-        assert "2" in result.output   # second arg
+        assert "2" in result.output  # second arg
         assert '"key": "val"' in result.output
 
     def test_detail_json(self, runner, db_path):
@@ -717,9 +723,11 @@ class TestJob:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.hello")
             # Corrupt the payload
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(payload_json="NOT VALID JSON")
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(payload_json="NOT VALID JSON")
+            )
             await q.close()
             return j.ulid
 
@@ -736,14 +744,16 @@ class TestJob:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.fail")
             now = now_epoch()
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.FAILED.value,
-                last_error="Division by zero",
-                last_failure_kind=FailureKind.EXCEPTION.value,
-                finished_at=now,
-                updated_at=now,
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.FAILED.value,
+                    last_error="Division by zero",
+                    last_failure_kind=FailureKind.EXCEPTION.value,
+                    finished_at=now,
+                    updated_at=now,
+                )
             )
             await q.close()
             return j.ulid
@@ -873,13 +883,15 @@ class TestRetry:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.fail")
             now = now_epoch()
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.FAILED.value,
-                last_error="err",
-                finished_at=now,
-                updated_at=now,
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.FAILED.value,
+                    last_error="err",
+                    finished_at=now,
+                    updated_at=now,
+                )
             )
             await q.close()
             return j.ulid
@@ -921,13 +933,15 @@ class TestRetry:
             now = now_epoch()
             for i in range(3):
                 j = await q.enqueue(f"myapp.tasks.fail_{i}")
-                await Job.query().filter(
-                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-                ).update_one(
-                    status=JobStatus.FAILED.value,
-                    last_error="err",
-                    finished_at=now,
-                    updated_at=now,
+                await (
+                    Job.query()
+                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                    .update_one(
+                        status=JobStatus.FAILED.value,
+                        last_error="err",
+                        finished_at=now,
+                        updated_at=now,
+                    )
                 )
                 ulids.append(j.ulid)
             await q.close()
@@ -952,13 +966,15 @@ class TestRetry:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.fail")
             now = now_epoch()
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.FAILED.value,
-                last_error="err",
-                finished_at=now,
-                updated_at=now,
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.FAILED.value,
+                    last_error="err",
+                    finished_at=now,
+                    updated_at=now,
+                )
             )
             await q.close()
             return j.ulid
@@ -980,20 +996,20 @@ class TestRetry:
             # 2 failed with task_a, 1 failed with task_b
             for task_name in ["task_a", "task_a", "task_b"]:
                 j = await q.enqueue(f"myapp.{task_name}")
-                await Job.query().filter(
-                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-                ).update_one(
-                    status=JobStatus.FAILED.value,
-                    last_error="err",
-                    finished_at=now,
-                    updated_at=now,
+                await (
+                    Job.query()
+                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                    .update_one(
+                        status=JobStatus.FAILED.value,
+                        last_error="err",
+                        finished_at=now,
+                        updated_at=now,
+                    )
                 )
             await q.close()
 
         asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "retry", "--db", db_path, "--all", "--task", "myapp.task_a"
-        ])
+        result = runner.invoke(cli, ["retry", "--db", db_path, "--all", "--task", "myapp.task_a"])
         assert result.exit_code == 0
         assert "Retried 2 job" in result.output
 
@@ -1035,12 +1051,14 @@ class TestCancel:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.done")
             now = now_epoch()
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now,
-                updated_at=now,
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.COMPLETED.value,
+                    finished_at=now,
+                    updated_at=now,
+                )
             )
             await q.close()
             return j.ulid
@@ -1077,9 +1095,7 @@ class TestCancel:
             await q.close()
 
         asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "cancel", "--db", db_path, "--all", "--queue", "urgent"
-        ])
+        result = runner.invoke(cli, ["cancel", "--db", db_path, "--all", "--queue", "urgent"])
         assert result.exit_code == 0
         assert "Cancelled 2 job" in result.output
 
@@ -1095,9 +1111,7 @@ class TestCancel:
             await q.close()
 
         asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "cancel", "--db", db_path, "--all", "--task", "myapp.task_a"
-        ])
+        result = runner.invoke(cli, ["cancel", "--db", db_path, "--all", "--task", "myapp.task_a"])
         assert result.exit_code == 0
         assert "Cancelled 2 job" in result.output
 
@@ -1140,30 +1154,32 @@ class TestPurge:
             old_ts = now_epoch() - 86400 * 10  # 10 days ago
             for i in range(3):
                 j = await q.enqueue(f"myapp.tasks.old_{i}")
-                await Job.query().filter(
-                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-                ).update_one(
-                    status=JobStatus.COMPLETED.value,
-                    created_at=old_ts,
-                    finished_at=old_ts,
-                    updated_at=old_ts,
+                await (
+                    Job.query()
+                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                    .update_one(
+                        status=JobStatus.COMPLETED.value,
+                        created_at=old_ts,
+                        finished_at=old_ts,
+                        updated_at=old_ts,
+                    )
                 )
             # 1 recent completed (should not be purged)
             j = await q.enqueue("myapp.tasks.recent")
             now = now_epoch()
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.COMPLETED.value,
-                finished_at=now,
-                updated_at=now,
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.COMPLETED.value,
+                    finished_at=now,
+                    updated_at=now,
+                )
             )
             await q.close()
 
         asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "purge", "--db", db_path, "--older-than", "7d"
-        ])
+        result = runner.invoke(cli, ["purge", "--db", db_path, "--older-than", "7d"])
         assert result.exit_code == 0
         assert "Purged 3 jobs" in result.output
 
@@ -1177,30 +1193,34 @@ class TestPurge:
             # 2 old failed
             for i in range(2):
                 j = await q.enqueue(f"myapp.tasks.fail_{i}")
-                await Job.query().filter(
-                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-                ).update_one(
-                    status=JobStatus.FAILED.value,
+                await (
+                    Job.query()
+                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                    .update_one(
+                        status=JobStatus.FAILED.value,
+                        created_at=old_ts,
+                        finished_at=old_ts,
+                        updated_at=old_ts,
+                    )
+                )
+            # 1 old completed (should not be purged when filtering by failed)
+            j = await q.enqueue("myapp.tasks.done")
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.COMPLETED.value,
                     created_at=old_ts,
                     finished_at=old_ts,
                     updated_at=old_ts,
                 )
-            # 1 old completed (should not be purged when filtering by failed)
-            j = await q.enqueue("myapp.tasks.done")
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.COMPLETED.value,
-                created_at=old_ts,
-                finished_at=old_ts,
-                updated_at=old_ts,
             )
             await q.close()
 
         asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "purge", "--db", db_path, "--older-than", "7d", "--status", "failed"
-        ])
+        result = runner.invoke(
+            cli, ["purge", "--db", db_path, "--older-than", "7d", "--status", "failed"]
+        )
         assert result.exit_code == 0
         assert "Purged 2 jobs" in result.output
 
@@ -1212,9 +1232,7 @@ class TestPurge:
 
     def test_json_output(self, runner, db_path):
         runner.invoke(cli, ["init", "--db", db_path])
-        result = runner.invoke(cli, [
-            "purge", "--db", db_path, "--older-than", "1d", "--json"
-        ])
+        result = runner.invoke(cli, ["purge", "--db", db_path, "--older-than", "1d", "--json"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["purged"] == 0
@@ -1230,13 +1248,15 @@ class TestPurge:
             await q.init_db()
             old_ts = now_epoch() - 86400 * 10
             j = await q.enqueue("myapp.tasks.old")
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.COMPLETED.value,
-                created_at=old_ts,
-                finished_at=old_ts,
-                updated_at=old_ts,
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.COMPLETED.value,
+                    created_at=old_ts,
+                    finished_at=old_ts,
+                    updated_at=old_ts,
+                )
             )
             # Add an attempt for the job
             a = JobAttempt(
@@ -1253,9 +1273,7 @@ class TestPurge:
             return j.ulid
 
         job_ulid = asyncio.run(_setup())
-        result = runner.invoke(cli, [
-            "purge", "--db", db_path, "--older-than", "7d"
-        ])
+        result = runner.invoke(cli, ["purge", "--db", db_path, "--older-than", "7d"])
         assert result.exit_code == 0
         assert "Purged 1 jobs" in result.output
 
@@ -1266,9 +1284,8 @@ class TestPurge:
             q = Queue(db_path)
             await q.init_db()
             from sqler import F
-            remaining = await JobAttempt.query().filter(
-                F("job_ulid") == job_ulid
-            ).all()
+
+            remaining = await JobAttempt.query().filter(F("job_ulid") == job_ulid).all()
             await q.close()
             return len(remaining)
 
@@ -1310,13 +1327,15 @@ class TestDoctor:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.stuck")
             expired_ts = now_epoch() - 600  # 10 min ago
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.RUNNING.value,
-                worker_id="dead-worker",
-                lease_expires_at=expired_ts,
-                updated_at=now_epoch(),
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(
+                    status=JobStatus.RUNNING.value,
+                    worker_id="dead-worker",
+                    lease_expires_at=expired_ts,
+                    updated_at=now_epoch(),
+                )
             )
             await q.close()
 
@@ -1334,9 +1353,11 @@ class TestDoctor:
             await q.init_db()
             j = await q.enqueue("myapp.tasks.stale")
             stale_ts = now_epoch() - 86400 * 2  # 2 days ago
-            await Job.query().filter(
-                (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(created_at=stale_ts, updated_at=stale_ts)
+            await (
+                Job.query()
+                .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                .update_one(created_at=stale_ts, updated_at=stale_ts)
+            )
             await q.close()
 
         asyncio.run(_setup())
@@ -1401,9 +1422,21 @@ class TestVersionHelp:
 
     def test_all_commands_have_help(self, runner):
         commands = [
-            "init", "backup", "worker", "status", "jobs", "job",
-            "attempts", "retry", "cancel", "purge", "doctor",
-            "dlq", "health", "tasks", "logs",
+            "init",
+            "backup",
+            "worker",
+            "status",
+            "jobs",
+            "job",
+            "attempts",
+            "retry",
+            "cancel",
+            "purge",
+            "doctor",
+            "dlq",
+            "health",
+            "tasks",
+            "logs",
         ]
         for cmd in commands:
             result = runner.invoke(cli, [cmd, "--help"])
@@ -1434,8 +1467,9 @@ def dlq_populated_db(db_path):
         for i in range(3):
             j = await q.enqueue(f"myapp.tasks.fail_{i}", queue_name="default", max_retries=0)
             claimed = await q.claim_job("w1", ["default"])
-            await q.fail_job(claimed, "w1", ValueError(f"error_{i}"),
-                             failure_kind=FailureKind.EXCEPTION)
+            await q.fail_job(
+                claimed, "w1", ValueError(f"error_{i}"), failure_kind=FailureKind.EXCEPTION
+            )
 
         # 1 job still pending (not in DLQ)
         await q.enqueue("myapp.tasks.pending", queue_name="default")
@@ -1487,18 +1521,16 @@ class TestDLQCli:
         assert data["data"] == []
 
     def test_dlq_list_filter_task(self, runner, dlq_populated_db):
-        result = runner.invoke(cli, [
-            "dlq", "--db", dlq_populated_db, "list", "--task", "myapp.tasks.fail_0"
-        ])
+        result = runner.invoke(
+            cli, ["dlq", "--db", dlq_populated_db, "list", "--task", "myapp.tasks.fail_0"]
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["count"] == 1
         assert data["data"][0]["task"] == "myapp.tasks.fail_0"
 
     def test_dlq_list_limit(self, runner, dlq_populated_db):
-        result = runner.invoke(cli, [
-            "dlq", "--db", dlq_populated_db, "list", "--limit", "2"
-        ])
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "list", "--limit", "2"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["count"] == 2
@@ -1512,9 +1544,7 @@ class TestDLQCli:
         assert data["count"] == 3
 
     def test_dlq_count_human(self, runner, dlq_populated_db):
-        result = runner.invoke(cli, [
-            "dlq", "--db", dlq_populated_db, "--human", "count"
-        ])
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "--human", "count"])
         assert result.exit_code == 0
         assert "Count: 3" in result.output
 
@@ -1568,9 +1598,9 @@ class TestDLQCli:
         list_result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "list"])
         ulid = json.loads(list_result.output)["data"][0]["ulid"]
 
-        result = runner.invoke(cli, [
-            "dlq", "--db", dlq_populated_db, "replay", ulid, "--queue", "retry_queue"
-        ])
+        result = runner.invoke(
+            cli, ["dlq", "--db", dlq_populated_db, "replay", ulid, "--queue", "retry_queue"]
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["data"][0]["queue_name"] == "retry_queue"
@@ -1596,9 +1626,7 @@ class TestDLQCli:
 
     def test_dlq_replay_not_found(self, runner, db_path):
         runner.invoke(cli, ["init", "--db", db_path])
-        result = runner.invoke(cli, [
-            "dlq", "--db", db_path, "replay", "NONEXISTENT"
-        ])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "replay", "NONEXISTENT"])
         assert result.exit_code == 1
         assert "NONEXISTENT" in result.output
 
@@ -1609,17 +1637,13 @@ class TestDLQCli:
         assert "Provide a job ULID or use --all" in result.output
 
     def test_dlq_replay_human(self, runner, dlq_populated_db):
-        result = runner.invoke(cli, [
-            "dlq", "--db", dlq_populated_db, "--human", "replay", "--all"
-        ])
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "--human", "replay", "--all"])
         assert result.exit_code == 0
         assert "Replayed 3 job(s)" in result.output
         assert "default" in result.output  # all three replay to original queue
 
     def test_dlq_purge_with_confirm(self, runner, dlq_populated_db):
-        result = runner.invoke(cli, [
-            "dlq", "--db", dlq_populated_db, "purge", "--confirm"
-        ])
+        result = runner.invoke(cli, ["dlq", "--db", dlq_populated_db, "purge", "--confirm"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["ok"] is True
@@ -1651,26 +1675,30 @@ class TestDLQCli:
             for i in range(2):
                 j = await q.enqueue(f"tasks.old_{i}", max_retries=0)
                 claimed = await q.claim_job("w1", ["default"])
-                await q.fail_job(claimed, "w1", ValueError("old"),
-                                 failure_kind=FailureKind.EXCEPTION)
+                await q.fail_job(
+                    claimed, "w1", ValueError("old"), failure_kind=FailureKind.EXCEPTION
+                )
                 # Backdate created_at
-                await Job.query().filter(F("ulid") == j.ulid).update_one(
-                    created_at=old_ts,
+                await (
+                    Job.query()
+                    .filter(F("ulid") == j.ulid)
+                    .update_one(
+                        created_at=old_ts,
+                    )
                 )
 
             # 1 recent DLQ job
             j = await q.enqueue("tasks.recent", max_retries=0)
             claimed = await q.claim_job("w1", ["default"])
-            await q.fail_job(claimed, "w1", ValueError("recent"),
-                             failure_kind=FailureKind.EXCEPTION)
+            await q.fail_job(
+                claimed, "w1", ValueError("recent"), failure_kind=FailureKind.EXCEPTION
+            )
 
             await q.close()
 
         asyncio.run(_setup())
 
-        result = runner.invoke(cli, [
-            "dlq", "--db", db_path, "purge", "--older-than", "7d"
-        ])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "purge", "--older-than", "7d"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["count"] == 2
@@ -1680,9 +1708,9 @@ class TestDLQCli:
         assert json.loads(count_result.output)["count"] == 1
 
     def test_dlq_purge_human(self, runner, dlq_populated_db):
-        result = runner.invoke(cli, [
-            "dlq", "--db", dlq_populated_db, "--human", "purge", "--confirm"
-        ])
+        result = runner.invoke(
+            cli, ["dlq", "--db", dlq_populated_db, "--human", "purge", "--confirm"]
+        )
         assert result.exit_code == 0
         assert "Count: 3" in result.output
 
@@ -1695,8 +1723,7 @@ class TestDLQCli:
             await q.init_db()
             j = await q.enqueue("tasks.fail", max_retries=0)
             claimed = await q.claim_job("w1", ["default"])
-            await q.fail_job(claimed, "w1", ValueError("oops"),
-                             failure_kind=FailureKind.EXCEPTION)
+            await q.fail_job(claimed, "w1", ValueError("oops"), failure_kind=FailureKind.EXCEPTION)
             await q.close()
 
         asyncio.run(_setup())
@@ -1706,9 +1733,7 @@ class TestDLQCli:
         assert json.loads(result.output)["count"] == 0
 
         # Custom DLQ name finds it
-        result = runner.invoke(cli, [
-            "dlq", "--db", db_path, "--dlq", "my_failures", "count"
-        ])
+        result = runner.invoke(cli, ["dlq", "--db", db_path, "--dlq", "my_failures", "count"])
         assert json.loads(result.output)["count"] == 1
 
     def test_dlq_json_envelope_error(self, runner, db_path):
@@ -1736,9 +1761,7 @@ class TestHealthCommand:
         assert "Either --port or --socket is required" in result.output
 
     def test_health_rejects_both_port_and_socket(self, runner):
-        result = runner.invoke(cli, [
-            "health", "--port", "9100", "--socket", "/tmp/h.sock"
-        ])
+        result = runner.invoke(cli, ["health", "--port", "9100", "--socket", "/tmp/h.sock"])
         assert result.exit_code == 2
         assert "mutually exclusive" in result.output
 
@@ -1771,20 +1794,25 @@ class TestHealthCommand:
 
         def mock_create_connection(address, timeout=None):
             class FakeSocket:
-                def sendall(self, data): pass
+                def sendall(self, data):
+                    pass
+
                 def recv(self, size):
-                    if not hasattr(self, '_sent'):
+                    if not hasattr(self, "_sent"):
                         self._sent = True
                         return response
                     return b""
-                def close(self): pass
-                def settimeout(self, t): pass
+
+                def close(self):
+                    pass
+
+                def settimeout(self, t):
+                    pass
+
             return FakeSocket()
 
         with patch("qler.cli.workers.socket_mod.create_connection", mock_create_connection):
-            result = runner.invoke(cli, [
-                "health", "--port", "9100", "--json"
-            ])
+            result = runner.invoke(cli, ["health", "--port", "9100", "--json"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["status"] == "healthy"
@@ -1818,20 +1846,25 @@ class TestHealthCommand:
 
         def mock_create_connection(address, timeout=None):
             class FakeSocket:
-                def sendall(self, data): pass
+                def sendall(self, data):
+                    pass
+
                 def recv(self, size):
-                    if not hasattr(self, '_sent'):
+                    if not hasattr(self, "_sent"):
                         self._sent = True
                         return response
                     return b""
-                def close(self): pass
-                def settimeout(self, t): pass
+
+                def close(self):
+                    pass
+
+                def settimeout(self, t):
+                    pass
+
             return FakeSocket()
 
         with patch("qler.cli.workers.socket_mod.create_connection", mock_create_connection):
-            result = runner.invoke(cli, [
-                "health", "--port", "9100"
-            ])
+            result = runner.invoke(cli, ["health", "--port", "9100"])
         assert result.exit_code == 0
         assert "healthy" in result.output
         assert "host:1:ABCD" in result.output
@@ -1875,7 +1908,10 @@ class TestTasksCommand:
     def test_tasks_lists_registered(self, runner, tmp_path):
         """Lists tasks with correct path, queue, config in human table."""
         db_path = str(tmp_path / "test.db")
-        mod_dir = _write_task_module(tmp_path, "_tasks_app.py", f"""
+        mod_dir = _write_task_module(
+            tmp_path,
+            "_tasks_app.py",
+            f"""
 from qler import Queue, task
 
 q = Queue("{db_path}")
@@ -1887,8 +1923,10 @@ async def send_email():
 @task(q, queue_name="urgent", sync=True)
 def process_sync():
     pass
-""")
+""",
+        )
         import sys
+
         sys.path.insert(0, mod_dir)
         try:
             result = runner.invoke(cli, ["tasks", "--app", "_tasks_app:q"])
@@ -1920,7 +1958,10 @@ def process_sync():
     def test_tasks_json_output(self, runner, tmp_path):
         """JSON output has all expected fields with correct values."""
         db_path = str(tmp_path / "test.db")
-        mod_dir = _write_task_module(tmp_path, "_tasks_json.py", f"""
+        mod_dir = _write_task_module(
+            tmp_path,
+            "_tasks_json.py",
+            f"""
 from qler import Queue, task
 
 q = Queue("{db_path}", default_max_retries=2, default_retry_delay=30)
@@ -1928,8 +1969,10 @@ q = Queue("{db_path}", default_max_retries=2, default_retry_delay=30)
 @task(q, max_retries=5, retry_delay=15, priority=10, lease_duration=600)
 async def my_task():
     pass
-""")
+""",
+        )
         import sys
+
         sys.path.insert(0, mod_dir)
         try:
             result = runner.invoke(cli, ["tasks", "--app", "_tasks_json:q", "--json"])
@@ -1955,7 +1998,10 @@ async def my_task():
     def test_tasks_shows_rate_limit(self, runner, tmp_path):
         """Rate-limited tasks show rate spec string."""
         db_path = str(tmp_path / "test.db")
-        mod_dir = _write_task_module(tmp_path, "_tasks_rate.py", f"""
+        mod_dir = _write_task_module(
+            tmp_path,
+            "_tasks_rate.py",
+            f"""
 from qler import Queue, task
 
 q = Queue("{db_path}")
@@ -1963,8 +2009,10 @@ q = Queue("{db_path}")
 @task(q, rate_limit="10/m")
 async def rate_limited():
     pass
-""")
+""",
+        )
         import sys
+
         sys.path.insert(0, mod_dir)
         try:
             result = runner.invoke(cli, ["tasks", "--app", "_tasks_rate:q", "--json"])
@@ -1979,7 +2027,10 @@ async def rate_limited():
     def test_tasks_shows_cron(self, runner, tmp_path):
         """Cron tasks show cron expression."""
         db_path = str(tmp_path / "test.db")
-        mod_dir = _write_task_module(tmp_path, "_tasks_cron.py", f"""
+        mod_dir = _write_task_module(
+            tmp_path,
+            "_tasks_cron.py",
+            f"""
 from qler import Queue, cron
 
 q = Queue("{db_path}")
@@ -1987,8 +2038,10 @@ q = Queue("{db_path}")
 @cron(q, "*/5 * * * *")
 async def periodic_cleanup():
     pass
-""")
+""",
+        )
         import sys
+
         sys.path.insert(0, mod_dir)
         try:
             result = runner.invoke(cli, ["tasks", "--app", "_tasks_cron:q", "--json"])
@@ -2005,7 +2058,10 @@ async def periodic_cleanup():
         import asyncio
 
         db_path = str(tmp_path / "test.db")
-        mod_dir = _write_task_module(tmp_path, "_tasks_count.py", f"""
+        mod_dir = _write_task_module(
+            tmp_path,
+            "_tasks_count.py",
+            f"""
 from qler import Queue, task
 
 q = Queue("{db_path}")
@@ -2013,14 +2069,18 @@ q = Queue("{db_path}")
 @task(q)
 async def counted_task():
     pass
-""")
+""",
+        )
         import sys
+
         sys.path.insert(0, mod_dir)
         try:
+
             async def _setup():
                 from sqler import F
 
                 from qler.enums import FailureKind
+
                 mod = __import__("_tasks_count")
                 q = mod.q
                 await q.init_db()
@@ -2031,20 +2091,27 @@ async def counted_task():
                 await q.enqueue(task_path)
                 # 1 completed (should NOT count)
                 j = await q.enqueue(task_path)
-                await Job.query().filter(
-                    (F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value)
-                ).update_one(
-                    status=JobStatus.COMPLETED.value, finished_at=now, updated_at=now,
+                await (
+                    Job.query()
+                    .filter((F("ulid") == j.ulid) & (F("status") == JobStatus.PENDING.value))
+                    .update_one(
+                        status=JobStatus.COMPLETED.value,
+                        finished_at=now,
+                        updated_at=now,
+                    )
                 )
                 # 1 failed (should NOT count)
                 j2 = await q.enqueue(task_path)
-                await Job.query().filter(
-                    (F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value)
-                ).update_one(
-                    status=JobStatus.FAILED.value,
-                    last_error="err",
-                    last_failure_kind=FailureKind.EXCEPTION.value,
-                    finished_at=now, updated_at=now,
+                await (
+                    Job.query()
+                    .filter((F("ulid") == j2.ulid) & (F("status") == JobStatus.PENDING.value))
+                    .update_one(
+                        status=JobStatus.FAILED.value,
+                        last_error="err",
+                        last_failure_kind=FailureKind.EXCEPTION.value,
+                        finished_at=now,
+                        updated_at=now,
+                    )
                 )
                 await q.close()
 
@@ -2062,7 +2129,10 @@ async def counted_task():
     def test_tasks_filter_by_queue(self, runner, tmp_path):
         """--queue filters to tasks in that queue only."""
         db_path = str(tmp_path / "test.db")
-        mod_dir = _write_task_module(tmp_path, "_tasks_filter.py", f"""
+        mod_dir = _write_task_module(
+            tmp_path,
+            "_tasks_filter.py",
+            f"""
 from qler import Queue, task
 
 q = Queue("{db_path}")
@@ -2074,23 +2144,25 @@ async def send_email():
 @task(q, queue_name="reports")
 async def generate_report():
     pass
-""")
+""",
+        )
         import sys
+
         sys.path.insert(0, mod_dir)
         try:
             # Filter to emails only
-            result = runner.invoke(cli, [
-                "tasks", "--app", "_tasks_filter:q", "--json", "--queue", "emails"
-            ])
+            result = runner.invoke(
+                cli, ["tasks", "--app", "_tasks_filter:q", "--json", "--queue", "emails"]
+            )
             assert result.exit_code == 0
             data = json.loads(result.output)
             assert len(data) == 1
             assert data[0]["task"] == "_tasks_filter.send_email"
 
             # Filter to reports only
-            result = runner.invoke(cli, [
-                "tasks", "--app", "_tasks_filter:q", "--json", "--queue", "reports"
-            ])
+            result = runner.invoke(
+                cli, ["tasks", "--app", "_tasks_filter:q", "--json", "--queue", "reports"]
+            )
             assert result.exit_code == 0
             data = json.loads(result.output)
             assert len(data) == 1
@@ -2177,9 +2249,7 @@ class TestLogs:
     def test_logs_level_filter_positive(self, runner, logs_db):
         db_path, ulid = logs_db
         # DB-sourced entries are INFO — filtering to INFO should find them
-        result = runner.invoke(cli, [
-            "logs", ulid, "--db", db_path, "--json", "--level", "INFO"
-        ])
+        result = runner.invoke(cli, ["logs", ulid, "--db", db_path, "--json", "--level", "INFO"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["total_matches"] >= 2
@@ -2187,9 +2257,7 @@ class TestLogs:
     def test_logs_level_filter_negative(self, runner, logs_db):
         db_path, ulid = logs_db
         # Filter to ERROR — no entries should match
-        result = runner.invoke(cli, [
-            "logs", ulid, "--db", db_path, "--json", "--level", "ERROR"
-        ])
+        result = runner.invoke(cli, ["logs", ulid, "--db", db_path, "--json", "--level", "ERROR"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["total_matches"] == 0
@@ -2218,9 +2286,7 @@ class TestLogs:
 
 
 class TestReadsThroughHeldQueue:
-    def test_job_reads_its_own_queue_after_another_was_initialised_last(
-        self, runner, tmp_path
-    ):
+    def test_job_reads_its_own_queue_after_another_was_initialised_last(self, runner, tmp_path):
         import asyncio
 
         path_a = str(tmp_path / "a.db")

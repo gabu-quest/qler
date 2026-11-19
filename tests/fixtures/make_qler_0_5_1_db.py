@@ -62,11 +62,17 @@ async def main(out_dir: Path) -> None:
     roles["limited_done"] = limited.ulid
 
     parent = await q.enqueue("fixture.task", args=(10,), queue_name="deps")
-    child_a = await q.enqueue("fixture.task", args=(11,), queue_name="deps", depends_on=[parent.ulid])
-    child_b = await q.enqueue("fixture.task", args=(12,), queue_name="deps", depends_on=[parent.ulid])
+    child_a = await q.enqueue(
+        "fixture.task", args=(11,), queue_name="deps", depends_on=[parent.ulid]
+    )
+    child_b = await q.enqueue(
+        "fixture.task", args=(12,), queue_name="deps", depends_on=[parent.ulid]
+    )
     roles["parent"], roles["child_a"], roles["child_b"] = parent.ulid, child_a.ulid, child_b.ulid
 
-    idem = await q.enqueue("fixture.task", args=(20,), queue_name="keys", idempotency_key="fixture-idem")
+    idem = await q.enqueue(
+        "fixture.task", args=(20,), queue_name="keys", idempotency_key="fixture-idem"
+    )
     uniq = await q.enqueue("fixture.task", args=(21,), queue_name="keys", unique_key="fixture-uniq")
     roles["idem"], roles["uniq"] = idem.ulid, uniq.ulid
 
