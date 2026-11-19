@@ -1094,25 +1094,6 @@ class TestDependencyStress:
 # ---------------------------------------------------------------------------
 
 
-def _raise_on_nth_update(monkeypatch, match, nth):
-    """Make the nth ``update_one`` whose fields satisfy ``match`` raise once.
-
-    Every other call, before and after, runs as usual.
-    """
-    original = AsyncSQLerQuerySet.update_one
-    seen = {"n": 0}
-
-    async def update_one(self, **fields):
-        if match(fields):
-            seen["n"] += 1
-            if seen["n"] == nth:
-                raise sqlite3.OperationalError("database is locked")
-        return await original(self, **fields)
-
-    monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
-    return seen
-
-
 def _is_decrement(fields):
     return "pending_dep_count" in fields
 
@@ -1128,13 +1109,15 @@ async def _job(ulid):
 class TestFinishIsOneWrite:
     """A stop between the parent's write and its children's writes strands nothing."""
 
-    async def test_complete_rolls_back_when_a_decrement_fails(self, queue, monkeypatch):
+    async def test_complete_rolls_back_when_a_decrement_fails(
+        self, queue, raise_on_nth_update
+    ):
         parent = await queue.enqueue("my.task")
         children = [await queue.enqueue("my.task", depends_on=[parent.ulid]) for _ in range(3)]
         claimed = await queue.claim_job("worker-1", ["default"])
         assert claimed.ulid == parent.ulid
 
-        _raise_on_nth_update(monkeypatch, _is_decrement, 2)
+        raise_on_nth_update(_is_decrement, 2)
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await queue.complete_job(claimed, "worker-1")
 
@@ -1151,14 +1134,16 @@ class TestFinishIsOneWrite:
         nxt = await queue.claim_job("worker-1", ["default"])
         assert nxt.ulid == children[0].ulid
 
-    async def test_fail_rolls_back_when_a_cascade_cancel_fails(self, queue, monkeypatch):
+    async def test_fail_rolls_back_when_a_cascade_cancel_fails(
+        self, queue, raise_on_nth_update
+    ):
         parent = await queue.enqueue("my.task")
         children = [await queue.enqueue("my.task", depends_on=[parent.ulid]) for _ in range(3)]
         grandchild = await queue.enqueue("my.task", depends_on=[children[0].ulid])
         claimed = await queue.claim_job("worker-1", ["default"])
         assert claimed.ulid == parent.ulid
 
-        _raise_on_nth_update(monkeypatch, _is_cascade_cancel, 2)
+        raise_on_nth_update(_is_cascade_cancel, 2)
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await queue.fail_job(claimed, "worker-1", ValueError("boom"))
 
@@ -1173,7 +1158,9 @@ class TestFinishIsOneWrite:
         assert (await _job(parent.ulid)).status == JobStatus.FAILED.value
         assert [(await _job(j.ulid)).status for j in dependents] == [JobStatus.CANCELLED.value] * 4
 
-    async def test_no_event_for_a_rolled_back_finish(self, queue, monkeypatch, caplog):
+    async def test_no_event_for_a_rolled_back_finish(
+        self, queue, monkeypatch, raise_on_nth_update, caplog
+    ):
         fired: list[str] = []
         monkeypatch.setattr("qler.queue._notify_fire", fired.append)
 
@@ -1192,10 +1179,10 @@ class TestFinishIsOneWrite:
 
         with caplog.at_level(logging.INFO, logger="qler.lifecycle"):
             caplog.clear()
-            _raise_on_nth_update(monkeypatch, _is_decrement, 2)
+            raise_on_nth_update(_is_decrement, 2)
             with pytest.raises(sqlite3.OperationalError):
                 await queue.complete_job(claimed_done, "worker-1")
-            _raise_on_nth_update(monkeypatch, _is_cascade_cancel, 2)
+            raise_on_nth_update(_is_cascade_cancel, 2)
             with pytest.raises(sqlite3.OperationalError):
                 await queue.fail_job(claimed_failed, "worker-1", ValueError("boom"))
             assert lifecycle_events() == []

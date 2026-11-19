@@ -1,8 +1,10 @@
 """Shared fixtures for qler tests."""
 
 import os
+import sqlite3
 import threading
 
+import pytest
 import pytest_asyncio
 
 
@@ -16,6 +18,7 @@ def pytest_sessionfinish(session, exitstatus):
     threading.Timer(5.0, os._exit, args=[exitstatus]).start()
 from qler.queue import Queue
 from sqler import AsyncSQLerDB
+from sqler.models.async_queryset import AsyncSQLerQuerySet
 
 
 @pytest_asyncio.fixture
@@ -73,3 +76,26 @@ async def assert_pool_healthy(db):
         f"Pool leak: {stats.available_connections}/{stats.max_connections} connections returned"
     )
     assert stats.in_use_connections == 0, "Connection still checked out"
+
+
+@pytest.fixture
+def raise_on_nth_update(monkeypatch):
+    """Return ``arm(match, nth=1)``: make the nth ``update_one`` whose fields satisfy
+    ``match`` raise ``database is locked`` once. Every other call runs as usual.
+    """
+
+    def arm(match, nth=1):
+        original = AsyncSQLerQuerySet.update_one
+        seen = {"n": 0}
+
+        async def update_one(self, **fields):
+            if match(fields):
+                seen["n"] += 1
+                if seen["n"] == nth:
+                    raise sqlite3.OperationalError("database is locked")
+            return await original(self, **fields)
+
+        monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
+        return seen
+
+    return arm

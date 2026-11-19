@@ -15,7 +15,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from sqler import AsyncSQLerDB, F
-from sqler.models.async_queryset import AsyncSQLerQuerySet
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required: @task rejects nested functions)
@@ -445,19 +444,10 @@ class TestImmediateFailWriteRaises:
     """A fail_job that raises in immediate mode reaches the caller with nothing written."""
 
     async def test_failed_fail_write_reaches_caller_and_leaves_job_running(
-        self, imm_queue, monkeypatch
+        self, imm_queue, raise_on_nth_update
     ):
-        original = AsyncSQLerQuerySet.update_one
-        seen = {"n": 0}
-
-        async def update_one(self, **fields):
-            if "last_failure_kind" in fields:  # fail_job's update of the job
-                seen["n"] += 1
-                if seen["n"] == 1:
-                    raise sqlite3.OperationalError("database is locked")
-            return await original(self, **fields)
-
-        monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
+        # fail_job's update of the job
+        raise_on_nth_update(lambda fields: "last_failure_kind" in fields)
 
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             await imm_queue.enqueue(f"{__name__}.boom_task")
