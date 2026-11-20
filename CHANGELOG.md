@@ -32,6 +32,8 @@ Requires `sqler>=1.2026.11.2`. The `logler` extra requires `logler>=2.0.0`, the 
 - **Enqueue refuses a bad payload before it waits for the write lock.**
 - `complete_job`, `fail_job`, `cancel_job` and `replay_job` called before `init_db()` raise `RuntimeError("Queue not initialized. Call init_db() first.")` where they raised an `AttributeError` or a `TypeError`.
 - `qler jobs` and `qler status` print `1 job`, not `1 jobs`.
+- **On Windows, a Unix-socket health endpoint is refused by name.** `Worker(health_socket=...)` raises `ConfigurationError` and `qler health --socket` exits with a usage error, each naming the port option. Before, both failed on a missing attribute at the moment of use.
+- **A fast job's duration is no longer 0 on Windows.** The worker times a job with `time.perf_counter()`; `time.monotonic()` moves in steps of about 16 ms there, so the duration histogram recorded 0 for a job faster than one step.
 
 ### Changed
 
