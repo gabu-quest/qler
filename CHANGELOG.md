@@ -4,6 +4,18 @@ All notable changes to qler will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-11-20
+
+### Fixed
+
+- **`pip install qler` installs everything qler needs.** qler's models are sqler's pydantic models, and sqler's core installs without pydantic, so `import qler` in a new environment raised `ImportError: AsyncSQLerSafeModel requires Pydantic`. 0.5.1 and 0.6.0 both did this; an environment that already had pydantic never showed it. qler now depends on `sqler[pydantic]`.
+- **Jobs enqueued back to back are claimed in the order they were enqueued.** Jobs of equal priority and eta are claimed by id, and two ids made as the millisecond turned could sort in the wrong order, so the second job could run first. Each id a process makes now sorts after the one before it, also when the clock steps back.
+- **A forked child no longer makes the id its parent makes next.** When both made an id in the millisecond of the parent's last one, the two ids were the same.
+
+### Development and CI
+
+- CI builds the wheel, installs it alone into a new environment, imports every module and runs one job (`tests/smoke_installed.py`). The publish workflow runs CI first, so a release that needs an undeclared package stops before the upload.
+
 ## [0.6.0] — 2026-11-20
 
 Requires `sqler>=1.2026.11.2`. The `logler` extra requires `logler>=2.0.0`, the first logler with wheels for Python 3.12 and later.
