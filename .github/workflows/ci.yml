@@ -63,3 +63,33 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: uv run --no-sync pytest -v --timeout=30 --timeout-method=thread -p no:cacheprovider --disable-warnings
+
+  # The test jobs install the development packages. This one has only what
+  # `pip install qler` brings, so a package qler needs and does not declare fails here.
+  installed:
+    name: Installed wheel, nothing else
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup UV
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel
+        run: uv build --wheel
+
+      - name: Install the wheel alone into a new environment
+        run: |
+          uv venv "$RUNNER_TEMP/installed"
+          uv pip install --python "$RUNNER_TEMP/installed/bin/python" dist/*.whl
+
+      - name: Import every module and run one job, outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/installed/bin/python" "$GITHUB_WORKSPACE/tests/smoke_installed.py"
+          "$RUNNER_TEMP/installed/bin/qler" --help
