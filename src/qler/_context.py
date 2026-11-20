@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from qler.models.job import Job
     from qler.queue import Queue
 
-_current_job: ContextVar[Optional["Job"]] = ContextVar("qler_current_job", default=None)
-_current_queue: ContextVar[Optional["Queue"]] = ContextVar("qler_current_queue", default=None)
+_current_job: ContextVar[Job | None] = ContextVar("qler_current_job", default=None)
+_current_queue: ContextVar[Queue | None] = ContextVar("qler_current_queue", default=None)
 
 
-def current_job() -> "Job":
+def current_job() -> Job:
     """Return the currently-executing Job.
 
     Raises:
@@ -28,7 +28,7 @@ def current_job() -> "Job":
     return job
 
 
-def current_queue() -> "Queue":
+def current_queue() -> Queue:
     """Return the Queue that owns the currently-executing job.
 
     Raises:
@@ -51,6 +51,7 @@ async def set_progress(percent: int, message: str = "") -> None:
     Raises:
         RuntimeError: If called outside a task execution context.
         ValueError: If percent is not in 0–100 range.
+        NotBoundError: (sqler) the current job was never enqueued or read.
     """
     from sqler import F
 
@@ -67,12 +68,14 @@ async def set_progress(percent: int, message: str = "") -> None:
             "This function can only be used inside a @task-decorated function."
         )
 
-    await Job.query().filter(
-        (F("ulid") == job.ulid) & (F("worker_id") == job.worker_id)
-    ).update_one(
-        progress=percent,
-        progress_message=message,
-        updated_at=now_epoch(),
+    await (
+        Job.beside(job)
+        .filter((F("ulid") == job.ulid) & (F("worker_id") == job.worker_id))
+        .update_one(
+            progress=percent,
+            progress_message=message,
+            updated_at=now_epoch(),
+        )
     )
     # Update local instance too
     job.progress = percent
@@ -83,6 +86,9 @@ async def is_cancellation_requested() -> bool:
     """Check if the current job has cancellation requested. Queries the DB.
 
     Returns False (not raises) when called outside a task context.
+
+    Raises:
+        NotBoundError: (sqler) the current job was never enqueued or read.
     """
     from sqler import F
 
@@ -91,7 +97,7 @@ async def is_cancellation_requested() -> bool:
     job = _current_job.get()
     if job is None:
         return False
-    refreshed = await Job.query().filter(F("ulid") == job.ulid).first()
+    refreshed = await Job.beside(job).filter(F("ulid") == job.ulid).first()
     if refreshed is None:
         return False
     # Only trust the flag if this worker still owns the job

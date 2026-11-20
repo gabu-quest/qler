@@ -4,16 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 import traceback as tb_module
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
-from sqler import AsyncSQLerDB, F
+from sqler import AsyncSQLerDB, AsyncSQLerQuerySet, F, SQLerExpression
+from sqler.exceptions import UniqueConstraintError
 
+from qler._cancel import cancel_job as _cancel_job
+from qler._cancel import cascade_cancel_dependents, children_by_parent
 from qler._context import _current_job
 from qler._notify import fire as _notify_fire
+from qler._schema import ensure_schema
+from qler._sqler import grouped_count
 from qler._time import generate_ulid, now_epoch
-from qler.enums import RETRYABLE_FAILURES, AttemptStatus, FailureKind, JobStatus
+from qler.enums import (
+    RETRYABLE_FAILURES,
+    TERMINAL_STATUSES,
+    AttemptStatus,
+    FailureKind,
+    JobStatus,
+)
 from qler.exceptions import (
     ConfigurationError,
     DependencyError,
@@ -23,8 +35,14 @@ from qler.exceptions import (
 )
 from qler.lifecycle import emit as _lifecycle
 from qler.models.attempt import JobAttempt
-from qler.models.bucket import RateLimitBucket
-from qler.models.job import Job
+from qler.models.dependency import JobDependency
+from qler.models.job import (
+    ARCHIVE_TABLE,
+    Job,
+    failed_to_pending_fields,
+    key_active,
+    unique_key_conflict,
+)
 from qler.rate_limit import RateSpec, parse_rate, try_acquire
 
 if TYPE_CHECKING:
@@ -37,6 +55,8 @@ if TYPE_CHECKING:
 _MAX_TRACEBACK_LENGTH = 8_192
 _MAX_ERROR_LENGTH = 1_024
 _MAX_RETRY_DELAY = 86_400  # 24 hours
+
+logger = logging.getLogger(__name__)
 
 
 class Queue:
@@ -55,13 +75,13 @@ class Queue:
         default_max_retries: int = 0,
         default_retry_delay: int = 60,
         max_payload_size: int = 1_000_000,
-        rate_limits: Optional[dict[str, str]] = None,
-        dlq: Optional[str] = None,
-        metrics: Union[bool, "CollectorRegistry"] = False,
+        rate_limits: dict[str, str] | None = None,
+        dlq: str | None = None,
+        metrics: bool | CollectorRegistry = False,
     ) -> None:
         if isinstance(db, str):
-            self._db_path: Optional[str] = db
-            self._db: Optional[AsyncSQLerDB] = None
+            self._db_path: str | None = db
+            self._db: AsyncSQLerDB | None = None
             self._owns_db = True
         else:
             self._db_path = None
@@ -69,9 +89,7 @@ class Queue:
             self._owns_db = False
 
         if default_retry_delay < 1:
-            raise ConfigurationError(
-                f"default_retry_delay must be >= 1, got {default_retry_delay}"
-            )
+            raise ConfigurationError(f"default_retry_delay must be >= 1, got {default_retry_delay}")
 
         self.immediate = immediate
         self.default_lease_duration = default_lease_duration
@@ -80,7 +98,7 @@ class Queue:
         self.max_payload_size = max_payload_size
         self._tasks: dict[str, TaskWrapper] = {}
         self._cron_tasks: dict[str, CronWrapper] = {}
-        self._dlq: Optional[str] = dlq
+        self._dlq: str | None = dlq
         self._rate_limits: dict[str, RateSpec] = {}
         if rate_limits:
             for queue_name, spec in rate_limits.items():
@@ -88,14 +106,14 @@ class Queue:
         self._initialized = False
 
         # Metrics (opt-in)
-        self._metrics: Optional[QlerMetrics] = None
+        self._metrics: QlerMetrics | None = None
         if metrics is not False:
             try:
                 from qler.metrics import QlerMetrics as _QM  # noqa: N814
-            except ImportError:
+            except ImportError as exc:
                 raise ConfigurationError(
                     "prometheus-client required: pip install 'qler[metrics]'"
-                )
+                ) from exc
             if metrics is True:
                 self._metrics = _QM()
             else:
@@ -115,57 +133,25 @@ class Queue:
             raise RuntimeError("Queue not initialized. Call init_db() first.")
         return self._db
 
-    async def _migrate_schema(self) -> None:
-        """Apply qler-owned schema migrations before ensure/create steps."""
-        await self._migrate_rate_limit_bucket_key_column()
+    @property
+    def jobs(self) -> AsyncSQLerQuerySet[Job]:
+        """This queue's jobs table, as a sqler queryset bound to its own database."""
+        return Job.using(self.db, Job.__tablename__)
 
-    async def _migrate_rate_limit_bucket_key_column(self) -> None:
-        """Rename the legacy reserved-word bucket column to ``bucket_key``."""
-        cur = await self._db.adapter.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='qler_rate_limit_buckets';"
-        )
-        try:
-            row = await cur.fetchone()
-        finally:
-            await cur.close()
-        if row is None:
-            return
+    @property
+    def attempts(self) -> AsyncSQLerQuerySet[JobAttempt]:
+        """This queue's job-attempts table, as a sqler queryset bound to its own database."""
+        return JobAttempt.using(self.db, JobAttempt.__tablename__)
 
-        cur = await self._db.adapter.execute('PRAGMA table_info("qler_rate_limit_buckets");')
-        try:
-            columns = {col[1] for col in await cur.fetchall()}
-        finally:
-            await cur.close()
+    @property
+    def archive(self) -> AsyncSQLerQuerySet[Job]:
+        """This queue's archived-jobs table, as a sqler queryset bound to its own database."""
+        return Job.using(self.db, ARCHIVE_TABLE)
 
-        if "key" in columns and "bucket_key" not in columns:
-            cur = await self._db.adapter.execute(
-                'ALTER TABLE "qler_rate_limit_buckets" RENAME COLUMN "key" TO bucket_key'
-            )
-            await cur.close()
-            await self._db.adapter.auto_commit()
-
-    async def _create_unique_indexes(self) -> None:
-        """Create explicit uniqueness guarantees for promoted columns."""
-        adapter = self._db.adapter
-        indexes = [
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_jobs_ulid ON qler_jobs (ulid)",
-            (
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_job_attempts_ulid "
-                "ON qler_job_attempts (ulid)"
-            ),
-            (
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_rate_limit_buckets_bucket_key "
-                "ON qler_rate_limit_buckets (bucket_key)"
-            ),
-            (
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_qler_jobs_archive_ulid "
-                "ON qler_jobs_archive (ulid)"
-            ),
-        ]
-        for ddl in indexes:
-            cur = await adapter.execute(ddl)
-            await cur.close()
-        await adapter.auto_commit()
+    @property
+    def _dependency_edges(self) -> AsyncSQLerQuerySet[JobDependency]:
+        """The (parent, child) edges, as a sqler queryset bound to this queue's database."""
+        return JobDependency.using(self.db)
 
     async def init_db(self) -> None:
         """Initialize the database schema. Lazy and idempotent."""
@@ -173,136 +159,19 @@ class Queue:
             return
 
         if self._db is None:
+            # on_disk sets the PRAGMAs: WAL, busy_timeout 5000, synchronous NORMAL, wal_autocheckpoint 1000.
+            if self._db_path is None:
+                raise RuntimeError("Queue has neither a database nor a path to open one.")
             self._db = AsyncSQLerDB.on_disk(self._db_path)
             await self._db.connect()
-            # Set SQLite PRAGMAs for performance
-            for pragma in [
-                "PRAGMA journal_mode=WAL",
-                "PRAGMA busy_timeout=5000",
-                "PRAGMA synchronous=NORMAL",
-                "PRAGMA wal_autocheckpoint=1000",
-            ]:
-                cur = await self._db.adapter.execute(pragma)
-                await cur.close()
 
-        await self._migrate_schema()
-
-        Job.set_db(self._db, "qler_jobs")
-        JobAttempt.set_db(self._db, "qler_job_attempts")
-        RateLimitBucket.set_db(self._db, "qler_rate_limit_buckets")
-
-        # Create tables with promoted columns + CHECK constraints.
-        # We call the db methods directly instead of Model._ensure_schema()
-        # because Pydantic's metaclass intercepts underscore-prefixed class
-        # attribute access.
-        await self._db._ensure_table_with_promoted(
-            "qler_jobs", Job.__promoted__, Job.__checks__
-        )
-        await self._db._ensure_table_with_promoted(
-            "qler_job_attempts", JobAttempt.__promoted__, JobAttempt.__checks__
-        )
-        await self._db._ensure_table_with_promoted(
-            "qler_rate_limit_buckets",
-            RateLimitBucket.__promoted__,
-            RateLimitBucket.__checks__,
-        )
-
-        await self._db._ensure_versioned_table("qler_jobs")
-        await self._db._ensure_versioned_table("qler_job_attempts")
-        await self._db._ensure_versioned_table("qler_rate_limit_buckets")
-
-        # Schema migration: add pending_dep_count column (idempotent)
-        try:
-            cur = await self._db.adapter.execute(
-                "ALTER TABLE qler_jobs ADD COLUMN pending_dep_count INTEGER NOT NULL DEFAULT 0"
-            )
-            await cur.close()
-            await self._db.adapter.auto_commit()
-        except Exception:
-            pass  # Column already exists
-
-        # Reverse dependency map for O(1) child lookups
-        cur = await self._db.adapter.execute(
-            "CREATE TABLE IF NOT EXISTS qler_job_deps ("
-            "parent_ulid TEXT NOT NULL, "
-            "child_ulid TEXT NOT NULL, "
-            "PRIMARY KEY (parent_ulid, child_ulid))"
-        )
-        await cur.close()
-        await self._db.adapter.auto_commit()
-
-        await self._create_indexes()
-
-        # Create archive table with same schema (no indexes — read-only)
-        await self._db._ensure_table_with_promoted(
-            "qler_jobs_archive", Job.__promoted__, Job.__checks__
-        )
-        await self._db._ensure_versioned_table("qler_jobs_archive")
-        await self._create_unique_indexes()
+        await ensure_schema(self.db)
 
         # Wire up queue depth query for Prometheus scrapes
         if self._metrics is not None:
             self._metrics.set_depth_query(self._query_queue_depth)
 
         self._initialized = True
-
-    async def _create_indexes(self) -> None:
-        """Create all required indexes (idempotent)."""
-        adapter = self._db.adapter
-        indexes = [
-            # 1. Claim: pick highest-priority pending job with earliest ETA and no pending deps
-            "DROP INDEX IF EXISTS idx_qler_jobs_claim",
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_claim "
-                "ON qler_jobs (queue_name, priority DESC, eta, ulid) "
-                "WHERE status = 'pending' AND pending_dep_count = 0"
-            ),
-            # 2. Lease expiry: find running jobs with expired leases
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_lease "
-                "ON qler_jobs (lease_expires_at) "
-                "WHERE status = 'running'"
-            ),
-            # 3. Correlation: look up jobs by correlation ID
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_correlation "
-                "ON qler_jobs (json_extract(data, '$.correlation_id')) "
-                "WHERE json_extract(data, '$.correlation_id') != ''"
-            ),
-            # 4. Attempt lookup: find attempts for a job
-            "CREATE INDEX IF NOT EXISTS idx_qler_attempts_job ON qler_job_attempts (job_ulid)",
-            # 5. Idempotency: deduplicate by idempotency key
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_idempotency "
-                "ON qler_jobs (json_extract(data, '$.idempotency_key')) "
-                "WHERE json_extract(data, '$.idempotency_key') IS NOT NULL"
-            ),
-            # 6. DLQ: find failed jobs in a specific queue
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_dlq "
-                "ON qler_jobs (queue_name, status) "
-                "WHERE status = 'failed'"
-            ),
-            # 7. Uniqueness: deduplicate active jobs by unique_key
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_unique "
-                "ON qler_jobs (json_extract(data, '$.unique_key')) "
-                "WHERE json_extract(data, '$.unique_key') IS NOT NULL "
-                "AND status IN ('pending', 'running')"
-            ),
-            # 8. Dependency resolution: find pending jobs with unresolved deps
-            (
-                "CREATE INDEX IF NOT EXISTS idx_qler_jobs_pending_deps "
-                "ON qler_jobs (status, pending_dep_count) "
-                "WHERE status = 'pending' AND pending_dep_count > 0"
-            ),
-            # 9. Reverse dependency map: find children by parent
-            "CREATE INDEX IF NOT EXISTS idx_qler_job_deps_parent ON qler_job_deps (parent_ulid)",
-        ]
-        for ddl in indexes:
-            cur = await adapter.execute(ddl)
-            await cur.close()
-        await adapter.auto_commit()
 
     # ------------------------------------------------------------------
     # Enqueue
@@ -312,141 +181,44 @@ class Queue:
         self,
         task_path: str,
         args: tuple = (),
-        kwargs: Optional[dict[str, Any]] = None,
+        kwargs: dict[str, Any] | None = None,
         *,
         queue_name: str = "default",
-        delay: Optional[int] = None,
-        eta: Optional[int] = None,
+        delay: int | None = None,
+        eta: int | None = None,
         priority: int = 0,
-        max_retries: Optional[int] = None,
-        retry_delay: Optional[int] = None,
-        lease_duration: Optional[int] = None,
-        idempotency_key: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-        depends_on: Optional[list[str]] = None,
-        timeout: Optional[int] = None,
-        unique_key: Optional[str] = None,
+        max_retries: int | None = None,
+        retry_delay: int | None = None,
+        lease_duration: int | None = None,
+        idempotency_key: str | None = None,
+        correlation_id: str | None = None,
+        depends_on: list[str] | None = None,
+        timeout: int | None = None,
+        unique_key: str | None = None,
     ) -> Job:
-        """Enqueue a new job. Returns the created Job instance."""
-        await self._lazy_init()
+        """Enqueue a new job. Returns the created Job instance.
 
-        # Serialize payload
-        payload = {"args": list(args), "kwargs": kwargs or {}}
-        try:
-            payload_json = json.dumps(payload)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise PayloadNotSerializableError(
-                f"Payload is not JSON-serializable: {exc}"
-            ) from exc
-
-        if len(payload_json) > self.max_payload_size:
-            raise PayloadTooLargeError(
-                f"Payload size {len(payload_json)} exceeds max {self.max_payload_size}",
-                size=len(payload_json),
-                max_size=self.max_payload_size,
-            )
-
-        # Idempotency check: return existing non-cancelled job with same key
-        if idempotency_key is not None:
-            existing = await Job.query().filter(
-                (F("idempotency_key") == idempotency_key)
-                & (F("status") != JobStatus.CANCELLED.value)
-            ).first()
-            if existing is not None:
-                return existing
-
-        # Uniqueness check: return existing active (pending/running) job with same key
-        if unique_key is not None:
-            existing = await Job.query().filter(
-                (F("unique_key") == unique_key)
-                & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
-            ).first()
-            if existing is not None:
-                return existing
-
-        # Validate dependencies
-        dep_list: list[str] = []
-        pending_dep_count = 0
-        if depends_on:
-            dep_list = list(dict.fromkeys(depends_on))  # deduplicate, preserve order
-            dep_jobs = await Job.query().filter(
-                F("ulid").in_list(dep_list)
-            ).all()
-            found_ulids = {j.ulid for j in dep_jobs}
-            for dep_ulid in dep_list:
-                if dep_ulid not in found_ulids:
-                    raise DependencyError(
-                        f"Dependency job {dep_ulid} not found",
-                        dependency_ulid=dep_ulid,
-                    )
-            for dep_job in dep_jobs:
-                if dep_job.status == JobStatus.FAILED.value:
-                    raise DependencyError(
-                        f"Dependency job {dep_job.ulid} is failed",
-                        dependency_ulid=dep_job.ulid,
-                    )
-                if dep_job.status == JobStatus.CANCELLED.value:
-                    raise DependencyError(
-                        f"Dependency job {dep_job.ulid} is cancelled",
-                        dependency_ulid=dep_job.ulid,
-                    )
-            pending_dep_count = sum(
-                1 for j in dep_jobs if j.status != JobStatus.COMPLETED.value
-            )
-
-        # Calculate ETA
-        now = now_epoch()
-        if eta is not None:
-            job_eta = eta
-        elif delay is not None:
-            job_eta = now + delay
-        else:
-            job_eta = now
-
-        job = Job(
-            ulid=generate_ulid(),
-            status=JobStatus.PENDING.value,
-            queue_name=queue_name,
-            priority=priority,
-            eta=job_eta,
-            task=task_path,
-            payload_json=payload_json,
-            max_retries=max_retries if max_retries is not None else self.default_max_retries,
-            retry_delay=retry_delay if retry_delay is not None else self.default_retry_delay,
-            lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
-            correlation_id=correlation_id or "",
-            idempotency_key=idempotency_key,
-            unique_key=unique_key,
-            dependencies=dep_list,
-            pending_dep_count=pending_dep_count,
-            timeout=timeout,
-            created_at=now,
-            updated_at=now,
-        )
-        await job.save()
-
-        if dep_list:
-            for dep_ulid in dep_list:
-                cur = await self._db.adapter.execute(
-                    "INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES (?, ?)",
-                    [dep_ulid, job.ulid],
-                )
-                await cur.close()
-            await self._db.adapter.auto_commit()
-
-        _lifecycle(
-            "job.enqueued", job_id=job.ulid, queue=queue_name,
-            task=task_path, correlation_id=job.correlation_id,
-            priority=job.priority,
-        )
-
-        if self._metrics:
-            self._metrics.inc_enqueued(queue_name, task_path)
-
-        if self.immediate:
-            return await self._execute_immediate(job)
-
-        return job
+        A job already active under ``idempotency_key`` or ``unique_key`` is returned as
+        it is instead, and is not run in immediate mode.
+        """
+        spec = {
+            "task_path": task_path,
+            "args": args,
+            "kwargs": kwargs,
+            "queue_name": queue_name,
+            "delay": delay,
+            "eta": eta,
+            "priority": priority,
+            "max_retries": max_retries,
+            "retry_delay": retry_delay,
+            "lease_duration": lease_duration,
+            "idempotency_key": idempotency_key,
+            "correlation_id": correlation_id,
+            "depends_on": depends_on,
+            "timeout": timeout,
+            "unique_key": unique_key,
+        }
+        return (await self._enqueue_specs([spec], batch=False))[0]
 
     async def enqueue_many(
         self,
@@ -458,238 +230,217 @@ class Queue:
         Each dict accepts the same keys as enqueue():
             task_path (required), args, kwargs, queue_name, delay, eta,
             priority, max_retries, retry_delay, lease_duration,
-            idempotency_key, correlation_id, depends_on, timeout.
+            idempotency_key, unique_key, correlation_id, depends_on, timeout;
+        and two of its own: ``ulid`` (the new job's ulid) and, in ``depends_on``, an
+        int (the index of an earlier entry of this batch).
 
-        Returns list of Job instances in the same order as input.
+        Returns list of Job instances in the same order as input. Entries with one key
+        share one Job object; in immediate mode only the jobs this call created run.
         """
         if not jobs:
             return []
+        return await self._enqueue_specs(jobs, batch=True)
 
+    async def _active_by_key(
+        self, jobs_q: AsyncSQLerQuerySet[Job], field: str, specs: list[dict[str, Any]]
+    ) -> dict[str, Job]:
+        """The active job of each ``field`` key the specs name, chunked under SQLite's
+        999-variable limit."""
+        keys = list(dict.fromkeys(s[field] for s in specs if s.get(field) is not None))
+        found: dict[str, Job] = {}
+        for off in range(0, len(keys), 900):
+            for j in await jobs_q.filter(
+                F(field).in_list(keys[off : off + 900]) & key_active(field)
+            ).all():
+                # Two active rows with one key exist only in a file from before the
+                # UNIQUE index: the first row read is the match, as .first() gives.
+                found.setdefault(getattr(j, field), j)
+        return found
+
+    async def _enqueue_specs(self, specs: list[dict[str, Any]], *, batch: bool) -> list[Job]:
+        """The one enqueue path, behind enqueue() (``batch=False``) and enqueue_many().
+
+        Returns one Job per spec, in order. A batch's errors start "Job at index i: ";
+        the single call's carry no prefix, and an int in its ``depends_on`` is refused.
+        """
         await self._lazy_init()
         now = now_epoch()
 
-        # Pre-fetch existing idempotency and uniqueness keys in batch
-        param_chunk = 900  # stay under SQLite's 999-parameter limit
-
-        all_idem_keys = list(dict.fromkeys(
-            s["idempotency_key"] for s in jobs if s.get("idempotency_key") is not None
-        ))
-        all_unique_keys = list(dict.fromkeys(
-            s["unique_key"] for s in jobs if s.get("unique_key") is not None
-        ))
-
-        idem_existing: dict[str, Job] = {}
-        if all_idem_keys:
-            for off in range(0, len(all_idem_keys), param_chunk):
-                chunk = all_idem_keys[off : off + param_chunk]
-                found = await Job.query().filter(
-                    F("idempotency_key").in_list(chunk)
-                    & (F("status") != JobStatus.CANCELLED.value)
-                ).all()
-                for j in found:
-                    idem_existing[j.idempotency_key] = j
-
-        unique_existing: dict[str, Job] = {}
-        if all_unique_keys:
-            for off in range(0, len(all_unique_keys), param_chunk):
-                chunk = all_unique_keys[off : off + param_chunk]
-                found = await Job.query().filter(
-                    F("unique_key").in_list(chunk)
-                    & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
-                ).all()
-                for j in found:
-                    unique_existing[j.unique_key] = j
-
-        # Phase 1: Validate all jobs and build Job instances
-        job_instances: list[Job] = []
-        batch_ulids: dict[str, Job] = {}  # for intra-batch dependency resolution
-        batch_idem_keys: dict[str, Job] = {}  # for intra-batch idempotency dedup
-
-        for i, spec in enumerate(jobs):
-            task_path = spec.get("task_path")
-            if not task_path:
-                raise ConfigurationError(
-                    f"Job at index {i}: task_path is required"
-                )
-
-            args = spec.get("args", ())
-            kwargs = spec.get("kwargs", None)
-            queue_name = spec.get("queue_name", "default")
-            delay = spec.get("delay")
-            eta = spec.get("eta")
-            priority = spec.get("priority", 0)
-            max_retries = spec.get("max_retries")
-            retry_delay = spec.get("retry_delay")
-            lease_duration = spec.get("lease_duration")
-            idempotency_key = spec.get("idempotency_key")
-            correlation_id = spec.get("correlation_id")
-            depends_on = spec.get("depends_on")
-            timeout = spec.get("timeout")
-            unique_key = spec.get("unique_key")
-
-            # Serialize payload
-            payload = {"args": list(args), "kwargs": kwargs or {}}
+        # What needs no database is checked first, for every spec, before the write lock
+        # is taken: a spec that cannot be stored is refused without waiting for it.
+        payloads: list[str] = []
+        for i, spec in enumerate(specs):
+            where = f"Job at index {i}: " if batch else ""
+            payload_word = f"{where}payload" if batch else "Payload"
+            if not spec.get("task_path"):
+                raise ConfigurationError(f"{where}task_path is required")
+            payload = {"args": list(spec.get("args", ())), "kwargs": spec.get("kwargs") or {}}
             try:
                 payload_json = json.dumps(payload)
             except (TypeError, ValueError, OverflowError) as exc:
                 raise PayloadNotSerializableError(
-                    f"Job at index {i}: payload is not JSON-serializable: {exc}"
+                    f"{payload_word} is not JSON-serializable: {exc}"
                 ) from exc
-
             if len(payload_json) > self.max_payload_size:
                 raise PayloadTooLargeError(
-                    f"Job at index {i}: payload size {len(payload_json)} exceeds max {self.max_payload_size}",
+                    f"{payload_word} size {len(payload_json)} exceeds max {self.max_payload_size}",
                     size=len(payload_json),
                     max_size=self.max_payload_size,
                 )
+            payloads.append(payload_json)
 
-            # Idempotency check (pre-fetched DB results then intra-batch)
-            if idempotency_key is not None:
-                if idempotency_key in idem_existing:
-                    job_instances.append(idem_existing[idempotency_key])
-                    continue
-                if idempotency_key in batch_idem_keys:
-                    job_instances.append(batch_idem_keys[idempotency_key])
+        # One write: the key look-ups, the parents' statuses and every row with its edges
+        # run in one transaction that holds the write lock from its start, so no other
+        # enqueue (task, connection or process) can write the same key between the check
+        # and the save. The UNIQUE indexes on the keys are the database's own guard.
+        jobs_q = self.jobs
+        async with self.db.transaction():
+            idem_existing = await self._active_by_key(jobs_q, "idempotency_key", specs)
+            unique_existing = await self._active_by_key(jobs_q, "unique_key", specs)
+
+            job_instances: list[Job] = []  # one per spec, in order
+            new_jobs: list[Job] = []  # the jobs this call creates, each once
+            batch_ulids: set[str] = set()
+            batch_idem: dict[str, Job] = {}
+            batch_unique: dict[str, Job] = {}
+
+            for i, spec in enumerate(specs):
+                where = f"Job at index {i}: " if batch else ""
+                dep_word = f"{where}dependency" if batch else "Dependency job"
+
+                # A key already active (in the database, then earlier in this call) is
+                # that job: idempotency key first, then unique key.
+                idempotency_key = spec.get("idempotency_key")
+                unique_key = spec.get("unique_key")
+                matched: Job | None = None
+                if idempotency_key is not None:
+                    matched = idem_existing.get(idempotency_key, batch_idem.get(idempotency_key))
+                if matched is None and unique_key is not None:
+                    matched = unique_existing.get(unique_key, batch_unique.get(unique_key))
+                if matched is not None:
+                    job_instances.append(matched)
                     continue
 
-            # Uniqueness check (pre-fetched DB results)
-            if unique_key is not None:
-                if unique_key in unique_existing:
-                    job_instances.append(unique_existing[unique_key])
-                    continue
-
-            # Validate dependencies (including intra-batch)
-            dep_list: list[str] = []
-            pending_dep_count = 0
-            if depends_on:
-                # Resolve integer indices to ULIDs of earlier jobs in this batch
-                resolved: list[str] = []
-                for dep in depends_on:
-                    if isinstance(dep, int):
-                        if dep < 0 or dep >= i:
+                # Dependencies: an int is the index of an earlier entry of the batch
+                dep_list: list[str] = []
+                pending_dep_count = 0
+                if spec.get("depends_on"):
+                    resolved: list[str] = []
+                    for dep in spec["depends_on"]:
+                        if not isinstance(dep, int):
+                            resolved.append(dep)
+                        elif not batch:
                             raise DependencyError(
-                                f"Job at index {i}: integer dependency index {dep} "
+                                f"Integer dependency index {dep} is only meaningful in "
+                                "enqueue_many; enqueue takes job ULIDs",
+                                dependency_ulid=str(dep),
+                            )
+                        elif 0 <= dep < i:
+                            resolved.append(job_instances[dep].ulid)
+                        else:
+                            raise DependencyError(
+                                f"{where}integer dependency index {dep} "
                                 f"out of range (must be 0..{i - 1})",
                                 dependency_ulid=str(dep),
                             )
-                        resolved.append(job_instances[dep].ulid)
-                    else:
-                        resolved.append(dep)
-                dep_list = list(dict.fromkeys(resolved))
-                # Check DB for existing deps
-                db_dep_ulids = [u for u in dep_list if u not in batch_ulids]
-                batch_dep_ulids = [u for u in dep_list if u in batch_ulids]
+                    dep_list = list(dict.fromkeys(resolved))  # each parent once, in order
+                    db_deps = [u for u in dep_list if u not in batch_ulids]
+                    if db_deps:
+                        dep_jobs = await jobs_q.filter(F("ulid").in_list(db_deps)).all()
+                        found_ulids = {j.ulid for j in dep_jobs}
+                        for dep_ulid in db_deps:
+                            if dep_ulid not in found_ulids:
+                                raise DependencyError(
+                                    f"{dep_word} {dep_ulid} not found",
+                                    dependency_ulid=dep_ulid,
+                                )
+                        for dep_job in dep_jobs:
+                            if dep_job.status in (
+                                JobStatus.FAILED.value,
+                                JobStatus.CANCELLED.value,
+                            ):
+                                raise DependencyError(
+                                    f"{dep_word} {dep_job.ulid} is {dep_job.status}",
+                                    dependency_ulid=dep_job.ulid,
+                                )
+                        pending_dep_count += sum(
+                            1 for j in dep_jobs if j.status != JobStatus.COMPLETED.value
+                        )
+                    # A parent created by this call is pending
+                    pending_dep_count += len(dep_list) - len(db_deps)
 
-                if db_dep_ulids:
-                    dep_jobs = await Job.query().filter(
-                        F("ulid").in_list(db_dep_ulids)
-                    ).all()
-                    found_ulids = {j.ulid for j in dep_jobs}
-                    for dep_ulid in db_dep_ulids:
-                        if dep_ulid not in found_ulids:
-                            raise DependencyError(
-                                f"Job at index {i}: dependency {dep_ulid} not found",
-                                dependency_ulid=dep_ulid,
-                            )
-                    for dep_job in dep_jobs:
-                        if dep_job.status == JobStatus.FAILED.value:
-                            raise DependencyError(
-                                f"Job at index {i}: dependency {dep_job.ulid} is failed",
-                                dependency_ulid=dep_job.ulid,
-                            )
-                        if dep_job.status == JobStatus.CANCELLED.value:
-                            raise DependencyError(
-                                f"Job at index {i}: dependency {dep_job.ulid} is cancelled",
-                                dependency_ulid=dep_job.ulid,
-                            )
-                    pending_dep_count += sum(
-                        1 for j in dep_jobs if j.status != JobStatus.COMPLETED.value
-                    )
-
-                # Intra-batch deps are always pending
-                pending_dep_count += len(batch_dep_ulids)
-
-            # Calculate ETA
-            if eta is not None:
-                job_eta = eta
-            elif delay is not None:
-                job_eta = now + delay
-            else:
-                job_eta = now
-
-            job = Job(
-                ulid=spec.get("ulid") or generate_ulid(),
-                status=JobStatus.PENDING.value,
-                queue_name=queue_name,
-                priority=priority,
-                eta=job_eta,
-                task=task_path,
-                payload_json=payload_json,
-                max_retries=max_retries if max_retries is not None else self.default_max_retries,
-                retry_delay=retry_delay if retry_delay is not None else self.default_retry_delay,
-                lease_duration=lease_duration if lease_duration is not None else self.default_lease_duration,
-                correlation_id=correlation_id or "",
-                idempotency_key=idempotency_key,
-                unique_key=unique_key,
-                dependencies=dep_list,
-                pending_dep_count=pending_dep_count,
-                timeout=timeout,
-                created_at=now,
-                updated_at=now,
-            )
-            job_instances.append(job)
-            batch_ulids[job.ulid] = job
-            if idempotency_key is not None:
-                batch_idem_keys[idempotency_key] = job
-
-        # Phase 2: Batch-save all new jobs (skip idempotency/uniqueness-matched existing ones)
-        # Deduplicate by identity — intra-batch dedup may add the same object twice
-        seen_ids: set[int] = set()
-        new_jobs: list[Job] = []
-        for j in job_instances:
-            if j._id is None and id(j) not in seen_ids:
-                seen_ids.add(id(j))
-                new_jobs.append(j)
-        if new_jobs:
-            await Job.asave_many(new_jobs)
-
-        # Batch-insert all dependency edges (chunked for SQLite 999-param limit)
-        all_dep_edges: list[tuple[str, str]] = []
-        for job in new_jobs:
-            for dep_ulid in job.dependencies:
-                all_dep_edges.append((dep_ulid, job.ulid))
-
-        if all_dep_edges:
-            dep_chunk = 499  # 2 params per edge, SQLite max 999
-            for offset in range(0, len(all_dep_edges), dep_chunk):
-                chunk = all_dep_edges[offset : offset + dep_chunk]
-                placeholders = ", ".join(["(?, ?)"] * len(chunk))
-                params: list[str] = [v for edge in chunk for v in edge]
-                cur = await self._db.adapter.execute(
-                    f"INSERT OR IGNORE INTO qler_job_deps (parent_ulid, child_ulid) VALUES {placeholders}",
-                    params,
+                eta = spec.get("eta")
+                delay = spec.get("delay")
+                max_retries = spec.get("max_retries")
+                retry_delay = spec.get("retry_delay")
+                lease_duration = spec.get("lease_duration")
+                job = Job(
+                    ulid=spec.get("ulid") or generate_ulid(),
+                    status=JobStatus.PENDING.value,
+                    queue_name=spec.get("queue_name", "default"),
+                    priority=spec.get("priority", 0),
+                    eta=eta if eta is not None else now + delay if delay is not None else now,
+                    task=spec["task_path"],
+                    payload_json=payloads[i],
+                    max_retries=max_retries
+                    if max_retries is not None
+                    else self.default_max_retries,
+                    retry_delay=retry_delay
+                    if retry_delay is not None
+                    else self.default_retry_delay,
+                    lease_duration=lease_duration
+                    if lease_duration is not None
+                    else self.default_lease_duration,
+                    correlation_id=spec.get("correlation_id") or "",
+                    idempotency_key=idempotency_key,
+                    unique_key=unique_key,
+                    dependencies=dep_list,
+                    pending_dep_count=pending_dep_count,
+                    timeout=spec.get("timeout"),
+                    created_at=now,
+                    updated_at=now,
                 )
-                await cur.close()
-            await self._db.adapter.auto_commit()
+                job_instances.append(job)
+                new_jobs.append(job)
+                batch_ulids.add(job.ulid)
+                if idempotency_key is not None:
+                    batch_idem[idempotency_key] = job
+                if unique_key is not None:
+                    batch_unique[unique_key] = job
 
+            if len(new_jobs) == 1:
+                # One row is one INSERT; save_many would wrap it in a savepoint of its own
+                await new_jobs[0].save(db=self.db)
+            elif new_jobs:
+                await Job.save_many(new_jobs, db=self.db)
+            # Each job's dependencies list holds a parent once: one edge per (parent, child)
+            edges = [
+                JobDependency(parent_ulid=dep_ulid, child_ulid=job.ulid)
+                for job in new_jobs
+                for dep_ulid in job.dependencies
+            ]
+            if edges:
+                await JobDependency.save_many(edges, db=self.db)
+
+        # Told only after the commit, and only of the jobs this call created
+        extra = {"batch": True} if batch else {}
         for job in new_jobs:
             _lifecycle(
-                "job.enqueued", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                priority=job.priority, batch=True,
+                "job.enqueued",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                priority=job.priority,
+                **extra,
             )
             if self._metrics:
                 self._metrics.inc_enqueued(job.queue_name, job.task)
 
-        # Phase 3: Execute in immediate mode if applicable
         if self.immediate:
-            results = []
-            for job in job_instances:
-                if job.status == JobStatus.PENDING.value:
-                    results.append(await self._execute_immediate(job))
-                else:
-                    results.append(job)
-            return results
+            # Run each job this call created once; a matched job is returned as it is.
+            ran = {job.ulid: await self._execute_immediate(job) for job in new_jobs}
+            return [ran.get(j.ulid, j) for j in job_instances]
 
         return job_instances
 
@@ -708,7 +459,7 @@ class Queue:
         attempt_id = generate_ulid()
 
         # Transition PENDING → RUNNING
-        claimed = await Job.query().filter(
+        claimed = await self.jobs.filter(
             (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
         ).update_one(
             status=JobStatus.RUNNING.value,
@@ -731,7 +482,7 @@ class Queue:
             worker_id=worker_id,
             started_at=now,
         )
-        await attempt.save()
+        await attempt.save(db=self.db)
 
         # Resolve task
         task_wrapper = self._tasks.get(job.task)
@@ -746,7 +497,7 @@ class Queue:
                 ),
                 failure_kind=FailureKind.TASK_NOT_FOUND,
             )
-            updated = await Job.query().filter(F("ulid") == job.ulid).first()
+            updated = await self.jobs.filter(F("ulid") == job.ulid).first()
             raise TaskNotRegisteredError(
                 f"Task '{job.task}' is not registered on this queue. "
                 "Register it with @task(queue) before enqueuing.",
@@ -772,17 +523,13 @@ class Queue:
                 if task_wrapper.sync:
                     # Sync tasks run in threads that can't be cancelled.
                     # Shield prevents wait_for from blocking on cancellation.
-                    result = await asyncio.wait_for(
-                        asyncio.shield(coro), timeout=timeout
-                    )
+                    result = await asyncio.wait_for(asyncio.shield(coro), timeout=timeout)
                 else:
                     result = await asyncio.wait_for(coro, timeout=timeout)
             else:
                 result = await coro
-        except asyncio.TimeoutError:
-            task_exc = TimeoutError(
-                f"Task {job.task} timed out after {timeout}s"
-            )
+        except TimeoutError:
+            task_exc = TimeoutError(f"Task {job.task} timed out after {timeout}s")
             failure_kind = FailureKind.TIMEOUT
         except asyncio.CancelledError:
             await self.fail_job(job, worker_id, failure_kind=FailureKind.CANCELLED)
@@ -793,19 +540,13 @@ class Queue:
             _current_job.reset(token)
 
         if task_exc is not None:
-            try:
-                await self.fail_job(
-                    job, worker_id, task_exc, failure_kind=failure_kind
-                )
-            except Exception:
-                # Best-effort: terminalize attempt directly if fail_job raises
-                await self._terminalize_attempt(
-                    attempt_id, AttemptStatus.FAILED.value, now_epoch(), error="Internal error"
-                )
+            # fail_job is one write: if it raises, nothing was written and the error
+            # reaches the caller, as it does for complete_job below.
+            await self.fail_job(job, worker_id, task_exc, failure_kind=failure_kind)
         else:
             await self.complete_job(job, worker_id, result=result)
 
-        updated = await Job.query().filter(F("ulid") == job.ulid).first()
+        updated = await self.jobs.filter(F("ulid") == job.ulid).first()
         return updated if updated is not None else job
 
     # ------------------------------------------------------------------
@@ -816,70 +557,13 @@ class Queue:
         self,
         worker_id: str,
         queues: list[str],
-    ) -> Optional[Job]:
-        """Atomically claim the next eligible job. Returns Job or None."""
-        await self._lazy_init()
+    ) -> Job | None:
+        """Atomically claim the next eligible job. Returns Job or None.
 
-        if not queues:
-            raise ConfigurationError("queues list must not be empty")
-
-        now_ts = now_epoch()
-        attempt_id = generate_ulid()
-
-        # Atomic claim via update_one
-        job = await Job.query().filter(
-            (F("status") == JobStatus.PENDING.value)
-            & F("queue_name").in_list(queues)
-            & (F("eta") <= now_ts)
-            & (F("pending_dep_count") == 0)
-        ).order_by("-priority", "eta", "ulid").update_one(
-            status=JobStatus.RUNNING.value,
-            worker_id=worker_id,
-            attempts=F("attempts") + 1,
-            lease_expires_at=now_ts + self.default_lease_duration,
-            last_attempt_id=attempt_id,
-            updated_at=now_ts,
-        )
-
-        if job is None:
-            return None
-
-        # Poison pill check: validate payload is parseable
-        try:
-            json.loads(job.payload_json)
-        except (json.JSONDecodeError, TypeError):
-            # Mark as permanently failed — bad payload
-            await self._poison_pill(job, worker_id, attempt_id, now_ts)
-            return None
-
-        # Rate limit checks (queue-level, then task-level)
-        if not self.immediate:
-            rate_limited = await self._check_rate_limits(job, worker_id, now_ts)
-            if rate_limited:
-                return None
-
-        # Create the running attempt record
-        attempt = JobAttempt(
-            ulid=attempt_id,
-            job_ulid=job.ulid,
-            status=AttemptStatus.RUNNING.value,
-            attempt_number=job.attempts,
-            worker_id=worker_id,
-            started_at=now_ts,
-            lease_expires_at=now_ts + self.default_lease_duration,
-        )
-        await attempt.save()
-
-        _lifecycle(
-            "job.claimed", job_id=job.ulid, queue=job.queue_name,
-            task=job.task, correlation_id=job.correlation_id,
-            worker_id=worker_id, attempt=job.attempts,
-        )
-
-        if self._metrics:
-            self._metrics.inc_claimed(job.queue_name, job.task)
-
-        return job
+        The first element of ``claim_jobs(worker_id, queues, 1)``, or None.
+        """
+        jobs = await self.claim_jobs(worker_id, queues, 1)
+        return jobs[0] if jobs else None
 
     async def claim_jobs(
         self,
@@ -889,9 +573,9 @@ class Queue:
     ) -> list[Job]:
         """Atomically claim up to *n* eligible jobs. Returns list of Jobs.
 
-        Uses batch UPDATE via ``update_n()`` to claim multiple jobs in a single
-        SQL statement, then performs per-job post-processing (poison pill check,
-        rate limit check, attempt record creation).
+        One claiming UPDATE (``update_one`` for one job, ``update_n()`` for more), then
+        per-job post-processing (poison pill check, rate limit check, attempt record).
+        A poison pill or a rate-limited job is not returned.
 
         Args:
             worker_id: Identifier of the claiming worker.
@@ -909,85 +593,88 @@ class Queue:
             raise ConfigurationError("n must be >= 1")
 
         now_ts = now_epoch()
-
-        # Atomic batch claim
-        jobs = await Job.query().filter(
+        jobs_table = self.jobs
+        # The lease is each job's own lease_duration, read from its row by the update.
+        eligible = jobs_table.filter(
             (F("status") == JobStatus.PENDING.value)
             & F("queue_name").in_list(queues)
             & (F("eta") <= now_ts)
             & (F("pending_dep_count") == 0)
-        ).order_by("-priority", "eta", "ulid").update_n(
-            n,
-            status=JobStatus.RUNNING.value,
-            worker_id=worker_id,
-            attempts=F("attempts") + 1,
-            lease_expires_at=now_ts + self.default_lease_duration,
-            updated_at=now_ts,
-        )
+        ).order_by("-priority", "eta", "ulid")
+        claim_fields: dict[str, Any] = {
+            "status": JobStatus.RUNNING.value,
+            "worker_id": worker_id,
+            "attempts": F("attempts") + 1,
+            "lease_expires_at": F("lease_duration") + now_ts,
+            "updated_at": now_ts,
+        }
 
-        if not jobs:
-            return []
-
+        # One write: the claiming update, each job's attempt id, the poison-pill and
+        # rate-limit writes and every attempt record commit together or not at all, so a
+        # failure at any job leaves every job of the claim pending as before it.
         claimed: list[Job] = []
-        for job in jobs:
-            attempt_id = generate_ulid()
+        async with self.db.transaction():
+            if n == 1:
+                # One job: its attempt id goes into the claiming update itself.
+                attempt_id = generate_ulid()
+                job = await eligible.update_one(last_attempt_id=attempt_id, **claim_fields)
+                rows = [] if job is None else [(job, attempt_id)]
+            else:
+                rows = []
+                for job in await eligible.update_n(n, **claim_fields):
+                    # update_n writes one value to every row: each job's own attempt id
+                    # takes one more update.
+                    attempt_id = generate_ulid()
+                    await jobs_table.filter(
+                        (F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value)
+                    ).update_one(last_attempt_id=attempt_id, updated_at=now_ts)
+                    # Keep in-memory object in sync for _terminalize_attempt
+                    job.last_attempt_id = attempt_id
+                    rows.append((job, attempt_id))
 
-            # Set last_attempt_id per-job (unique per job, can't batch)
-            await Job.query().filter(
-                (F("ulid") == job.ulid)
-                & (F("status") == JobStatus.RUNNING.value)
-            ).update_one(
-                last_attempt_id=attempt_id,
-                updated_at=now_ts,
-            )
-            # Keep in-memory object in sync for _terminalize_attempt
-            job.last_attempt_id = attempt_id
-
-            # Poison pill check
-            try:
-                json.loads(job.payload_json)
-            except (json.JSONDecodeError, TypeError):
-                await self._poison_pill(job, worker_id, attempt_id, now_ts)
-                continue
-
-            # Rate limit check
-            if not self.immediate:
-                rate_limited = await self._check_rate_limits(
-                    job, worker_id, now_ts,
-                )
-                if rate_limited:
+            for job, attempt_id in rows:
+                # Poison pill check: validate payload is parseable
+                try:
+                    json.loads(job.payload_json)
+                except (json.JSONDecodeError, TypeError):
+                    await self._poison_pill(job, worker_id, attempt_id, now_ts)
                     continue
 
-            # Create attempt record
-            attempt = JobAttempt(
-                ulid=attempt_id,
-                job_ulid=job.ulid,
-                status=AttemptStatus.RUNNING.value,
-                attempt_number=job.attempts,
-                worker_id=worker_id,
-                started_at=now_ts,
-                lease_expires_at=now_ts + self.default_lease_duration,
-            )
-            await attempt.save()
+                # Rate limit checks (queue-level, then task-level)
+                if not self.immediate and await self._check_rate_limits(job, worker_id, now_ts):
+                    continue
 
+                await JobAttempt(
+                    ulid=attempt_id,
+                    job_ulid=job.ulid,
+                    status=AttemptStatus.RUNNING.value,
+                    attempt_number=job.attempts,
+                    worker_id=worker_id,
+                    started_at=now_ts,
+                    lease_expires_at=job.lease_expires_at,
+                ).save(db=self.db)
+                claimed.append(job)
+
+        # Events and metrics only for the jobs the committed claim returns.
+        for job in claimed:
             _lifecycle(
-                "job.claimed", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                worker_id=worker_id, attempt=job.attempts,
+                "job.claimed",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                worker_id=worker_id,
+                attempt=job.attempts,
             )
 
             if self._metrics:
                 self._metrics.inc_claimed(job.queue_name, job.task)
 
-            claimed.append(job)
-
         return claimed
 
-    async def _poison_pill(
-        self, job: Job, worker_id: str, attempt_id: str, now_ts: int
-    ) -> None:
-        """Handle a job with an unparseable payload."""
-        await Job.query().filter(
+    async def _poison_pill(self, job: Job, worker_id: str, attempt_id: str, now_ts: int) -> None:
+        """Handle a job with an unparseable payload (inside the claim's transaction)."""
+        await self.jobs.filter(
             (F("ulid") == job.ulid) & (F("status") == JobStatus.RUNNING.value)
         ).update_one(
             status=JobStatus.FAILED.value,
@@ -1010,7 +697,7 @@ class Queue:
             failure_kind=FailureKind.PAYLOAD_INVALID.value,
             error="Payload is not valid JSON",
         )
-        await attempt.save()
+        await attempt.save(db=self.db)
 
     # ------------------------------------------------------------------
     # Complete
@@ -1024,11 +711,11 @@ class Queue:
     ) -> None:
         """Mark a job as completed.
 
-        Uses atomic update_one() with ownership guard instead of
-        refresh+save to avoid version mismatch after claim's update_one().
+        One transaction: the ownership-guarded status update, the dependents' counts and
+        the attempt's end. The lifecycle event, metric and wake-up follow the commit.
         """
         # Serialize result
-        result_json: Optional[str] = None
+        result_json: str | None = None
         if result is not None:
             try:
                 result_json = json.dumps(result)
@@ -1055,40 +742,45 @@ class Queue:
                 )
                 return
 
+        # One write: the guarded status update, the dependents' counts and the attempt's
+        # end commit together or not at all, so a stop between them (a locked database,
+        # a dying process) cannot leave a completed parent above children whose count
+        # nothing will lower again. The outside world hears only of a committed completion.
         now = now_epoch()
-        updated = await Job.query().filter(
-            (F("ulid") == job.ulid)
-            & (F("status") == JobStatus.RUNNING.value)
-            & (F("worker_id") == worker_id)
-        ).update_one(
-            status=JobStatus.COMPLETED.value,
-            result_json=result_json,
-            finished_at=now,
-            updated_at=now,
-            worker_id="",
-            lease_expires_at=None,
-        )
+        async with self.db.transaction():
+            updated = await self.jobs.filter(
+                (F("ulid") == job.ulid)
+                & (F("status") == JobStatus.RUNNING.value)
+                & (F("worker_id") == worker_id)
+            ).update_one(
+                status=JobStatus.COMPLETED.value,
+                result_json=result_json,
+                finished_at=now,
+                updated_at=now,
+                worker_id="",
+                lease_expires_at=None,
+            )
 
-        if updated is None:
-            return  # Lost ownership
+            if updated is None:
+                return  # Lost ownership: nothing written, nothing told
+
+            # Resolve dependencies: unblock dependent jobs
+            await self._resolve_dependencies(job.ulid)
+
+            await self._terminalize_attempt(job.last_attempt_id, AttemptStatus.COMPLETED.value, now)
 
         _lifecycle(
-            "job.completed", job_id=job.ulid, queue=job.queue_name,
-            task=job.task, correlation_id=job.correlation_id,
+            "job.completed",
+            job_id=job.ulid,
+            queue=job.queue_name,
+            task=job.task,
+            correlation_id=job.correlation_id,
         )
 
         if self._metrics:
             self._metrics.inc_completed(job.queue_name, job.task)
 
         _notify_fire(job.ulid)
-
-        # Resolve dependencies: unblock dependent jobs
-        await self._resolve_dependencies(job.ulid)
-
-        # Terminalize attempt (best effort)
-        await self._terminalize_attempt(
-            job.last_attempt_id, AttemptStatus.COMPLETED.value, now
-        )
 
     # ------------------------------------------------------------------
     # Fail
@@ -1098,18 +790,17 @@ class Queue:
         self,
         job: Job,
         worker_id: str,
-        exc: Optional[BaseException] = None,
+        exc: BaseException | None = None,
         failure_kind: FailureKind = FailureKind.EXCEPTION,
     ) -> None:
         """Mark a job as failed, with optional retry.
 
-        Uses atomic update_one() with ownership guard.
+        One transaction: the ownership-guarded status update, the dependents'
+        cancellations and the attempt's end. The lifecycle event, metric and wake-ups
+        follow the commit.
         """
         now = now_epoch()
-        can_retry = (
-            failure_kind in RETRYABLE_FAILURES
-            and job.retry_count < job.max_retries
-        )
+        can_retry = failure_kind in RETRYABLE_FAILURES and job.retry_count < job.max_retries
 
         error_msg = str(exc)[:_MAX_ERROR_LENGTH] if exc else None
         error_tb = tb_module.format_exception(exc) if exc else None
@@ -1136,27 +827,54 @@ class Queue:
                 update_fields["original_queue"] = job.queue_name
                 update_fields["queue_name"] = self._dlq
 
-        updated = await Job.query().filter(
-            (F("ulid") == job.ulid)
-            & (F("status") == JobStatus.RUNNING.value)
-            & (F("worker_id") == worker_id)
-        ).update_one(**update_fields)
+        # One write: the guarded status update (with the dead-letter move), the dependents'
+        # cancellations and the attempt's end commit together or not at all, so a stop
+        # between them cannot leave a failed parent above pending children that will
+        # neither run nor be cancelled. The outside world hears only of what committed.
+        cancelled: list[str] = []
+        async with self.db.transaction():
+            updated = await self.jobs.filter(
+                (F("ulid") == job.ulid)
+                & (F("status") == JobStatus.RUNNING.value)
+                & (F("worker_id") == worker_id)
+            ).update_one(**update_fields)
 
-        if updated is None:
-            return  # Lost ownership
+            if updated is None:
+                return  # Lost ownership: nothing written, nothing told
+
+            # Cascade-cancel dependents on terminal failure
+            if not can_retry:
+                cancelled = await self._cascade_cancel_dependents(job.ulid)
+
+            await self._terminalize_attempt(
+                job.last_attempt_id,
+                AttemptStatus.FAILED.value,
+                now,
+                error=error_msg,
+                traceback=error_tb_str,
+                failure_kind=failure_kind.value,
+            )
 
         if can_retry:
             _lifecycle(
-                "job.retried", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                failure_kind=failure_kind.value, retry_count=job.retry_count + 1,
+                "job.retried",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                failure_kind=failure_kind.value,
+                retry_count=job.retry_count + 1,
                 error=error_msg or "",
             )
         else:
             _lifecycle(
-                "job.failed", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-                failure_kind=failure_kind.value, error=error_msg or "",
+                "job.failed",
+                job_id=job.ulid,
+                queue=job.queue_name,
+                task=job.task,
+                correlation_id=job.correlation_id,
+                failure_kind=failure_kind.value,
+                error=error_msg or "",
             )
 
         if self._metrics:
@@ -1165,20 +883,10 @@ class Queue:
             else:
                 self._metrics.inc_failed(job.queue_name, job.task, failure_kind.value)
 
-        # Cascade-cancel dependents on terminal failure
         if not can_retry:
             _notify_fire(job.ulid)
-            await self._cascade_cancel_dependents(job.ulid)
-
-        # Terminalize attempt (best effort)
-        await self._terminalize_attempt(
-            job.last_attempt_id,
-            AttemptStatus.FAILED.value,
-            now,
-            error=error_msg,
-            traceback=error_tb_str,
-            failure_kind=failure_kind.value,
-        )
+            for child_ulid in cancelled:
+                _notify_fire(child_ulid)
 
     # ------------------------------------------------------------------
     # Lease Recovery
@@ -1199,33 +907,9 @@ class Queue:
         recovered = 0
 
         for _ in range(max_per_tick):
-            job = await Job.query().filter(
-                (F("status") == JobStatus.RUNNING.value)
-                & (F("lease_expires_at") <= now)
-            ).order_by("lease_expires_at").update_one(
-                status=JobStatus.PENDING.value,
-                worker_id="",
-                lease_expires_at=None,
-                updated_at=now,
-                progress=None,
-                progress_message="",
-            )
-            if job is None:
+            expired = (F("status") == JobStatus.RUNNING.value) & (F("lease_expires_at") <= now)
+            if await self._recover_one(expired, now) is None:
                 break
-
-            _lifecycle(
-                "job.lease_recovered", job_id=job.ulid, queue=job.queue_name,
-                task=job.task, correlation_id=job.correlation_id,
-            )
-
-            # Terminalize the attempt as LEASE_EXPIRED
-            await self._terminalize_attempt(
-                job.last_attempt_id,
-                AttemptStatus.LEASE_EXPIRED.value,
-                now,
-                failure_kind=FailureKind.LEASE_EXPIRED.value,
-                error="Lease expired",
-            )
             recovered += 1
 
         if self._metrics and recovered:
@@ -1233,74 +917,126 @@ class Queue:
 
         return recovered
 
+    async def _release_lease(self, job_ulid: str, worker_id: str) -> bool:
+        """Recover one job at once, before its lease ends, if `worker_id` still runs it.
+
+        For a worker whose shutdown cut the job and whose task has ended: the job
+        becomes what lease recovery makes it. The write is guarded, so a job that
+        lease recovery, a cancel or another worker already moved is left alone.
+        Returns True if the job was released.
+        """
+        now = now_epoch()
+        still_ours = (
+            (F("ulid") == job_ulid)
+            & (F("status") == JobStatus.RUNNING.value)
+            & (F("worker_id") == worker_id)
+        )
+        if await self._recover_one(still_ours, now) is None:
+            return False
+        if self._metrics:
+            self._metrics.inc_leases_recovered(1)
+        return True
+
+    async def _recover_one(self, where: SQLerExpression, now: int) -> Job | None:
+        """Return the first RUNNING job matching `where` to PENDING, as lease recovery does.
+
+        Its attempt ends as LEASE_EXPIRED; its retry count is kept (a lost lease is
+        not a task failure). One transaction: the reset and the attempt's end commit
+        together or not at all, so a stop between them cannot leave a pending job
+        whose last attempt still says running. Returns the job, or None if none matched.
+        """
+        async with self.db.transaction():
+            job = (
+                await self.jobs.filter(where)
+                .order_by("lease_expires_at")
+                .update_one(
+                    status=JobStatus.PENDING.value,
+                    worker_id="",
+                    lease_expires_at=None,
+                    updated_at=now,
+                    progress=None,
+                    progress_message="",
+                )
+            )
+            if job is None:
+                return None
+
+            await self._terminalize_attempt(
+                job.last_attempt_id,
+                AttemptStatus.LEASE_EXPIRED.value,
+                now,
+                failure_kind=FailureKind.LEASE_EXPIRED.value,
+                error="Lease expired",
+            )
+
+        # Told only after the commit
+        _lifecycle(
+            "job.lease_recovered",
+            job_id=job.ulid,
+            queue=job.queue_name,
+            task=job.task,
+            correlation_id=job.correlation_id,
+        )
+        return job
+
     # ------------------------------------------------------------------
     # Dependencies
     # ------------------------------------------------------------------
 
+    async def _children_of(self, parent_ulid: str) -> list[str]:
+        """The ulids of the jobs that wait on ``parent_ulid``, ascending."""
+        return (await self._children_by_parent([parent_ulid])).get(parent_ulid, [])
+
+    async def _children_by_parent(self, parents: list[str]) -> dict[str, list[str]]:
+        """Each parent's children, ascending, read from this queue's database."""
+        return await children_by_parent(self._dependency_edges, parents)
+
     async def _resolve_dependencies(self, completed_ulid: str) -> None:
-        """Decrement pending_dep_count for jobs depending on the completed job."""
-        cur = await self._db.adapter.execute(
-            "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
-            [completed_ulid],
-        )
-        children = await cur.fetchall()
-        await cur.close()
-        await self._db.adapter.auto_commit()
+        """Decrement pending_dep_count for jobs depending on the completed job.
 
-        for (child_ulid,) in children:
-            await Job.query().filter(
-                (F("ulid") == child_ulid)
-                & (F("status") == JobStatus.PENDING.value)
-                & (F("pending_dep_count") > 0)
-            ).update_one(
-                pending_dep_count=F("pending_dep_count") - 1,
-                updated_at=now_epoch(),
-            )
+        One transaction (a savepoint inside the caller's): every child is decremented,
+        or none is.
+        """
+        jobs = self.jobs
+        async with self.db.transaction():
+            children = await self._children_of(completed_ulid)
 
-    async def _cascade_cancel_dependents(self, failed_ulid: str) -> None:
-        """Cancel PENDING jobs that depend on a failed/cancelled job, recursively."""
-        cur = await self._db.adapter.execute(
-            "SELECT child_ulid FROM qler_job_deps WHERE parent_ulid = ?",
-            [failed_ulid],
-        )
-        children = await cur.fetchall()
-        await cur.close()
-        await self._db.adapter.auto_commit()
+            now = now_epoch()
+            for child_ulid in children:
+                await jobs.filter(
+                    (F("ulid") == child_ulid)
+                    & (F("status") == JobStatus.PENDING.value)
+                    & (F("pending_dep_count") > 0)
+                ).update_one(
+                    pending_dep_count=F("pending_dep_count") - 1,
+                    updated_at=now,
+                )
 
-        now = now_epoch()
-        cancelled_ulids: list[str] = []
-        for (child_ulid,) in children:
-            updated = await Job.query().filter(
-                (F("ulid") == child_ulid)
-                & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.CANCELLED.value,
-                last_error=f"Dependency {failed_ulid} failed/cancelled",
-                finished_at=now,
-                updated_at=now,
-            )
-            if updated is not None:
-                _notify_fire(child_ulid)
-                cancelled_ulids.append(child_ulid)
-
-        for ulid in cancelled_ulids:
-            await self._cascade_cancel_dependents(ulid)
+    async def _cascade_cancel_dependents(self, failed_ulid: str) -> list[str]:
+        """Cancel the pending jobs that depend on ``failed_ulid``, in this queue's
+        database, as one savepoint; returns the ULIDs cancelled, for notice after the
+        caller's commit."""
+        return await cascade_cancel_dependents(self.jobs, failed_ulid)
 
     async def cancel_job(self, job: Job) -> bool:
-        """Cancel a job and cascade-cancel its dependents."""
-        ok = await job.cancel()
-        if ok and job.status == JobStatus.CANCELLED.value:
-            _notify_fire(job.ulid)
-            await self._cascade_cancel_dependents(job.ulid)
-        return ok
+        """Cancel a job and cascade-cancel its dependents, as ``job.cancel()`` does.
 
-    async def replay_job(
-        self, job: Job, *, queue_name: Optional[str] = None
-    ) -> Optional[Job]:
+        Works on the database the job's row lives in. A PENDING job and its pending
+        dependents are cancelled in one transaction; a RUNNING job gets a cooperative
+        cancellation request. Waiters are notified after the commit, and only for what
+        was committed. Raises RuntimeError on a queue that was never initialized, as
+        every other finishing call does.
+        """
+        _ = self.db
+        return await _cancel_job(job)
+
+    async def replay_job(self, job: Job, *, queue_name: str | None = None) -> Job | None:
         """Replay a FAILED DLQ job back to its original queue.
 
         Resets the job to PENDING with retry_count=0 and clears the DLQ fields.
         Returns the updated Job, or None if the job wasn't FAILED.
+        Raises UniqueKeyConflictError, and leaves the job FAILED, while another job
+        with its ``unique_key`` is pending or running.
 
         Args:
             job: The failed job to replay.
@@ -1311,28 +1047,19 @@ class Queue:
             target_queue = "default"
 
         now = now_epoch()
-        updated = await Job.query().filter(
-            (F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value)
-        ).update_one(
-            status=JobStatus.PENDING.value,
-            queue_name=target_queue,
-            original_queue="",
-            retry_count=0,
-            finished_at=None,
-            eta=now,
-            updated_at=now,
-            progress=None,
-            progress_message="",
-        )
+        try:
+            updated = await self.jobs.filter(
+                (F("ulid") == job.ulid) & (F("status") == JobStatus.FAILED.value)
+            ).update_one(**failed_to_pending_fields(now, target_queue=target_queue))
+        except UniqueConstraintError as err:
+            raise await unique_key_conflict(job, err, self.jobs) from err
         return updated
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _check_rate_limits(
-        self, job: Job, worker_id: str, now_ts: int
-    ) -> bool:
+    async def _check_rate_limits(self, job: Job, worker_id: str, now_ts: int) -> bool:
         """Check rate limits for a claimed job. Returns True if rate-limited.
 
         Checks queue-level rate limit first, then task-level. If either limit
@@ -1341,7 +1068,7 @@ class Queue:
         # Queue-level rate limit
         queue_rate = self._rate_limits.get(job.queue_name)
         if queue_rate is not None:
-            allowed = await try_acquire(f"queue:{job.queue_name}", queue_rate)
+            allowed = await try_acquire(f"queue:{job.queue_name}", queue_rate, db=self.db)
             if not allowed:
                 await self._requeue_rate_limited(job, worker_id, queue_rate, now_ts)
                 return True
@@ -1349,11 +1076,9 @@ class Queue:
         # Task-level rate limit
         task_wrapper = self._tasks.get(job.task)
         if task_wrapper is not None and task_wrapper.rate_spec is not None:
-            allowed = await try_acquire(f"task:{job.task}", task_wrapper.rate_spec)
+            allowed = await try_acquire(f"task:{job.task}", task_wrapper.rate_spec, db=self.db)
             if not allowed:
-                await self._requeue_rate_limited(
-                    job, worker_id, task_wrapper.rate_spec, now_ts
-                )
+                await self._requeue_rate_limited(job, worker_id, task_wrapper.rate_spec, now_ts)
                 return True
 
         return False
@@ -1363,7 +1088,7 @@ class Queue:
     ) -> None:
         """Requeue a rate-limited job back to PENDING with a delayed ETA."""
         delay = max(1, int(1.0 / rate.refill_rate)) if rate.refill_rate > 0 else 1
-        await Job.query().filter(
+        await self.jobs.filter(
             (F("ulid") == job.ulid)
             & (F("status") == JobStatus.RUNNING.value)
             & (F("worker_id") == worker_id)
@@ -1379,13 +1104,13 @@ class Queue:
 
     async def _terminalize_attempt(
         self,
-        attempt_id: Optional[str],
+        attempt_id: str | None,
         status: str,
         finished_at: int,
         *,
-        error: Optional[str] = None,
-        traceback: Optional[str] = None,
-        failure_kind: Optional[str] = None,
+        error: str | None = None,
+        traceback: str | None = None,
+        failure_kind: str | None = None,
     ) -> None:
         """Update the attempt record to its terminal state via atomic update_one."""
         if attempt_id is None:
@@ -1402,7 +1127,7 @@ class Queue:
         if failure_kind is not None:
             update_fields["failure_kind"] = failure_kind
 
-        await JobAttempt.query().filter(
+        await self.attempts.filter(
             (F("ulid") == attempt_id) & (F("status") == AttemptStatus.RUNNING.value)
         ).update_one(**update_fields)
 
@@ -1416,21 +1141,16 @@ class Queue:
         if self._db is None:
             return []
         try:
-            cur = await self._db.adapter.execute(
-                "SELECT queue_name, status, COUNT(*) "
-                "FROM qler_jobs GROUP BY queue_name, status"
-            )
-            rows = await cur.fetchall()
-            await cur.close()
-            return rows
+            groups = await grouped_count(self.jobs.group_by("queue_name", "status"))
+            return [(g["queue_name"], g["status"], g["count"]) for g in groups]
         except Exception:
+            # A scrape must not fail, but the reason it came back empty is logged.
+            logger.warning("qler queue depth query failed; reporting no depth", exc_info=True)
             return []
 
     # ------------------------------------------------------------------
     # Archival
     # ------------------------------------------------------------------
-
-    _TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
     async def archive_jobs(self, older_than_seconds: int = 300) -> int:
         """Move terminal jobs older than threshold to archive table.
@@ -1440,34 +1160,27 @@ class Queue:
         await self._lazy_init()
         threshold = now_epoch() - older_than_seconds
 
-        _where = (
-            "WHERE status IN ('completed', 'failed', 'cancelled') "
-            "AND json_extract(data, '$.finished_at') IS NOT NULL "
-            "AND json_extract(data, '$.finished_at') < ?"
+        # A job with no finished_at reads NULL, and NULL < threshold matches nothing.
+        archivable = self.jobs.filter(
+            F("status").in_list(list(TERMINAL_STATUSES)) & (F("finished_at") < threshold)
         )
 
-        async with self._db.transaction():
-            cur = await self._db.adapter.execute(
-                f"INSERT INTO qler_jobs_archive SELECT * FROM qler_jobs {_where}",
-                [threshold],
-            )
-            await cur.close()
+        async with self.db.transaction():
+            moved = await archivable.distinct_values("ulid")
+            if not moved:
+                return 0
+            await archivable.copy_to(ARCHIVE_TABLE)
 
-            # Clean up reverse dependency map for jobs being archived
-            cur = await self._db.adapter.execute(
-                f"DELETE FROM qler_job_deps WHERE parent_ulid IN "
-                f"(SELECT ulid FROM qler_jobs {_where}) "
-                f"OR child_ulid IN (SELECT ulid FROM qler_jobs {_where})",
-                [threshold, threshold],
-            )
-            await cur.close()
+            # Remove the edges that name an archived job as parent or child
+            edges = self._dependency_edges
+            chunk = 499  # two lists of the chunk per statement: under SQLite's old 999 limit
+            for offset in range(0, len(moved), chunk):
+                part = moved[offset : offset + chunk]
+                await edges.filter(
+                    F("parent_ulid").in_list(part) | F("child_ulid").in_list(part)
+                ).delete()
 
-            cur = await self._db.adapter.execute(
-                f"DELETE FROM qler_jobs {_where}",
-                [threshold],
-            )
-            count = cur.rowcount
-            await cur.close()
+            count = await archivable.delete()
 
         if count:
             _lifecycle(
@@ -1489,42 +1202,33 @@ class Queue:
     ) -> list[Job]:
         """Query archived jobs (read-only)."""
         await self._lazy_init()
-        Job.set_db(self._db, "qler_jobs_archive")
-        try:
-            query = Job.query()
-            filters = []
-            if queue_name:
-                filters.append(F("queue_name") == queue_name)
-            if status:
-                filters.append(F("status") == status)
-            if filters:
-                combined = filters[0]
-                for f in filters[1:]:
-                    combined = combined & f
-                query = query.filter(combined)
-            return await query.order_by("-ulid").limit(limit).all()
-        finally:
-            Job.set_db(self._db, "qler_jobs")
+        query = self.archive
+        filters = []
+        if queue_name:
+            filters.append(F("queue_name") == queue_name)
+        if status:
+            filters.append(F("status") == status)
+        if filters:
+            combined = filters[0]
+            for f in filters[1:]:
+                combined = combined & f
+            query = query.filter(combined)
+        return await query.order_by("-ulid").limit(limit).all()
 
     async def pool_health(self) -> dict[str, Any]:
         """Report connection pool state for monitoring."""
         await self._lazy_init()
-        adapter = self._db.adapter
+        stats = self.db.pool_stats()
         return {
-            "pool_size": adapter._pool_size,
-            "available": adapter._pool.qsize(),
-            "healthy": adapter._pool.qsize() == adapter._pool_size,
+            "pool_size": stats.max_connections,
+            "available": stats.available_connections,
+            "healthy": stats.available_connections == stats.max_connections,
         }
 
     async def archive_count(self) -> int:
         """Return total number of archived jobs."""
         await self._lazy_init()
-        cur = await self._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_jobs_archive"
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        return row[0] if row else 0
+        return await self.archive.count()
 
     async def close(self) -> None:
         """Close the database connection if we own it."""
@@ -1537,7 +1241,7 @@ class Queue:
 def _calculate_retry_eta(job: Job) -> int:
     """Calculate the next retry ETA with exponential backoff + jitter."""
     base_delay = job.retry_delay
-    delay = min(base_delay * (2 ** job.retry_count), _MAX_RETRY_DELAY)
+    delay = min(base_delay * (2**job.retry_count), _MAX_RETRY_DELAY)
     # Add 10% jitter (non-cryptographic, intentional)
     jitter = delay * 0.1 * random.random()
     return now_epoch() + int(delay + jitter)

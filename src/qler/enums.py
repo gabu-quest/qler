@@ -11,6 +11,15 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+# One owner for the status sets. Tuples, so the SQL a filter makes has one order.
+ACTIVE_STATUSES: tuple[str, ...] = (JobStatus.PENDING.value, JobStatus.RUNNING.value)
+TERMINAL_STATUSES: tuple[str, ...] = (
+    JobStatus.COMPLETED.value,
+    JobStatus.FAILED.value,
+    JobStatus.CANCELLED.value,
+)
+
+
 class AttemptStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
@@ -28,6 +37,4 @@ class FailureKind(str, Enum):
     TIMEOUT = "timeout"
 
 
-RETRYABLE_FAILURES: frozenset[FailureKind] = frozenset(
-    {FailureKind.EXCEPTION, FailureKind.TIMEOUT}
-)
+RETRYABLE_FAILURES: frozenset[FailureKind] = frozenset({FailureKind.EXCEPTION, FailureKind.TIMEOUT})

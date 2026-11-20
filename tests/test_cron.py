@@ -1,17 +1,18 @@
 """Tests for cron scheduling — @cron decorator, CronWrapper, scheduler loop."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+import contextlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB, F
+
 from qler.cron import CronWrapper, cron
 from qler.enums import JobStatus
 from qler.exceptions import ConfigurationError
-from qler.models.job import Job
 from qler.queue import Queue
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 
 # Module-level functions (required by @cron's qualname validation)
@@ -120,9 +121,9 @@ async def test_cron_next_run():
     q = Queue(":memory:")
     wrapped = cron(q, "0 * * * *")(hourly_task)  # top of every hour
 
-    ref = datetime(2026, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+    ref = datetime(2026, 1, 15, 10, 30, 0, tzinfo=UTC)
     next_time = wrapped.next_run(after=ref)
-    assert next_time == datetime(2026, 1, 15, 11, 0, 0, tzinfo=timezone.utc)
+    assert next_time == datetime(2026, 1, 15, 11, 0, 0, tzinfo=UTC)
 
 
 async def test_cron_idempotency_key():
@@ -152,7 +153,7 @@ async def test_cron_max_running_blocks(queue):
     await wrapped.enqueue()
 
     # Check running count matches expectation
-    count = await Job.query().filter(
+    count = await queue.jobs.filter(
         (F("task") == wrapped.task_path)
         & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
     ).count()
@@ -166,7 +167,7 @@ async def test_cron_max_running_allows(queue):
 
     # Enqueue one — still below max_running of 2
     await wrapped.enqueue()
-    count = await Job.query().filter(
+    count = await queue.jobs.filter(
         (F("task") == wrapped.task_path)
         & F("status").in_list([JobStatus.PENDING.value, JobStatus.RUNNING.value])
     ).count()
@@ -241,15 +242,11 @@ async def test_cron_scheduler_loop_enqueues(queue):
     worker._running = False
     await asyncio.sleep(0.1)
     worker_task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await worker_task
-    except asyncio.CancelledError:
-        pass
 
     # The scheduler should have created at least one job
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
     assert len(all_jobs) == 1
 
 
@@ -261,7 +258,7 @@ async def test_cron_timezone():
     assert wrapped.schedule.timezone == "US/Eastern"
     # next_run should return a valid datetime
     next_time = wrapped.next_run()
-    assert next_time > datetime.now(timezone.utc)
+    assert next_time > datetime.now(UTC)
 
 
 async def test_cron_run_now(queue):
@@ -341,8 +338,8 @@ async def test_missed_runs_returns_timestamps():
     wrapped = cron(q, "0 * * * *")(catchup_task)
 
     # 3 hours ago
-    now = datetime(2026, 1, 15, 15, 0, 0, tzinfo=timezone.utc)
-    since = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 15, 15, 0, 0, tzinfo=UTC)
+    since = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
     since_ts = int(since.timestamp())
     now_ts = int(now.timestamp())
 
@@ -350,9 +347,9 @@ async def test_missed_runs_returns_timestamps():
     # Should be 13:00, 14:00, 15:00
     assert len(runs) == 3
     expected = [
-        int(datetime(2026, 1, 15, 13, 0, 0, tzinfo=timezone.utc).timestamp()),
-        int(datetime(2026, 1, 15, 14, 0, 0, tzinfo=timezone.utc).timestamp()),
-        int(datetime(2026, 1, 15, 15, 0, 0, tzinfo=timezone.utc).timestamp()),
+        int(datetime(2026, 1, 15, 13, 0, 0, tzinfo=UTC).timestamp()),
+        int(datetime(2026, 1, 15, 14, 0, 0, tzinfo=UTC).timestamp()),
+        int(datetime(2026, 1, 15, 15, 0, 0, tzinfo=UTC).timestamp()),
     ]
     assert runs == expected
 
@@ -363,8 +360,8 @@ async def test_missed_runs_empty_when_current():
     # Every hour
     wrapped = cron(q, "0 * * * *")(catchup_task)
 
-    now = datetime(2026, 1, 15, 15, 30, 0, tzinfo=timezone.utc)
-    since = datetime(2026, 1, 15, 15, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 15, 15, 30, 0, tzinfo=UTC)
+    since = datetime(2026, 1, 15, 15, 0, 0, tzinfo=UTC)
     since_ts = int(since.timestamp())
     now_ts = int(now.timestamp())
 
@@ -379,17 +376,17 @@ async def test_missed_runs_oldest_first():
     # Every 15 minutes
     wrapped = cron(q, "*/15 * * * *")(catchup_task)
 
-    now = datetime(2026, 1, 15, 16, 0, 0, tzinfo=timezone.utc)
-    since = datetime(2026, 1, 15, 15, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 15, 16, 0, 0, tzinfo=UTC)
+    since = datetime(2026, 1, 15, 15, 0, 0, tzinfo=UTC)
     since_ts = int(since.timestamp())
     now_ts = int(now.timestamp())
 
     runs = wrapped.missed_runs(since_ts, now_ts)
     expected = [
-        int(datetime(2026, 1, 15, 15, 15, 0, tzinfo=timezone.utc).timestamp()),
-        int(datetime(2026, 1, 15, 15, 30, 0, tzinfo=timezone.utc).timestamp()),
-        int(datetime(2026, 1, 15, 15, 45, 0, tzinfo=timezone.utc).timestamp()),
-        int(datetime(2026, 1, 15, 16, 0, 0, tzinfo=timezone.utc).timestamp()),
+        int(datetime(2026, 1, 15, 15, 15, 0, tzinfo=UTC).timestamp()),
+        int(datetime(2026, 1, 15, 15, 30, 0, tzinfo=UTC).timestamp()),
+        int(datetime(2026, 1, 15, 15, 45, 0, tzinfo=UTC).timestamp()),
+        int(datetime(2026, 1, 15, 16, 0, 0, tzinfo=UTC).timestamp()),
     ]
     assert len(runs) == 4
     assert runs == expected
@@ -405,7 +402,7 @@ async def test_find_last_enqueued_ts(queue):
     wrapped = cron(queue, "0 * * * *", catchup=1)(catchup_task)
 
     # Seed a job with a cron idempotency key
-    ts = int(datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+    ts = int(datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC).timestamp())
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(ts))
 
     result = await wrapped._find_last_enqueued_ts()
@@ -435,8 +432,8 @@ async def test_find_last_enqueued_ts_returns_most_recent(queue):
     """With multiple jobs, returns the most recent timestamp (not oldest)."""
     wrapped = cron(queue, "0 * * * *", catchup=1)(catchup_task)
 
-    ts_old = int(datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc).timestamp())
-    ts_new = int(datetime(2026, 1, 15, 14, 0, 0, tzinfo=timezone.utc).timestamp())
+    ts_old = int(datetime(2026, 1, 15, 10, 0, 0, tzinfo=UTC).timestamp())
+    ts_new = int(datetime(2026, 1, 15, 14, 0, 0, tzinfo=UTC).timestamp())
     # Enqueue oldest first
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(ts_old))
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(ts_new))
@@ -458,10 +455,8 @@ async def _run_worker_briefly(queue, duration=0.3):
     worker._running = False
     await asyncio.sleep(0.1)
     worker_task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await worker_task
-    except asyncio.CancelledError:
-        pass
 
 
 async def test_catchup_enqueues_missed(queue):
@@ -470,16 +465,14 @@ async def test_catchup_enqueues_missed(queue):
     wrapped = cron(queue, "0 * * * *", catchup=5, max_running=10)(catchup_task)
 
     # Seed a job from 4 hours ago
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old_ts = int((now - timedelta(hours=4)).replace(minute=0, second=0, microsecond=0).timestamp())
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
 
     await _run_worker_briefly(queue)
 
     # Should have the original + up to 5 catchup jobs (at least 2 hourly in 4h window)
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
     # Seed + catchup: 4 hours of hourly runs = seed + 3 catchups = 4, but timing can vary ±1
     assert 3 <= len(all_jobs) <= 5
     for job in all_jobs:
@@ -491,15 +484,13 @@ async def test_catchup_latest_only_one(queue):
     wrapped = cron(queue, "0 * * * *", catchup="latest", max_running=10)(catchup_latest_task)
 
     # Seed a job from 5 hours ago
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old_ts = int((now - timedelta(hours=5)).replace(minute=0, second=0, microsecond=0).timestamp())
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
     # The key check: exactly 1 catchup job (not 4-5), plus possibly the normal tick
     cron_timestamps = set()
     for job in all_jobs:
@@ -520,18 +511,15 @@ async def test_catchup_respects_max_running(queue):
     wrapped = cron(queue, "0 * * * *", catchup=5, max_running=1)(catchup_limited_task)
 
     # Seed a job from 3 hours ago (PENDING = counts toward max_running)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old_ts = int((now - timedelta(hours=3)).replace(minute=0, second=0, microsecond=0).timestamp())
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
     pending_running = [
-        j for j in all_jobs
-        if j.status in (JobStatus.PENDING.value, JobStatus.RUNNING.value)
+        j for j in all_jobs if j.status in (JobStatus.PENDING.value, JobStatus.RUNNING.value)
     ]
     # max_running guard should have prevented pile-up
     assert len(pending_running) <= 1
@@ -542,7 +530,7 @@ async def test_catchup_idempotent(queue):
     wrapped = cron(queue, "0 * * * *", catchup=3, max_running=10)(catchup_task)
 
     # Seed a job from 2 hours ago
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old_ts = int((now - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0).timestamp())
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
 
@@ -550,9 +538,7 @@ async def test_catchup_idempotent(queue):
     for _ in range(2):
         await _run_worker_briefly(queue, duration=0.2)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
     assert 2 <= len(all_jobs) <= 4  # seed + 1-2 catchups + possible normal tick
     # No duplicate idempotency keys
     keys = [j.idempotency_key for j in all_jobs]
@@ -565,9 +551,7 @@ async def test_catchup_no_history_skips(queue):
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
     # Should have exactly 1 job (from normal scheduling), not a flood
     assert len(all_jobs) == 1
 
@@ -577,7 +561,7 @@ async def test_catchup_latest_picks_most_recent(queue):
     wrapped = cron(queue, "0 * * * *", catchup="latest", max_running=10)(catchup_latest_task)
 
     # Seed a job from 5 hours ago
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old_ts = int((now - timedelta(hours=5)).replace(minute=0, second=0, microsecond=0).timestamp())
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
 
@@ -589,13 +573,8 @@ async def test_catchup_latest_picks_most_recent(queue):
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
-    catchup_keys = {
-        int(j.idempotency_key.rsplit(":", 1)[1])
-        for j in all_jobs
-    }
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
+    catchup_keys = {int(j.idempotency_key.rsplit(":", 1)[1]) for j in all_jobs}
     catchup_keys.discard(old_ts)
 
     # The catchup job should be the most recent hour, not the oldest missed
@@ -612,19 +591,14 @@ async def test_catchup_trims_to_limit(queue):
     wrapped = cron(queue, "0 * * * *", catchup=2, max_running=10)(catchup_task)
 
     # Seed a job from 5 hours ago — creates 4+ missed hourly runs
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     old_ts = int((now - timedelta(hours=5)).replace(minute=0, second=0, microsecond=0).timestamp())
     await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(old_ts))
 
     await _run_worker_briefly(queue)
 
-    all_jobs = await Job.query().filter(
-        F("task") == wrapped.task_path
-    ).all()
-    catchup_keys = sorted(
-        int(j.idempotency_key.rsplit(":", 1)[1])
-        for j in all_jobs
-    )
+    all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
+    catchup_keys = sorted(int(j.idempotency_key.rsplit(":", 1)[1]) for j in all_jobs)
 
     # Remove seed and any normal tick (within 60s of now)
     now_ts = int(now.timestamp())
@@ -634,3 +608,22 @@ async def test_catchup_trims_to_limit(queue):
     assert len(catchup_only) == 2
     assert catchup_only == sorted(catchup_only)  # oldest first
     assert catchup_only[0] == old_ts + 3600  # first missed hour after seed
+
+
+async def test_find_last_enqueued_ts_reads_its_own_queue_after_another_was_initialised_last(
+    tmp_path,
+):
+    """The last-run lookup goes through the queue the cron task was registered on."""
+    qa = Queue(str(tmp_path / "a.db"))
+    await qa.init_db()
+    wrapped = cron(qa, "0 * * * *", catchup=1)(catchup_task)
+    ts = int(datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC).timestamp())
+    await wrapped.enqueue(_idempotency_key=wrapped.idempotency_key(ts))
+
+    qb = Queue(str(tmp_path / "b.db"))
+    await qb.init_db()  # binds the class-wide handle to B last
+    try:
+        assert await wrapped._find_last_enqueued_ts() == ts
+    finally:
+        await qa.close()
+        await qb.close()

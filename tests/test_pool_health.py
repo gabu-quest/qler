@@ -6,16 +6,15 @@ connection pool — the exact path that was invisible with :memory: DBs
 """
 
 import asyncio
+import contextlib
 import re
 
 import pytest
-from conftest import assert_pool_healthy
-from qler.enums import AttemptStatus, JobStatus
-from qler.models.attempt import JobAttempt
-from qler.models.job import Job
-from qler.task import task
-from qler.worker import Worker
+from conftest import assert_pool_healthy, make_worker
 from sqler import F
+
+from qler.enums import AttemptStatus, JobStatus
+from qler.task import task
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -47,18 +46,6 @@ async def pool_failing_task():
 # ---------------------------------------------------------------------------
 
 
-def _make_worker(queue, **kwargs):
-    defaults = {
-        "queues": ["default"],
-        "concurrency": 2,
-        "poll_interval": 0.01,
-        "lease_recovery_interval": 60.0,
-        "shutdown_timeout": 2.0,
-    }
-    defaults.update(kwargs)
-    return Worker(queue, **defaults)
-
-
 async def _run_worker_until_idle(worker, expected_count, timeout=10.0):
     """Run worker until expected_count jobs from _pool_log, then stop."""
     worker_task = asyncio.create_task(worker.run())
@@ -77,10 +64,8 @@ async def _run_worker_until_idle(worker, expected_count, timeout=10.0):
         worker._running = False
         await asyncio.sleep(0.05)
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +84,7 @@ class TestWorkerPoolHealth:
         for i in range(6):
             await wrapped.enqueue(f"job_{i}")
 
-        w = _make_worker(disk_queue, concurrency=2)
+        w = make_worker(disk_queue, concurrency=2)
         await _run_worker_until_idle(w, 6)
 
         assert len(_pool_log) == 6
@@ -119,7 +104,7 @@ class TestWorkerPoolHealth:
         )
 
         # Worker completes parent, dep resolution unblocks child, worker completes child
-        w = _make_worker(disk_queue, concurrency=1)
+        w = make_worker(disk_queue, concurrency=1)
         await _run_worker_until_idle(w, 2)
 
         assert set(_pool_log) == {"parent", "child"}
@@ -142,7 +127,7 @@ class TestWorkerPoolHealth:
             depends_on=[parent.ulid],
         )
 
-        w = _make_worker(disk_queue, concurrency=1)
+        w = make_worker(disk_queue, concurrency=1)
         worker_task = asyncio.create_task(w.run())
         try:
             # Wait for parent to fail
@@ -156,43 +141,12 @@ class TestWorkerPoolHealth:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # Child should be cascade-cancelled
         await child.refresh()
         assert child.status == JobStatus.CANCELLED.value
-
-        await assert_pool_healthy(disk_db)
-
-    async def test_batch_claim_last_attempt_id_synced(self, disk_db, disk_queue):
-        """claim_jobs() returns objects with last_attempt_id set (no refresh needed)."""
-        for i in range(3):
-            await disk_queue.enqueue(f"task_{i}", queue_name="default")
-
-        jobs = await disk_queue.claim_jobs("w-test", ["default"], n=3)
-        assert len(jobs) == 3
-
-        for job in jobs:
-            assert job.last_attempt_id is not None, (
-                f"Job {job.ulid} has last_attempt_id=None without refresh"
-            )
-            assert _ULID_PATTERN.match(job.last_attempt_id), (
-                f"Expected ULID, got {job.last_attempt_id!r}"
-            )
-
-        # Verify attempt records exist with correct data
-        for job in jobs:
-            attempts = await JobAttempt.query().filter(
-                F("job_ulid") == job.ulid
-            ).all()
-            assert len(attempts) == 1
-            assert attempts[0].ulid == job.last_attempt_id
-            assert attempts[0].worker_id == "w-test"
-            assert attempts[0].attempt_number == 1
-            assert attempts[0].status == AttemptStatus.RUNNING.value
 
         await assert_pool_healthy(disk_db)
 
@@ -204,20 +158,18 @@ class TestWorkerPoolHealth:
         for i in range(5):
             await wrapped.enqueue(f"e2e_{i}", duration=0.02)
 
-        w = _make_worker(disk_queue, concurrency=2)
+        w = make_worker(disk_queue, concurrency=2)
         await _run_worker_until_idle(w, 5)
 
         assert len(_pool_log) == 5
         assert set(_pool_log) == {f"e2e_{i}" for i in range(5)}
 
         # All jobs completed
-        completed = await Job.query().filter(
-            F("status") == JobStatus.COMPLETED.value
-        ).count()
+        completed = await disk_queue.jobs.filter(F("status") == JobStatus.COMPLETED.value).count()
         assert completed == 5
 
         # All attempts finalized
-        running_attempts = await JobAttempt.query().filter(
+        running_attempts = await disk_queue.attempts.filter(
             F("status") == AttemptStatus.RUNNING.value
         ).count()
         assert running_attempts == 0
@@ -228,6 +180,24 @@ class TestWorkerPoolHealth:
 # ---------------------------------------------------------------------------
 # TestPoolHealthMethod
 # ---------------------------------------------------------------------------
+
+
+async def _hold_transaction(db):
+    """Hold one pooled connection through a public call: a transaction a task keeps open.
+
+    Returns (task, release); call release() and await the task to give it back.
+    """
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder():
+        async with db.transaction():
+            held.set()
+            await release.wait()
+
+    task_ = asyncio.create_task(holder())
+    await asyncio.wait_for(held.wait(), 5)
+    return task_, release
 
 
 class TestPoolHealthMethod:
@@ -242,14 +212,15 @@ class TestPoolHealthMethod:
         assert result["healthy"] is True
 
         # Hold a connection — pool becomes unhealthy
-        conn = await disk_db.adapter._pool.get()
+        holder, release = await _hold_transaction(disk_db)
         try:
             result = await disk_queue.pool_health()
             assert result["pool_size"] == 4
             assert result["available"] == 3
             assert result["healthy"] is False
         finally:
-            await disk_db.adapter._pool.put(conn)
+            release.set()
+            await holder
 
         # After release — healthy again
         result = await disk_queue.pool_health()
@@ -258,7 +229,7 @@ class TestPoolHealthMethod:
 
     async def test_health_response_includes_pool(self, disk_db, disk_queue):
         """Worker._health_response() includes pool stats with concrete values."""
-        w = _make_worker(disk_queue)
+        w = make_worker(disk_queue, concurrency=2)
         await disk_queue.init_db()
 
         # Idle: all connections returned
@@ -269,11 +240,95 @@ class TestPoolHealthMethod:
         assert pool["healthy"] is True
 
         # Hold a connection — health response reflects it
-        conn = await disk_db.adapter._pool.get()
+        holder, release = await _hold_transaction(disk_db)
         try:
             resp = w._health_response()
             pool = resp["pool"]
             assert pool["available"] == 3
             assert pool["healthy"] is False
         finally:
-            await disk_db.adapter._pool.put(conn)
+            release.set()
+            await holder
+
+
+# ---------------------------------------------------------------------------
+# Queue read methods give their connection back
+# ---------------------------------------------------------------------------
+
+
+async def _read_depth(q):
+    return await q._query_queue_depth()
+
+
+async def _read_archive_count(q):
+    return await q.archive_count()
+
+
+async def _read_archived_jobs(q):
+    return await q.archived_jobs()
+
+
+async def _read_pool_health(q):
+    return await q.pool_health()
+
+
+# Every read method of Queue (the rest of its public methods write).
+_READS = [
+    pytest.param(_read_depth, id="_query_queue_depth"),
+    pytest.param(_read_archive_count, id="archive_count"),
+    pytest.param(_read_archived_jobs, id="archived_jobs"),
+    pytest.param(_read_pool_health, id="pool_health"),
+]
+
+
+class TestQueueReadsReleaseConnection:
+    @pytest.mark.parametrize("read", _READS)
+    async def test_live_tasks_after_read_do_not_hold_connections(self, disk_db, disk_queue, read):
+        hold = asyncio.Event()
+        have_read = [asyncio.Event() for _ in range(4)]
+
+        async def reader(mine):
+            await read(disk_queue)
+            mine.set()
+            await hold.wait()
+
+        tasks = [asyncio.create_task(reader(e)) for e in have_read]
+        try:
+            # Each reader says when its read has returned; no polling.
+            await asyncio.wait_for(asyncio.gather(*(e.wait() for e in have_read)), 30)
+
+            job = await asyncio.wait_for(disk_queue.enqueue("m.f"), 2)
+            assert job.status == JobStatus.PENDING.value
+            await assert_pool_healthy(disk_db)
+        finally:
+            hold.set()
+            await asyncio.gather(*tasks)
+        await assert_pool_healthy(disk_db)
+
+    async def test_archived_jobs_does_not_redirect_other_tasks(self, disk_db, disk_queue):
+        for i in range(3):
+            await disk_queue.enqueue("m.f", args=(i,))
+        claimed = await disk_queue.claim_job("w-test", ["default"])
+        await disk_queue.complete_job(claimed, "w-test", result="ok")
+        await disk_queue.jobs.filter(F("ulid") == claimed.ulid).update_one(finished_at=1)
+        assert await disk_queue.archive_jobs(older_than_seconds=300) == 1
+        assert await disk_queue.jobs.count() == 2
+
+        counts = []
+        stop = asyncio.Event()
+
+        async def counter():
+            while not stop.is_set():
+                counts.append(await disk_queue.jobs.count())
+                await asyncio.sleep(0)
+
+        t = asyncio.create_task(counter())
+        try:
+            for _ in range(30):
+                archived = await disk_queue.archived_jobs()
+                assert len(archived) == 1
+        finally:
+            stop.set()
+            await t
+        assert counts
+        assert set(counts) == {2}

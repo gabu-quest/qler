@@ -1,22 +1,27 @@
 """Tests for the Worker class — init, execution, concurrency, shutdown, correlation."""
 
 import asyncio
+import contextlib
 import json
+import logging
 import re
+import sqlite3
 import sys
+import threading
 
 import pytest
 import pytest_asyncio
-from qler._context import current_job
+from conftest import make_worker, run_worker_until_done
+from sqler import AsyncSQLerDB, F
+
+from qler._context import current_job, current_queue
 from qler._time import generate_ulid, now_epoch
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import ConfigurationError, JobFailedError
-from qler.models.attempt import JobAttempt
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 _WORKER_ID_PATTERN = re.compile(r"^.+:\d+:[0-9A-Z]{26}$")
@@ -98,13 +103,256 @@ async def timeout_fast_task():
 
 def timeout_sync_task():
     import time
+
     time.sleep(3)
     return "should not reach"
+
+
+# Module-level tasks for shutdown-timeout tests; events are made per test.
+_held_started: asyncio.Event | None = None
+_held_runs = 0
+
+
+async def held_task():
+    """First run outlives any shutdown timeout; a later run returns at once."""
+    global _held_runs
+    _held_runs += 1
+    _held_started.set()
+    if _held_runs == 1:
+        await asyncio.Event().wait()
+    return "second run"
+
+
+async def swallowing_task():
+    _held_started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        return "swallowed"
+
+
+# Set per test by TestShutdownBounds.
+_drain_release: asyncio.Event | None = None
+_lease_at_finish: list[tuple[int, int]] = []
+
+
+async def draining_task():
+    """First run waits for the test's release, then records (lease, clock)."""
+    global _held_runs
+    _held_runs += 1
+    if _held_runs > 1:
+        return "second run"
+    _held_started.set()
+    await _drain_release.wait()
+    row = await current_queue().jobs.filter(F("ulid") == current_job().ulid).first()
+    _lease_at_finish.append((row.lease_expires_at, now_epoch()))
+    return "first run"
+
+
+async def stubborn_task():
+    """Swallows the shutdown's cancel and keeps waiting."""
+    _held_started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await _drain_release.wait()
+    return "released"
+
+
+# Set per test by TestShutdownRelease.
+_thread_entered: threading.Event | None = None
+_thread_go: threading.Event | None = None
+_thread_returned: threading.Event | None = None
+_on_cut: asyncio.Event | None = None
+_resume: asyncio.Event | None = None
+_honour_started: asyncio.Event | None = None
+_ignore_started: asyncio.Event | None = None
+_ignore_release: asyncio.Event | None = None
+
+
+def blocking_sync_task():
+    """First run blocks its thread until the test sets _thread_go; a later run returns."""
+    global _held_runs
+    _held_runs += 1
+    if _held_runs > 1:
+        return "second run"
+    _thread_entered.set()
+    try:
+        _thread_go.wait(30)
+        return "first run"
+    finally:
+        _thread_returned.set()
+
+
+async def pausing_on_cut_task():
+    """Honours the cut, but only after the test sets _resume."""
+    _held_started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        _on_cut.set()
+        await _resume.wait()
+        raise
+
+
+async def honouring_task():
+    _honour_started.set()
+    await asyncio.Event().wait()
+
+
+async def ignoring_task():
+    _ignore_started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await _ignore_release.wait()
+    return "ignored"
+
+
+# Set per test by TestShutdownSeesWorkAJobStarted.
+_children: set[asyncio.Task] = set()
+_job_task: asyncio.Task | None = None
+_outside_go: threading.Event | None = None
+
+
+async def job_awaiting_a_thread():
+    """An async job that hands its work to the loop's default pool and awaits it."""
+    return await asyncio.to_thread(blocking_sync_task)
+
+
+async def job_leaving_an_executor_call():
+    """Submits to the default pool without awaiting it, then waits; honours the cut."""
+    asyncio.get_running_loop().run_in_executor(None, blocking_sync_task)
+    _held_started.set()
+    await asyncio.Event().wait()
+
+
+async def job_whose_thread_finished_earlier():
+    """Its to_thread call is over before the cut; then it waits and honours the cut."""
+    assert await asyncio.to_thread(sync_task, 21) == 42
+    _held_started.set()
+    await asyncio.Event().wait()
+
+
+def raising_after_go():
+    _thread_entered.set()
+    try:
+        _thread_go.wait(30)
+        raise RuntimeError("thread failed")
+    finally:
+        _thread_returned.set()
+
+
+async def job_whose_thread_raises():
+    return await asyncio.to_thread(raising_after_go)
+
+
+_child_cancels: list[str] = []
+
+
+async def child_running_on():
+    """Runs until the test lets it go; records a cancel if one reaches it."""
+    _ignore_started.set()
+    try:
+        await _ignore_release.wait()
+    except asyncio.CancelledError:
+        _child_cancels.append("child_running_on")
+        raise
+
+
+async def job_with_a_child_running_on():
+    _children.add(asyncio.create_task(child_running_on()))
+    await asyncio.Event().wait()
+
+
+async def child_ending_after_its_job():
+    """Ends a few passes of the loop after the job's own task has ended."""
+    _ignore_started.set()
+    await asyncio.wait({_job_task})
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+async def job_with_a_child_that_ends_in_the_grace():
+    global _job_task
+    _job_task = asyncio.current_task()
+    _children.add(asyncio.create_task(child_ending_after_its_job()))
+    await asyncio.Event().wait()
+
+
+_other_listed: asyncio.Event | None = None
+
+
+async def honouring_once_the_other_is_listed():
+    """Honours the cut, but only after the other cut job is listed as left for recovery."""
+    _honour_started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await _other_listed.wait()
+        raise
+
+
+class _SignalOnAppend(list):
+    """A list that calls `on_append` after each append."""
+
+    def __init__(self, on_append):
+        super().__init__()
+        self._on_append = on_append
+
+    def append(self, item):
+        super().append(item)
+        self._on_append()
+
+
+_blockers_wanted = 0
+_blockers_ran = 0
+_blockers_lock = threading.Lock()
+_blockers_all_in: threading.Event | None = None
+
+
+def counting_blocker():
+    """Counts itself in, then blocks its thread until the test sets _thread_go."""
+    global _blockers_ran
+    with _blockers_lock:
+        _blockers_ran += 1
+        if _blockers_ran == _blockers_wanted:
+            _blockers_all_in.set()
+    _thread_go.wait(30)
+
+
+async def job_with_more_calls_than_threads():
+    """Hands the pool eight calls more than it has threads. On the cut, gather has cancelled
+    them all before this handler runs: the calls still queued never run; then the threads go."""
+    calls = [asyncio.to_thread(counting_blocker) for _ in range(_blockers_wanted + 8)]
+    try:
+        await asyncio.gather(*calls)
+    except asyncio.CancelledError:
+        _thread_go.set()
+        raise
+
+
+async def started_task():
+    _held_started.set()
+    return "started"
+
+
+class _SignalOnAdd(set):
+    """A set that calls `on_add` after each add: tells a test the shutdown cut a job."""
+
+    def __init__(self, on_add):
+        super().__init__()
+        self._on_add = on_add
+
+    def add(self, item):
+        super().add(item)
+        self._on_add()
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest_asyncio.fixture
 async def worker_db():
@@ -123,44 +371,16 @@ async def worker_queue(worker_db):
     yield q
 
 
-def _make_worker(queue, **kwargs):
-    """Create a Worker with fast test defaults."""
-    defaults = {
-        "queues": ["default"],
-        "concurrency": 1,
-        "poll_interval": 0.01,
-        "lease_recovery_interval": 60.0,
-        "shutdown_timeout": 2.0,
-    }
-    defaults.update(kwargs)
-    return Worker(queue, **defaults)
-
-
-async def _run_worker_until_job_done(worker, job, timeout=5.0):
-    """Run worker in background, wait for job to reach terminal state, stop worker."""
-    worker_task = asyncio.create_task(worker.run())
-    try:
-        result = await job.wait(timeout=timeout, poll_interval=0.02)
-        return result
-    finally:
-        worker._running = False
-        await asyncio.sleep(0.05)
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-
-
 # ---------------------------------------------------------------------------
 # TestWorkerInit
 # ---------------------------------------------------------------------------
+
 
 class TestWorkerInit:
     """Worker.__init__ validation and defaults."""
 
     def test_worker_id_format(self, worker_queue):
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         assert _WORKER_ID_PATTERN.match(w.worker_id), (
             f"Expected hostname:pid:ULID format, got {w.worker_id!r}"
         )
@@ -197,6 +417,7 @@ class TestWorkerInit:
 # TestWorkerExecution
 # ---------------------------------------------------------------------------
 
+
 class TestWorkerExecution:
     """Worker claims and executes jobs correctly."""
 
@@ -204,8 +425,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(succeeding_task)
         job = await wrapped.enqueue(10, y=5)
 
-        w = _make_worker(worker_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        result = await run_worker_until_done(w, job)
         assert result.status == "completed"
         assert result.result == {"sum": 15}
 
@@ -213,8 +434,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue, sync=True)(sync_task)
         job = await wrapped.enqueue(21)
 
-        w = _make_worker(worker_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        result = await run_worker_until_done(w, job)
         assert result.status == "completed"
         assert result.result == 42
 
@@ -222,9 +443,9 @@ class TestWorkerExecution:
         """Unregistered task path → permanent FAILED with TASK_NOT_FOUND."""
         job = await worker_queue.enqueue("nonexistent.task_fn")
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.TASK_NOT_FOUND.value
 
         await job.refresh()
@@ -240,9 +461,9 @@ class TestWorkerExecution:
             args=(1,),  # Missing b and c
         )
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.SIGNATURE_MISMATCH.value
 
         await job.refresh()
@@ -256,7 +477,7 @@ class TestWorkerExecution:
         wrapped = task(q)(failing_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         worker_task = asyncio.create_task(w.run())
         try:
             # Wait for first attempt to fail and job to go back to pending
@@ -269,10 +490,8 @@ class TestWorkerExecution:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # After 1 failure with max_retries=1, job goes back to pending for retry
         assert job.status == "pending"
@@ -285,9 +504,9 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(failing_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         with pytest.raises(JobFailedError):
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == "failed"
@@ -299,8 +518,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(succeeding_task)
         job = await wrapped.enqueue(3, y=7)
 
-        w = _make_worker(worker_queue)
-        result = await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        result = await run_worker_until_done(w, job)
         assert result.result_json is not None
         assert result.result == {"sum": 10}
 
@@ -312,8 +531,8 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(context_var_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         assert _captured_job_ulid == job.ulid
 
@@ -322,12 +541,10 @@ class TestWorkerExecution:
         wrapped = task(worker_queue)(succeeding_task)
         job = await wrapped.enqueue(1)
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await worker_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.COMPLETED.value
         assert attempts[0].worker_id == w.worker_id
@@ -336,6 +553,7 @@ class TestWorkerExecution:
 # ---------------------------------------------------------------------------
 # TestWorkerConcurrency
 # ---------------------------------------------------------------------------
+
 
 class TestWorkerConcurrency:
     """Concurrency control via semaphore."""
@@ -346,7 +564,7 @@ class TestWorkerConcurrency:
         job1 = await wrapped.enqueue(duration=0.1)
         job2 = await wrapped.enqueue(duration=0.1)
 
-        w = _make_worker(worker_queue, concurrency=2)
+        w = make_worker(worker_queue, concurrency=2)
         worker_task = asyncio.create_task(w.run())
         try:
             # Both should complete within ~0.2s (parallel), not ~0.4s (serial)
@@ -355,10 +573,8 @@ class TestWorkerConcurrency:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job1.refresh()
         await job2.refresh()
@@ -373,7 +589,7 @@ class TestWorkerConcurrency:
         job1 = await wrapped.enqueue("a")
         job2 = await wrapped.enqueue("b")
 
-        w = _make_worker(worker_queue, concurrency=1)
+        w = make_worker(worker_queue, concurrency=1)
         worker_task = asyncio.create_task(w.run())
         try:
             await job1.wait(timeout=2.0, poll_interval=0.02)
@@ -381,10 +597,8 @@ class TestWorkerConcurrency:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         # With concurrency=1, one job must fully complete before the next starts.
         # Order is non-deterministic (a or b first), but must be serial.
@@ -403,6 +617,7 @@ class TestWorkerConcurrency:
 # TestWorkerShutdown
 # ---------------------------------------------------------------------------
 
+
 class TestWorkerShutdown:
     """Graceful shutdown behavior."""
 
@@ -411,7 +626,7 @@ class TestWorkerShutdown:
         wrapped = task(worker_queue)(slow_task)
         job = await wrapped.enqueue(duration=0.1)
 
-        w = _make_worker(worker_queue, shutdown_timeout=5.0)
+        w = make_worker(worker_queue, shutdown_timeout=5.0)
         worker_task = asyncio.create_task(w.run())
 
         # Wait for job to start executing
@@ -424,17 +639,15 @@ class TestWorkerShutdown:
         w._running = False
         await asyncio.sleep(0.3)  # Let it drain
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
         await job.refresh()
         assert job.status == "completed"
 
     async def test_running_flag_stops_claim_loop(self, worker_queue):
         """Setting _running = False causes the worker task to exit cleanly."""
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
 
         await asyncio.sleep(0.05)
@@ -454,6 +667,7 @@ class TestWorkerShutdown:
 # TestCorrelation
 # ---------------------------------------------------------------------------
 
+
 class TestCorrelation:
     """Correlation context wraps execution."""
 
@@ -468,8 +682,8 @@ class TestCorrelation:
             correlation_id="my-trace-123",
         )
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         assert _captured_correlation == "my-trace-123"
 
@@ -481,8 +695,8 @@ class TestCorrelation:
         wrapped = task(worker_queue)(capture_no_correlation_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         # correlation_id defaults to "" for jobs enqueued without one
         assert _captured_correlation == ""
@@ -491,6 +705,7 @@ class TestCorrelation:
 # ---------------------------------------------------------------------------
 # TestLeaseRenewalLoop
 # ---------------------------------------------------------------------------
+
 
 class TestLeaseRenewalLoop:
     """Verify the background lease renewal loop extends leases mid-execution."""
@@ -502,7 +717,7 @@ class TestLeaseRenewalLoop:
         wrapped = task(q)(slow_task)
         job = await wrapped.enqueue(duration=3.0)
 
-        w = _make_worker(q, lease_recovery_interval=60.0)
+        w = make_worker(q, lease_recovery_interval=60.0)
         worker_task = asyncio.create_task(w.run())
 
         try:
@@ -523,8 +738,7 @@ class TestLeaseRenewalLoop:
             # Lease should have been extended beyond the original
             await job.refresh()
             assert job.lease_expires_at > original_expiry, (
-                f"Lease was not renewed: original={original_expiry}, "
-                f"current={job.lease_expires_at}"
+                f"Lease was not renewed: original={original_expiry}, current={job.lease_expires_at}"
             )
 
             # Job should still complete successfully despite taking 3s > 2s lease
@@ -535,63 +749,849 @@ class TestLeaseRenewalLoop:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
 
 # ---------------------------------------------------------------------------
 # TestShutdownTimeout
 # ---------------------------------------------------------------------------
 
-class TestShutdownTimeout:
-    """Verify forced cancellation when jobs exceed shutdown_timeout."""
 
-    async def test_timeout_cancels_long_running_job(self, worker_db):
-        """Job exceeding shutdown_timeout gets cancelled and marked FAILED."""
+class TestShutdownTimeout:
+    """A job that outlives shutdown_timeout: a user's cancel, an outcome write, a swallowed cut."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_shutdown_state(self):
+        global _held_started, _held_runs
+        _held_started = asyncio.Event()
+        _held_runs = 0
+        yield
+
+    async def _start(self, w):
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        return worker_task
+
+    async def _shut_down(self, w, worker_task):
+        w._running = False
+        await asyncio.wait_for(worker_task, timeout=5.0)
+
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
+
+    async def _attempts(self, queue, job):
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
+        return sorted(attempts, key=lambda a: a.attempt_number)
+
+    async def test_user_cancel_during_shutdown_still_fails_cancelled(self, worker_db, caplog):
+        """A cancel the user asked for keeps today's outcome when shutdown cuts the job."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(held_task)
+        job = await wrapped.enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        worker_task = await self._start(w)
+        w._running = False  # draining from here on
+        assert await q.cancel_job(job) is True
+        with caplog.at_level("WARNING", logger="qler.worker"):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        row = await self._row(q, job)
+        assert row.status == JobStatus.FAILED.value
+        assert row.last_failure_kind == FailureKind.CANCELLED.value
+        assert row.retry_count == 0
+        attempts = await self._attempts(q, job)
+        assert [(a.status, a.failure_kind) for a in attempts] == [
+            (AttemptStatus.FAILED.value, FailureKind.CANCELLED.value),
+        ]
+        assert (
+            "released 0 to be claimed at once, 0 keep their lease for lease recovery, "
+            "failed 1 as cancelled"
+        ) in caplog.text
+
+    async def test_job_finishing_just_after_timeout_is_recorded_once(self, worker_db, monkeypatch):
+        """A job writing its outcome when the timeout passes finishes the write, once."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(succeeding_task)
+        job = await wrapped.enqueue(1)
+
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+        timeout_passed = asyncio.Event()
+        calls = []
+        real_complete = q.complete_job
+        real_wait = asyncio.wait
+
+        async def gated_complete(*args, **kwargs):
+            calls.append(args[0].ulid)
+            entered.set()
+            await gate.wait()
+            return await real_complete(*args, **kwargs)
+
+        async def wait_then_signal(*args, **kwargs):
+            res = await real_wait(*args, **kwargs)
+            if kwargs.get("timeout") == 0.2:
+                timeout_passed.set()
+            return res
+
+        monkeypatch.setattr(q, "complete_job", gated_complete)
+        monkeypatch.setattr(asyncio, "wait", wait_then_signal)
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        w._running = False
+        await asyncio.wait_for(timeout_passed.wait(), timeout=5.0)
+        gate.set()
+        await asyncio.wait_for(worker_task, timeout=5.0)
+
+        row = await self._row(q, job)
+        assert row.status == JobStatus.COMPLETED.value
+        assert row.result == {"sum": 2}
+        assert calls == [job.ulid]
+        attempts = await self._attempts(q, job)
+        assert [a.status for a in attempts] == [AttemptStatus.COMPLETED.value]
+
+    async def test_task_swallowing_the_cancel_completes_once(self, worker_db):
+        """A task that catches the shutdown's cancel and returns is completed, once."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(swallowing_task)
+        job = await wrapped.enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        await self._shut_down(w, await self._start(w))
+
+        row = await self._row(q, job)
+        assert row.status == JobStatus.COMPLETED.value
+        assert row.result == "swallowed"
+        attempts = await self._attempts(q, job)
+        assert [a.status for a in attempts] == [AttemptStatus.COMPLETED.value]
+        assert w._left_for_recovery == []
+
+
+# ---------------------------------------------------------------------------
+# TestShutdownRelease
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownRelease:
+    """A job the shutdown cut is claimable at once only when its work has really ended."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        global _held_started, _held_runs, _drain_release
+        global _thread_entered, _thread_go, _thread_returned, _on_cut, _resume
+        global _honour_started, _ignore_started, _ignore_release
+        _held_started = asyncio.Event()
+        _held_runs = 0
+        _drain_release = asyncio.Event()
+        _thread_entered = threading.Event()
+        _thread_go = threading.Event()
+        _thread_returned = threading.Event()
+        _on_cut = asyncio.Event()
+        _resume = asyncio.Event()
+        _honour_started = asyncio.Event()
+        _ignore_started = asyncio.Event()
+        _ignore_release = asyncio.Event()
+        yield
+        _thread_go.set()  # never leave a test's thread blocked
+
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
+
+    async def _attempt_rows(self, queue, job):
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
+        return [
+            (a.status, a.failure_kind, a.error, a.worker_id)
+            for a in sorted(attempts, key=lambda a: a.attempt_number)
+        ]
+
+    async def _end_lease_now(self, q, job):
+        """Move the lease end into the past, as the clock would after the lease length."""
+        await q.jobs.filter(F("ulid") == job.ulid).update_one(lease_expires_at=now_epoch() - 1)
+
+    async def test_released_job_is_claimed_before_its_lease_would_end(self, worker_db):
+        """An async task that honours the cut: a second worker runs it at once."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        job = await task(q)(held_task).enqueue()
+
+        w1 = make_worker(q, shutdown_timeout=0.2)
+        w1_task = asyncio.create_task(w1.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        lease_end = (await self._row(q, job)).lease_expires_at
+        w1._running = False
+        await asyncio.wait_for(w1_task, timeout=5.0)
+
+        w2 = make_worker(q)
+        result = await run_worker_until_done(w2, job)
+        assert now_epoch() < lease_end
+        assert result.status == JobStatus.COMPLETED.value
+        assert result.result == "second run"
+        assert result.retry_count == 0
+        assert _held_runs == 2
+        assert await self._attempt_rows(q, job) == [
+            (
+                AttemptStatus.LEASE_EXPIRED.value,
+                FailureKind.LEASE_EXPIRED.value,
+                "Lease expired",
+                w1.worker_id,
+            ),
+            (AttemptStatus.COMPLETED.value, None, None, w2.worker_id),
+        ]
+
+    async def test_release_equals_recovery_after_the_lease_ends(self, worker_db):
+        """Two copies of one job with no retries left: released and recovered end alike."""
         q = Queue(worker_db, default_lease_duration=30, default_max_retries=0)
         await q.init_db()
-        wrapped = task(q)(slow_task)
-        job = await wrapped.enqueue(duration=30.0)
+        wrapped = task(q)(held_task)
+        # The copy for recovery is claimed by a worker that is gone, and never run.
+        recovered = await wrapped.enqueue()
+        claimed = await q.claim_job("gone-worker", ["default"])
+        assert claimed.ulid == recovered.ulid
+        released = await wrapped.enqueue()
 
-        w = _make_worker(q, shutdown_timeout=0.1)
-        worker_task = asyncio.create_task(w.run())
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        w._running = False
+        await asyncio.wait_for(w_task, timeout=5.0)
 
+        await self._end_lease_now(q, recovered)
+        assert await q.recover_expired_leases() == 1
+
+        def state(row):
+            return (
+                row.status,
+                row.retry_count,
+                row.worker_id,
+                row.lease_expires_at,
+                row.progress,
+                row.progress_message,
+                row.last_failure_kind,
+                row.last_error,
+            )
+
+        a, b = await self._row(q, released), await self._row(q, recovered)
+        assert state(a) == (JobStatus.PENDING.value, 0, "", None, None, "", None, None)
+        assert state(a) == state(b)
+        rows_a = [r[:3] for r in await self._attempt_rows(q, released)]
+        rows_b = [r[:3] for r in await self._attempt_rows(q, recovered)]
+        assert rows_a == [
+            (AttemptStatus.LEASE_EXPIRED.value, FailureKind.LEASE_EXPIRED.value, "Lease expired")
+        ]
+        assert rows_a == rows_b
+
+    async def test_task_ignoring_the_cut_keeps_its_lease(self, worker_db):
+        """An async task that swallows the cancel and runs on: not claimable."""
+        import qler.worker as worker_module
+
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        job = await task(q)(ignoring_task).enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_ignore_started.wait(), timeout=5.0)
+        stuck = set(w._active_tasks)
+        before = await self._row(q, job)
         try:
-            # Wait for job to start executing
-            for _ in range(50):
-                await asyncio.sleep(0.02)
-                if w._active_jobs:
-                    break
-            assert len(w._active_jobs) == 1
-
-            # Signal shutdown — worker has 0.1s to drain
-            w._running = False
-
-            # Wait for the worker to fully shut down
-            for _ in range(50):
-                await asyncio.sleep(0.05)
-                if worker_task.done():
-                    break
-            assert worker_task.done(), "Worker did not shut down"
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.3)
+                w._running = False
+                await asyncio.wait_for(asyncio.shield(w_task), timeout=5.0)
+            after = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
         finally:
-            if not worker_task.done():
-                worker_task.cancel()
-                try:
-                    await worker_task
-                except asyncio.CancelledError:
-                    pass
+            _ignore_release.set()
+            await asyncio.gather(*stuck, return_exceptions=True)
 
-        # The CancelledError handler should have marked the job FAILED
-        await job.refresh()
-        assert job.status == "failed"
-        assert job.last_failure_kind == FailureKind.CANCELLED.value
+        assert other is None
+        assert (after.status, after.worker_id, after.lease_expires_at) == (
+            JobStatus.RUNNING.value,
+            w.worker_id,
+            before.lease_expires_at,
+        )
+
+    async def test_sync_task_still_in_its_thread_keeps_its_lease(
+        self, worker_db, monkeypatch, caplog
+    ):
+        """A cancelled to_thread await ends while the thread runs on: the job keeps its lease."""
+        import qler.worker as worker_module
+
+        monkeypatch.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.3)
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        job = await task(q, sync=True)(blocking_sync_task).enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        try:
+            assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+            before = await self._row(q, job)
+            with caplog.at_level("WARNING", logger="qler.worker"):
+                w._running = False
+                await asyncio.wait_for(w_task, timeout=5.0)
+            thread_returned_at_exit = _thread_returned.is_set()
+            after = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
+        finally:
+            # End the thread here: the loop's teardown would wait for it.
+            _thread_go.set()
+            await asyncio.to_thread(_thread_returned.wait, 5.0)
+
+        assert thread_returned_at_exit is False
+        assert other is None
+        assert (after.status, after.worker_id, after.lease_expires_at) == (
+            JobStatus.RUNNING.value,
+            w.worker_id,
+            before.lease_expires_at,
+        )
+        assert (
+            "released 0 to be claimed at once, 1 keep their lease for lease recovery" in caplog.text
+        )
+        kept = [
+            r.getMessage() for r in caplog.records if "job(s) keep their lease" in r.getMessage()
+        ]
+        assert len(kept) == 1
+        assert kept[0].endswith(job.ulid)
+
+    async def test_sync_task_whose_thread_ends_in_the_grace_is_released(self, worker_db):
+        """The thread returns after the cut, inside the grace: the job is claimable."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        job = await task(q, sync=True)(blocking_sync_task).enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        w._cut_by_shutdown = _SignalOnAdd(_thread_go.set)
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+        w._running = False
+        await asyncio.wait_for(w_task, timeout=5.0)
+
+        row = await self._row(q, job)
+        assert _thread_returned.is_set() is True
+        assert (row.status, row.worker_id, row.lease_expires_at, row.retry_count) == (
+            JobStatus.PENDING.value,
+            "",
+            None,
+            0,
+        )
+
+    async def test_job_recovered_before_the_release_is_left_alone(self, worker_db, caplog):
+        """Lease recovery and another worker's claim came first: the guarded write changes nothing."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        job = await task(q)(pausing_on_cut_task).enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        w._running = False
+        await asyncio.wait_for(_on_cut.wait(), timeout=5.0)
+        await self._end_lease_now(q, job)
+        assert await q.recover_expired_leases() == 1
+        other = await q.claim_job("other-worker", ["default"])
+        assert other.ulid == job.ulid
+        _resume.set()
+        with caplog.at_level("WARNING", logger="qler.worker"):
+            await asyncio.wait_for(w_task, timeout=5.0)
+
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, "other-worker")
+        assert [(r[0], r[3]) for r in await self._attempt_rows(q, job)] == [
+            (AttemptStatus.LEASE_EXPIRED.value, w.worker_id),
+            (AttemptStatus.RUNNING.value, "other-worker"),
+        ]
+        assert (
+            "released 0 to be claimed at once, 0 keep their lease for lease recovery" in caplog.text
+        )
+
+    async def test_failed_release_is_logged_and_left_for_recovery(
+        self, worker_db, monkeypatch, caplog
+    ):
+        """The release write raises: one error naming the job; recovery takes it later."""
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        job = await task(q)(held_task).enqueue()
+
+        async def locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(q, "_release_lease", locked)
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        with caplog.at_level("WARNING", logger="qler.worker"):
+            w._running = False
+            await asyncio.wait_for(w_task, timeout=5.0)
+
+        errors = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "qler.worker" and r.levelno == logging.ERROR
+        ]
+        assert errors == [
+            f"Could not release job {job.ulid} after the shutdown cut; "
+            "left it running for lease recovery"
+        ]
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+        await self._end_lease_now(q, job)
+        assert await q.recover_expired_leases() == 1
+        assert (await self._row(q, job)).status == JobStatus.PENDING.value
+
+    async def test_hanging_release_does_not_hold_the_shutdown(self, worker_db, monkeypatch, caplog):
+        """A release that never returns is given up at the drain's bound."""
+        import qler.worker as worker_module
+
+        monkeypatch.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.5)
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        job = await task(q)(held_task).enqueue()
+
+        async def hangs(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(q, "_release_lease", hangs)
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        loop = asyncio.get_running_loop()
+        with caplog.at_level("WARNING", logger="qler.worker"):
+            started = loop.time()
+            w._running = False
+            await asyncio.wait_for(w_task, timeout=5.0)
+            elapsed = loop.time() - started
+
+        # timeout 0.2 + grace 0.5, with room for a busy machine
+        assert elapsed < 0.2 + 0.5 + 1.5
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert job.ulid in errors[0]
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+
+    async def test_two_jobs_cut_one_released_one_kept(self, worker_db, monkeypatch, caplog):
+        """One task honours the cut, one ignores it: the log counts and names them."""
+        import qler.worker as worker_module
+
+        monkeypatch.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.3)
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        honoured = await task(q)(honouring_task).enqueue()
+        ignored = await task(q)(ignoring_task).enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2, concurrency=2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_honour_started.wait(), timeout=5.0)
+        await asyncio.wait_for(_ignore_started.wait(), timeout=5.0)
+        stuck = set(w._active_tasks)
+        try:
+            with caplog.at_level("WARNING", logger="qler.worker"):
+                w._running = False
+                await asyncio.wait_for(asyncio.shield(w_task), timeout=5.0)
+            row_h, row_i = await self._row(q, honoured), await self._row(q, ignored)
+        finally:
+            _ignore_release.set()
+            await asyncio.gather(*stuck, return_exceptions=True)
+
+        assert (row_h.status, row_h.worker_id) == (JobStatus.PENDING.value, "")
+        assert (row_i.status, row_i.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+        assert (
+            "with 2 job(s) unfinished: released 1 to be claimed at once, "
+            "1 keep their lease for lease recovery, failed 0 as cancelled"
+        ) in caplog.text
+        kept = [
+            r.getMessage() for r in caplog.records if "job(s) keep their lease" in r.getMessage()
+        ]
+        assert len(kept) == 1
+        assert kept[0].endswith(f": {ignored.ulid}")
+
+    async def test_a_worker_run_again_counts_only_what_its_own_shutdown_cut(
+        self, worker_db, caplog
+    ):
+        """A worker object run a second time: the first run's cut job is not this run's."""
+        global _held_runs, _held_started
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(held_task)
+        first = await wrapped.enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        run = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        w._running = False
+        await asyncio.wait_for(run, timeout=5.0)
+        # Another worker finishes the released job, so the second run never holds it.
+        await run_worker_until_done(make_worker(q), first)
+
+        _held_runs = 0
+        _held_started = asyncio.Event()
+        second = await wrapped.enqueue()
+        run = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        with caplog.at_level("WARNING", logger="qler.worker"):
+            w._running = False
+            await asyncio.wait_for(run, timeout=5.0)
+
+        row = await self._row(q, second)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+        assert (
+            "with 1 job(s) unfinished: released 1 to be claimed at once, "
+            "0 keep their lease for lease recovery, failed 0 as cancelled"
+        ) in caplog.text
+
+
+class TestShutdownSeesWorkAJobStarted:
+    """Threads and tasks an async job started itself keep its lease while they run."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch):
+        global _held_started, _held_runs, _thread_entered, _thread_go, _thread_returned
+        global _ignore_started, _ignore_release, _children, _job_task, _outside_go
+        global _honour_started, _other_listed, _blockers_wanted, _blockers_ran, _blockers_all_in
+        import qler.worker as worker_module
+
+        monkeypatch.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.3)
+        _held_started = asyncio.Event()
+        _held_runs = 0
+        _thread_entered = threading.Event()
+        _thread_go = threading.Event()
+        _thread_returned = threading.Event()
+        _ignore_started = asyncio.Event()
+        _ignore_release = asyncio.Event()
+        _honour_started = asyncio.Event()
+        _children = set()
+        _child_cancels.clear()
+        _job_task = None
+        _outside_go = threading.Event()
+        _other_listed = asyncio.Event()
+        _blockers_wanted = _blockers_ran = 0
+        _blockers_all_in = threading.Event()
+        yield
+        _thread_go.set()  # never leave a test's thread blocked
+        _outside_go.set()
+
+    async def _queue(self, db):
+        q = Queue(db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        return q
+
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
+
+    async def _stop(self, w, w_task):
+        """Stop the worker; return the seconds from the stop to run()'s return."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        w._running = False
+        await asyncio.wait_for(asyncio.shield(w_task), timeout=5.0)
+        return loop.time() - started
+
+    async def _end_thread(self):
+        _thread_go.set()
+        assert await asyncio.to_thread(_thread_returned.wait, 5.0) is True
+
+    async def test_to_thread_running_past_the_grace_keeps_the_lease(self, worker_db, caplog):
+        """The cut ends the job's task; the thread it awaited runs on: nothing is claimable."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_awaiting_a_thread).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        try:
+            assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+            before = await self._row(q, job)
+            with caplog.at_level("WARNING", logger="qler.worker"):
+                elapsed = await self._stop(w, w_task)
+            thread_returned_at_exit = _thread_returned.is_set()
+            after = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
+        finally:
+            await self._end_thread()
+
+        assert thread_returned_at_exit is False
+        assert other is None
+        assert (after.status, after.worker_id, after.lease_expires_at) == (
+            JobStatus.RUNNING.value,
+            w.worker_id,
+            before.lease_expires_at,
+        )
+        kept = [
+            r.getMessage() for r in caplog.records if "job(s) keep their lease" in r.getMessage()
+        ]
+        assert len(kept) == 1
+        assert kept[0].endswith(f": {job.ulid}")
+        # The shutdown is held no longer than before: timeout 0.2 + grace 0.3,
+        # with room for a busy machine.
+        assert elapsed < 0.2 + 0.3 + 1.5
+
+    async def test_to_thread_returning_in_the_grace_is_released(self, worker_db):
+        """The thread returns after the cut, inside the grace: claimable at once."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_awaiting_a_thread).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w._cut_by_shutdown = _SignalOnAdd(_thread_go.set)
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+        await self._stop(w, w_task)
+
+        assert _thread_returned.is_set() is True
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id, row.lease_expires_at, row.retry_count) == (
+            JobStatus.PENDING.value,
+            "",
+            None,
+            0,
+        )
+        other = await q.claim_job("other-worker", ["default"])
+        assert other.ulid == job.ulid
+
+    async def test_executor_call_not_awaited_keeps_the_lease(self, worker_db):
+        """run_in_executor(None, fn) left running by a job that honours the cut."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_leaving_an_executor_call).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+            assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+            await self._stop(w, w_task)
+            thread_returned_at_exit = _thread_returned.is_set()
+            row = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
+        finally:
+            await self._end_thread()
+
+        assert thread_returned_at_exit is False
+        assert other is None
+        assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+
+    async def test_thread_that_finished_before_the_cut_does_not_hold_the_lease(self, worker_db):
+        """A to_thread call that is over before the cut: nothing of it runs, so released."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_whose_thread_finished_earlier).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        await self._stop(w, w_task)
+
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+        assert w._thread_running == {}
+
+    async def test_thread_that_raises_in_the_grace_is_released(self, worker_db):
+        """The thread's function raises after the cut: it has returned, so released."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_whose_thread_raises).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w._cut_by_shutdown = _SignalOnAdd(_thread_go.set)
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+        await self._stop(w, w_task)
+
+        assert _thread_returned.is_set() is True
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+        assert w._thread_running == {}
+
+    async def test_two_jobs_only_the_one_without_a_running_thread_is_released(self, worker_db):
+        q = await self._queue(worker_db)
+        threaded = await task(q)(job_awaiting_a_thread).enqueue()
+        plain = await task(q)(honouring_task).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2, concurrency=2)
+        w_task = asyncio.create_task(w.run())
+        try:
+            assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+            await asyncio.wait_for(_honour_started.wait(), timeout=5.0)
+            await self._stop(w, w_task)
+            row_t, row_p = await self._row(q, threaded), await self._row(q, plain)
+        finally:
+            await self._end_thread()
+
+        assert (row_t.status, row_t.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+        assert (row_p.status, row_p.worker_id) == (JobStatus.PENDING.value, "")
+
+    async def test_job_whose_thread_returns_during_another_release_is_released_too(self, worker_db):
+        """The threaded job is listed first and its thread still runs when the drain looks at
+        it; the thread returns while the other job's release is being written. Both are
+        claimable at once."""
+        q = await self._queue(worker_db)
+        threaded = await task(q)(job_awaiting_a_thread).enqueue()
+        plain = await task(q)(honouring_once_the_other_is_listed).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2, concurrency=2)
+        w._left_for_recovery = _SignalOnAppend(_other_listed.set)
+        release = w._release
+        released: list[str] = []
+
+        async def ending_the_thread_during_the_first(ulid, remaining):
+            released.append(ulid)
+            if len(released) == 1:
+                await self._end_thread()
+                # The thread's return reaches the loop through these futures.
+                running = set().union(*w._thread_running.values())
+                if running:
+                    await asyncio.wait(running, timeout=5.0)
+                assert w._thread_running == {}
+            return await release(ulid, remaining)
+
+        w._release = ending_the_thread_during_the_first
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+        await asyncio.wait_for(_honour_started.wait(), timeout=5.0)
+        await self._stop(w, w_task)
+
+        assert list(w._left_for_recovery) == [threaded.ulid, plain.ulid]
+        assert released == [plain.ulid, threaded.ulid]
+        row_t, row_p = await self._row(q, threaded), await self._row(q, plain)
+        assert (row_t.status, row_t.worker_id) == (JobStatus.PENDING.value, "")
+        assert (row_p.status, row_p.worker_id) == (JobStatus.PENDING.value, "")
+
+    async def test_pool_call_cancelled_before_a_thread_took_it_does_not_hold_the_lease(
+        self, worker_db
+    ):
+        """A job handed the pool more calls than it has threads; the cut cancels the queued
+        ones, which never run. Once the running ones return, the job is claimable at once."""
+        import concurrent.futures
+
+        global _blockers_wanted
+        stock = concurrent.futures.ThreadPoolExecutor()
+        _blockers_wanted = stock._max_workers
+        stock.shutdown()
+        q = await self._queue(worker_db)
+        job = await task(q)(job_with_more_calls_than_threads).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_blockers_all_in.wait, 5.0) is True
+        await self._stop(w, w_task)
+
+        assert _blockers_ran == _blockers_wanted
+        assert w._thread_running == {}
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+
+    async def test_thread_started_outside_any_job_is_not_counted(self, worker_db):
+        """A default-pool thread the host started is still running at the cut: the job is released."""
+        q = await self._queue(worker_db)
+        job = await task(q)(held_task).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        outside = asyncio.ensure_future(asyncio.to_thread(_outside_go.wait, 30))
+        try:
+            await self._stop(w, w_task)
+            outside_done_at_exit = outside.done()
+            row = await self._row(q, job)
+        finally:
+            _outside_go.set()
+            assert await outside is True
+
+        assert outside_done_at_exit is False
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+        assert w._thread_running == {}
+
+    async def test_child_task_running_on_keeps_the_lease_and_is_not_cancelled(self, worker_db):
+        """A task the job started and did not await runs past the cut: nothing is
+        claimable, and the stop has not cancelled a task the worker did not start."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_with_a_child_running_on).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_ignore_started.wait(), timeout=5.0)
+        children = set(_children)
+        try:
+            elapsed = await self._stop(w, w_task)
+            child_done_at_exit = [c.done() for c in children]
+            row = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
+        finally:
+            _ignore_release.set()
+            await asyncio.wait_for(asyncio.gather(*children, return_exceptions=True), 5.0)
+
+        assert child_done_at_exit == [False]
+        assert _child_cancels == []
+        assert other is None
+        assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+        assert elapsed < 0.2 + 0.3 + 1.5
+
+    async def test_child_task_ending_in_the_grace_is_waited_for(self, worker_db, monkeypatch):
+        """The job is released only once the task it started has ended."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_with_a_child_that_ends_in_the_grace).enqueue()
+        child_done_at_release: list[bool] = []
+        release = q._release_lease
+
+        async def recording(*args, **kwargs):
+            child_done_at_release.append(all(c.done() for c in _children))
+            return await release(*args, **kwargs)
+
+        monkeypatch.setattr(q, "_release_lease", recording)
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_ignore_started.wait(), timeout=5.0)
+        await self._stop(w, w_task)
+
+        assert len(_children) == 1
+        assert child_done_at_release == [True]
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+
+
+class TestWorkerDefaultPool:
+    """The worker gives its loop a default thread pool of its own, once."""
+
+    async def _run_one_job(self, w, q):
+        """Run the worker until it has started a job, then stop it."""
+        global _held_started
+        _held_started = asyncio.Event()
+        await task(q)(started_task).enqueue()
+        run = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        w._running = False
+        await asyncio.wait_for(run, timeout=5.0)
+
+    async def test_pool_is_installed_once_for_runs_on_one_loop(self, worker_queue):
+        import concurrent.futures
+
+        stock = concurrent.futures.ThreadPoolExecutor()
+        stock.shutdown()
+        loop = asyncio.get_running_loop()
+        pools = []
+        for w in (make_worker(worker_queue), make_worker(worker_queue)):
+            for _ in range(2):
+                await self._run_one_job(w, worker_queue)
+                pools.append(loop._default_executor)
+
+        assert len(pools) == 4
+        assert all(p is pools[0] for p in pools)
+        assert isinstance(pools[0], concurrent.futures.ThreadPoolExecutor)
+        assert pools[0]._max_workers == stock._max_workers
+        # Left installed and working after run() returns.
+        assert await asyncio.to_thread(sync_task, 4) == 8
+
+    async def test_a_pool_the_host_set_is_replaced_and_left_open(self, worker_queue):
+        import concurrent.futures
+
+        loop = asyncio.get_running_loop()
+        host_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(host_pool)
+        try:
+            await self._run_one_job(make_worker(worker_queue), worker_queue)
+
+            assert loop._default_executor is not host_pool
+            assert host_pool.submit(sync_task, 5).result(timeout=5.0) == 10
+        finally:
+            host_pool.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
 # TestMalformedPayload
 # ---------------------------------------------------------------------------
+
 
 class TestMalformedPayload:
     """Verify worker handles payloads with valid JSON but wrong structure."""
@@ -619,11 +1619,11 @@ class TestMalformedPayload:
             updated_at=now,
             eta=now,
         )
-        await job.save()
+        await job.save(db=q.db)
 
-        w = _make_worker(q)
+        w = make_worker(q)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.PAYLOAD_INVALID.value
 
         await job.refresh()
@@ -650,11 +1650,11 @@ class TestMalformedPayload:
             updated_at=now,
             eta=now,
         )
-        await job.save()
+        await job.save(db=q.db)
 
-        w = _make_worker(q)
+        w = make_worker(q)
         with pytest.raises(JobFailedError) as exc_info:
-            await _run_worker_until_job_done(w, job)
+            await run_worker_until_done(w, job)
         assert exc_info.value.failure_kind == FailureKind.PAYLOAD_INVALID.value
 
         await job.refresh()
@@ -665,6 +1665,7 @@ class TestMalformedPayload:
 # ---------------------------------------------------------------------------
 # TestRetryExhaustion
 # ---------------------------------------------------------------------------
+
 
 class TestRetryExhaustion:
     """Verify the full retry exhaustion cycle through the worker."""
@@ -681,10 +1682,10 @@ class TestRetryExhaustion:
         wrapped = task(q)(failing_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(q)
+        w = make_worker(q)
         # job.wait() will raise JobFailedError once retries are exhausted
         with pytest.raises(JobFailedError):
-            await _run_worker_until_job_done(w, job, timeout=10.0)
+            await run_worker_until_done(w, job, timeout=10.0)
 
         await job.refresh()
         assert job.status == "failed"
@@ -694,9 +1695,7 @@ class TestRetryExhaustion:
         assert job.last_error == "boom"
 
         # Verify both attempt records
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).order_by("ulid").all()
+        attempts = await q.attempts.filter(F("job_ulid") == job.ulid).order_by("ulid").all()
         assert len(attempts) == 2
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert attempts[0].attempt_number == 1
@@ -747,45 +1746,44 @@ class TestHealthEndpoint:
     """Health endpoint: TCP and Unix socket, JSON response, lifecycle."""
 
     def test_constructor_rejects_both_port_and_socket(self, worker_queue):
-        with pytest.raises(
-            ConfigurationError, match="mutually exclusive"
-        ):
+        with pytest.raises(ConfigurationError, match="mutually exclusive"):
             Worker(worker_queue, health_port=9100, health_socket="/tmp/h.sock")
 
-    def test_constructor_rejects_invalid_port_zero(self, worker_queue):
+    def test_constructor_rejects_a_unix_socket_on_windows(self, worker_queue, monkeypatch):
+        monkeypatch.setattr("sys.platform", "win32")
         with pytest.raises(
-            ConfigurationError, match="health_port must be between 1 and 65535"
+            ConfigurationError,
+            match="health_socket needs Unix sockets, which Windows does not have; use health_port",
         ):
+            Worker(worker_queue, health_socket="/tmp/h.sock")
+
+    def test_constructor_rejects_invalid_port_zero(self, worker_queue):
+        with pytest.raises(ConfigurationError, match="health_port must be between 1 and 65535"):
             Worker(worker_queue, health_port=0)
 
     def test_constructor_rejects_invalid_port_too_high(self, worker_queue):
-        with pytest.raises(
-            ConfigurationError, match="health_port must be between 1 and 65535"
-        ):
+        with pytest.raises(ConfigurationError, match="health_port must be between 1 and 65535"):
             Worker(worker_queue, health_port=70000)
 
     def test_status_property_before_run(self, worker_queue):
         """Before run(), _running is False → status is 'draining'."""
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         assert w.status == "draining"
 
     def test_started_at_set_on_init(self, worker_queue):
         before = now_epoch()
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         after = now_epoch()
         assert before <= w._started_at <= after
 
     async def test_health_not_started_without_flag(self, worker_queue):
         """No health server starts without explicit port/socket."""
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.05)
         try:
             # No health background task should exist (only lease renewal + recovery)
-            health_tasks = [
-                t for t in w._background_tasks
-                if "health" in (t.get_name() or "")
-            ]
+            health_tasks = [t for t in w._background_tasks if "health" in (t.get_name() or "")]
             # The health task won't have "health" in name by default, but
             # the total count should be exactly 2 (lease renewal + recovery)
             assert len(w._background_tasks) == 2
@@ -793,16 +1791,14 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.05)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     async def test_health_tcp_responds(self, worker_queue):
         """TCP health endpoint returns 200 with correct JSON fields."""
         port = 19100
         before = now_epoch()
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         after = now_epoch()
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)  # Let server start
@@ -822,16 +1818,14 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     @pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets not available on Windows")
     async def test_health_unix_socket_responds(self, worker_queue, tmp_path):
         """Unix socket health endpoint returns 200 with correct JSON."""
         sock_path = str(tmp_path / "health.sock")
-        w = _make_worker(worker_queue, health_socket=sock_path)
+        w = make_worker(worker_queue, health_socket=sock_path)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
@@ -846,29 +1840,26 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     @pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets not available on Windows")
     async def test_health_unix_socket_cleanup(self, worker_queue, tmp_path):
         """Socket file is removed after worker stops."""
         sock_path = str(tmp_path / "health.sock")
-        w = _make_worker(worker_queue, health_socket=sock_path)
+        w = make_worker(worker_queue, health_socket=sock_path)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
         import pathlib
+
         assert pathlib.Path(sock_path).exists()
 
         w._running = False
         await asyncio.sleep(0.2)
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass
 
         # Give a moment for cleanup
         await asyncio.sleep(0.1)
@@ -877,7 +1868,7 @@ class TestHealthEndpoint:
     async def test_health_404_on_other_path(self, worker_queue):
         """Non-/health path returns 404."""
         port = 19101
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
@@ -889,10 +1880,8 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
     async def test_health_draining_status(self, worker_queue):
         """After _running = False, health response status becomes 'draining'.
@@ -901,7 +1890,7 @@ class TestHealthEndpoint:
         _running can be toggled without triggering the full shutdown sequence.
         """
         port = 19102
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         w._running = True  # Simulate started state
         health_task = asyncio.create_task(w._health_server_loop())
         await asyncio.sleep(0.15)
@@ -916,10 +1905,8 @@ class TestHealthEndpoint:
             assert data["status"] == "draining"
         finally:
             health_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await health_task
-            except asyncio.CancelledError:
-                pass
 
     async def test_health_response_active_jobs(self, worker_queue):
         """active_jobs count reflects running work."""
@@ -927,7 +1914,7 @@ class TestHealthEndpoint:
         wrapped = task(worker_queue)(slow_task)
         job = await wrapped.enqueue(duration=2.0)
 
-        w = _make_worker(worker_queue, health_port=port)
+        w = make_worker(worker_queue, health_port=port)
         worker_task = asyncio.create_task(w.run())
         await asyncio.sleep(0.15)
 
@@ -946,15 +1933,14 @@ class TestHealthEndpoint:
             w._running = False
             await asyncio.sleep(0.1)
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
 
 # ---------------------------------------------------------------------------
 # TestTimeout
 # ---------------------------------------------------------------------------
+
 
 class TestTimeout:
     """Job timeout enforcement via asyncio.wait_for."""
@@ -964,7 +1950,7 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=1)(timeout_slow_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -975,10 +1961,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
@@ -990,7 +1974,7 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=1, max_retries=2)(timeout_slow_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1001,10 +1985,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         # Should be pending (requeued for retry), not permanently failed
@@ -1017,8 +1999,8 @@ class TestTimeout:
         wrapped = task(worker_queue)(timeout_fast_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == JobStatus.COMPLETED.value
@@ -1029,8 +2011,8 @@ class TestTimeout:
         wrapped = task(worker_queue)(slow_task)
         job = await wrapped.enqueue(0.5)
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == JobStatus.COMPLETED.value
@@ -1044,7 +2026,7 @@ class TestTimeout:
 
         assert job.timeout == 1
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1055,10 +2037,8 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
@@ -1070,8 +2050,8 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=5)(timeout_fast_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
-        await _run_worker_until_job_done(w, job)
+        w = make_worker(worker_queue)
+        await run_worker_until_done(w, job)
 
         await job.refresh()
         assert job.status == JobStatus.COMPLETED.value
@@ -1082,7 +2062,7 @@ class TestTimeout:
         wrapped = task(worker_queue, timeout=1)(timeout_slow_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1093,15 +2073,11 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await worker_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert "timed out" in attempts[0].error
@@ -1111,7 +2087,7 @@ class TestTimeout:
         wrapped = task(worker_queue, sync=True, timeout=1)(timeout_sync_task)
         job = await wrapped.enqueue()
 
-        w = _make_worker(worker_queue)
+        w = make_worker(worker_queue)
         worker_task = asyncio.create_task(w.run())
         try:
             for _ in range(60):
@@ -1122,17 +2098,240 @@ class TestTimeout:
         finally:
             w._running = False
             worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
-            except asyncio.CancelledError:
-                pass
 
         await job.refresh()
         assert job.status == JobStatus.FAILED.value
         assert job.last_failure_kind == FailureKind.TIMEOUT.value
         assert "timed out" in job.last_error
-        attempts = await JobAttempt.query().filter(F("job_ulid") == job.ulid).all()
+        attempts = await worker_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert attempts[0].failure_kind == FailureKind.TIMEOUT.value
         assert "timed out" in attempts[0].error
+
+
+class TestShutdownBounds:
+    """Renewal lasts through the drain, and the drain ends in bounded time."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        global _held_started, _held_runs, _drain_release, _lease_at_finish
+        _held_started = asyncio.Event()
+        _held_runs = 0
+        _drain_release = asyncio.Event()
+        _lease_at_finish = []
+        yield
+
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
+
+    async def test_lease_is_renewed_through_a_long_drain(self, worker_db):
+        """A drain longer than the job's lease: the lease stays ahead, one completion."""
+        q = Queue(worker_db, default_lease_duration=2, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(draining_task)
+        job = await wrapped.enqueue()
+
+        w1 = make_worker(q, shutdown_timeout=10.0)
+        w1_task = asyncio.create_task(w1.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        w2 = make_worker(q, lease_recovery_interval=0.1)
+        w2_task = asyncio.create_task(w2.run())
+        try:
+            w1._running = False  # the drain starts here
+            claim_lease = (await self._row(q, job)).lease_expires_at
+            # Hold the drain until the claim lease and one lease length after it
+            # are over (the clock has no event to wait on).
+            while now_epoch() <= claim_lease + 2:  # noqa: ASYNC110 - waits on the wall clock, no event exists
+                await asyncio.sleep(0.05)
+            _drain_release.set()
+            await asyncio.wait_for(w1_task, timeout=10.0)
+        finally:
+            _drain_release.set()
+            w2._running = False
+            await asyncio.wait_for(w2_task, timeout=10.0)
+            if not w1_task.done():
+                w1_task.cancel()
+
+        assert len(_lease_at_finish) == 1
+        lease, clock = _lease_at_finish[0]
+        assert lease > clock
+        assert _held_runs == 1
+        row = await self._row(q, job)
+        assert row.status == JobStatus.COMPLETED.value
+        assert row.result == "first run"
+        attempts = await q.attempts.filter(F("job_ulid") == job.ulid).all()
+        assert [(a.status, a.worker_id) for a in attempts] == [
+            (AttemptStatus.COMPLETED.value, w1.worker_id),
+        ]
+
+    async def test_task_ignoring_the_cut_does_not_hold_shutdown(
+        self, worker_db, monkeypatch, caplog
+    ):
+        """A task that swallows the cancel and keeps waiting is left after the grace."""
+        import qler.worker as worker_module
+
+        monkeypatch.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.5, raising=False)
+        q = Queue(worker_db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        wrapped = task(q)(stubborn_task)
+        job = await wrapped.enqueue()
+
+        w = make_worker(q, shutdown_timeout=0.2)
+        worker_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        stuck = set(w._active_tasks)
+        try:
+            with caplog.at_level("WARNING", logger="qler.worker"):
+                started = asyncio.get_running_loop().time()
+                w._running = False
+                await asyncio.wait_for(asyncio.shield(worker_task), timeout=5.0)
+                elapsed = asyncio.get_running_loop().time() - started
+            row = await self._row(q, job)
+        finally:
+            for t in stuck:
+                t.cancel()
+            await asyncio.gather(*stuck, return_exceptions=True)
+
+        # timeout 0.2 + grace 0.5, with room for a busy machine
+        assert elapsed < 0.2 + 0.5 + 1.5
+        assert row.status == JobStatus.RUNNING.value
+        assert row.worker_id == w.worker_id
+        stuck_logs = [
+            r.getMessage() for r in caplog.records if "job(s) keep their lease" in r.getMessage()
+        ]
+        assert len(stuck_logs) == 1
+        assert job.ulid in stuck_logs[0]
+
+
+class TestFinishFailureIsLogged:
+    """A finish write that raises in the worker is logged; the worker carries on."""
+
+    @pytest.fixture
+    def tasks(self, worker_queue):
+        return (
+            task(worker_queue)(succeeding_task),
+            task(worker_queue)(failing_task),
+        )
+
+    async def _run(
+        self, worker_queue, monkeypatch, caplog, which, first_task, second_task, first_args=()
+    ):
+        """Make the first finish of kind `which` raise once; return (first, second, records)."""
+        first_finish_raised = asyncio.Event()
+        second_completed = asyncio.Event()
+        real_complete = Queue.complete_job
+        real_fail = Queue.fail_job
+        calls = {"n": 0}
+
+        async def complete_job(self, job, *a, **kw):
+            if which == "complete":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    first_finish_raised.set()
+                    raise sqlite3.OperationalError("database is locked")
+            await real_complete(self, job, *a, **kw)
+            if job.ulid == second.ulid:
+                second_completed.set()
+
+        async def fail_job(self, job, *a, **kw):
+            if which == "fail":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    first_finish_raised.set()
+                    raise sqlite3.OperationalError("database is locked")
+            await real_fail(self, job, *a, **kw)
+
+        monkeypatch.setattr(Queue, "complete_job", complete_job)
+        monkeypatch.setattr(Queue, "fail_job", fail_job)
+
+        first = await first_task.enqueue(*first_args)
+        second = None
+
+        w = make_worker(worker_queue)
+        with caplog.at_level(logging.ERROR, logger="qler.worker"):
+            worker_task = asyncio.create_task(w.run())
+            try:
+                await asyncio.wait_for(first_finish_raised.wait(), timeout=5.0)
+                second = await second_task.enqueue(1)
+                await asyncio.wait_for(second_completed.wait(), timeout=5.0)
+            finally:
+                w._running = False
+                await asyncio.wait_for(worker_task, timeout=10.0)
+        return w, first, second
+
+    async def test_complete_that_raises_is_logged_and_worker_goes_on(
+        self, worker_queue, monkeypatch, caplog, tasks
+    ):
+        succeeding, _ = tasks
+        w, first, second = await self._run(
+            worker_queue, monkeypatch, caplog, "complete", succeeding, succeeding, (1,)
+        )
+
+        errors = [
+            r for r in caplog.records if r.name == "qler.worker" and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert first.ulid in message
+        assert succeeding.task_path in message
+        assert "complete" in message
+        assert "lease recovery" in message
+        assert errors[0].exc_info[0] is sqlite3.OperationalError
+
+        stored = await worker_queue.jobs.filter(F("ulid") == first.ulid).first()
+        assert stored.status == JobStatus.RUNNING.value
+        assert stored.worker_id == w.worker_id
+        assert stored.lease_expires_at is not None
+        other = await worker_queue.jobs.filter(F("ulid") == second.ulid).first()
+        assert other.status == JobStatus.COMPLETED.value
+
+    async def test_fail_that_raises_is_logged_and_worker_goes_on(
+        self, worker_queue, monkeypatch, caplog, tasks
+    ):
+        succeeding, failing = tasks
+        w, first, second = await self._run(
+            worker_queue, monkeypatch, caplog, "fail", failing, succeeding
+        )
+
+        errors = [
+            r
+            for r in caplog.records
+            if r.name == "qler.worker"
+            and r.levelno == logging.ERROR
+            and "lease recovery" in r.getMessage()
+        ]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert first.ulid in message
+        assert failing.task_path in message
+        assert "fail" in message
+        assert errors[0].exc_info[0] is sqlite3.OperationalError
+
+        stored = await worker_queue.jobs.filter(F("ulid") == first.ulid).first()
+        assert stored.status == JobStatus.RUNNING.value
+        assert stored.worker_id == w.worker_id
+        assert stored.lease_expires_at is not None
+        other = await worker_queue.jobs.filter(F("ulid") == second.ulid).first()
+        assert other.status == JobStatus.COMPLETED.value
+
+
+async def test_cancel_check_reads_its_own_queue_after_another_was_initialised_last(
+    tmp_path,
+):
+    """The worker's cancel check goes through the queue it holds."""
+    qa = Queue(str(tmp_path / "a.db"))
+    await qa.init_db()
+    await qa.enqueue("m.f")
+    job = await qa.claim_job("w1", ["default"])
+    assert await job.request_cancel() is True
+    qb = Queue(str(tmp_path / "b.db"))
+    await qb.init_db()  # binds the class-wide handle to B last
+    try:
+        w = make_worker(qa)
+        assert await w._cancel_was_requested(job) is True
+    finally:
+        await qa.close()
+        await qb.close()

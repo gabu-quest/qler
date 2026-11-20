@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 logger = logging.getLogger("qler.metrics")
 
@@ -72,7 +73,7 @@ class QlerMetrics:
             registry=self.registry,
         )
 
-        self._depth_query_fn: Optional[Callable[[], Awaitable[list[tuple[str, str, int]]]]] = None
+        self._depth_query_fn: Callable[[], Awaitable[list[tuple[str, str, int]]]] | None = None
 
     def set_depth_query(self, fn: Callable[[], Awaitable[list[tuple[str, str, int]]]]) -> None:
         """Set the async depth query function called before each /metrics scrape."""

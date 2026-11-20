@@ -7,15 +7,15 @@ import logging
 
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB, F
+
 from qler._time import now_epoch
 from qler.enums import FailureKind
 from qler.lifecycle import emit
 from qler.lifecycle import logger as lifecycle_logger
-from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required by @task decorator)
@@ -194,7 +194,9 @@ class TestEnqueueEvents:
         assert emitted_ids == {j.ulid for j in jobs}
 
     @pytest.mark.asyncio
-    async def test_enqueue_many_idempotency_skips_event(self, queue: Queue, capture: CapturingHandler):
+    async def test_enqueue_many_idempotency_skips_event(
+        self, queue: Queue, capture: CapturingHandler
+    ):
         """Idempotency-matched jobs in batch do not emit job.enqueued."""
         t = task(queue)(batch_idemp_task)
 
@@ -203,10 +205,12 @@ class TestEnqueueEvents:
         capture.clear()
 
         # Batch: key-1 already exists, key-2 is new
-        jobs = await queue.enqueue_many([
-            {"task_path": t.task_path, "args": (1,), "idempotency_key": "key-1"},
-            {"task_path": t.task_path, "args": (2,), "idempotency_key": "key-2"},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": t.task_path, "args": (1,), "idempotency_key": "key-1"},
+                {"task_path": t.task_path, "args": (2,), "idempotency_key": "key-2"},
+            ]
+        )
 
         events = capture.by_event("job.enqueued")
         # Only key-2 should emit (key-1 is an idempotency match)
@@ -258,7 +262,9 @@ class TestFailEvents:
         claimed = await queue.claim_job("worker-1", ["default"])
         capture.clear()
 
-        await queue.fail_job(claimed, "worker-1", RuntimeError("boom"), failure_kind=FailureKind.EXCEPTION)
+        await queue.fail_job(
+            claimed, "worker-1", RuntimeError("boom"), failure_kind=FailureKind.EXCEPTION
+        )
 
         failed_events = capture.by_event("job.failed")
         assert len(failed_events) == 1
@@ -276,7 +282,9 @@ class TestFailEvents:
         claimed = await queue.claim_job("worker-1", ["default"])
         capture.clear()
 
-        await queue.fail_job(claimed, "worker-1", RuntimeError("oops"), failure_kind=FailureKind.EXCEPTION)
+        await queue.fail_job(
+            claimed, "worker-1", RuntimeError("oops"), failure_kind=FailureKind.EXCEPTION
+        )
 
         retried_events = capture.by_event("job.retried")
         assert len(retried_events) == 1
@@ -294,28 +302,36 @@ class TestFailEvents:
         claimed = await queue.claim_job("worker-1", ["default"])
         capture.clear()
 
-        await queue.fail_job(claimed, "worker-1", RuntimeError("oops"), failure_kind=FailureKind.EXCEPTION)
+        await queue.fail_job(
+            claimed, "worker-1", RuntimeError("oops"), failure_kind=FailureKind.EXCEPTION
+        )
 
         assert len(capture.by_event("job.retried")) == 1
         assert len(capture.by_event("job.failed")) == 0
 
     @pytest.mark.asyncio
-    async def test_fail_exhausted_retries_emits_failed(self, queue: Queue, capture: CapturingHandler):
+    async def test_fail_exhausted_retries_emits_failed(
+        self, queue: Queue, capture: CapturingHandler
+    ):
         """Final failure after retry exhaustion emits 'job.failed', not 'job.retried'."""
         t = task(queue, max_retries=1, retry_delay=1)(exhaust_task)
         await t.enqueue()
 
         # First failure → retried
         claimed = await queue.claim_job("worker-1", ["default"])
-        await queue.fail_job(claimed, "worker-1", RuntimeError("x"), failure_kind=FailureKind.EXCEPTION)
+        await queue.fail_job(
+            claimed, "worker-1", RuntimeError("x"), failure_kind=FailureKind.EXCEPTION
+        )
 
         # Reset ETA so we can reclaim
-        await Job.query().filter(F("ulid") == claimed.ulid).update_one(eta=now_epoch())
+        await queue.jobs.filter(F("ulid") == claimed.ulid).update_one(eta=now_epoch())
 
         # Second failure → exhausted → failed
         claimed = await queue.claim_job("worker-1", ["default"])
         capture.clear()
-        await queue.fail_job(claimed, "worker-1", RuntimeError("x"), failure_kind=FailureKind.EXCEPTION)
+        await queue.fail_job(
+            claimed, "worker-1", RuntimeError("x"), failure_kind=FailureKind.EXCEPTION
+        )
 
         assert len(capture.by_event("job.failed")) == 1
         assert len(capture.by_event("job.retried")) == 0
@@ -329,7 +345,7 @@ class TestLeaseRecoveryEvents:
 
         claimed = await queue.claim_job("worker-1", ["default"])
         now = now_epoch()
-        await Job.query().filter(F("ulid") == claimed.ulid).update_one(
+        await queue.jobs.filter(F("ulid") == claimed.ulid).update_one(
             lease_expires_at=now - 100,
         )
         capture.clear()

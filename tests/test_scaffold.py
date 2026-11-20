@@ -7,7 +7,7 @@ from click.testing import CliRunner
 def test_import_qler():
     import qler
 
-    assert qler.__version__ == "0.5.1"
+    assert qler.__version__ == "0.6.0"
 
 
 def test_enums_importable():
@@ -54,36 +54,30 @@ def test_enums_importable():
     from qler.enums import RETRYABLE_FAILURES
 
     assert isinstance(RETRYABLE_FAILURES, frozenset)
-    assert RETRYABLE_FAILURES == frozenset({FailureKind.EXCEPTION, FailureKind.TIMEOUT})
+    assert frozenset({FailureKind.EXCEPTION, FailureKind.TIMEOUT}) == RETRYABLE_FAILURES
 
 
 def test_exceptions_hierarchy():
     from qler import (
-        ClaimConflictError,
         ConfigurationError,
         JobCancelledError,
         JobFailedError,
-        JobNotFoundError,
         PayloadNotSerializableError,
         PayloadTooLargeError,
         QlerError,
-        SignatureMismatchError,
-        TaskNotFoundError,
         TaskNotRegisteredError,
+        UniqueKeyConflictError,
     )
 
     # All exceptions inherit from QlerError
     for exc_cls in (
-        JobNotFoundError,
         JobFailedError,
         JobCancelledError,
-        TaskNotFoundError,
         TaskNotRegisteredError,
-        SignatureMismatchError,
         PayloadTooLargeError,
         PayloadNotSerializableError,
-        ClaimConflictError,
         ConfigurationError,
+        UniqueKeyConflictError,
     ):
         assert issubclass(exc_cls, QlerError), f"{exc_cls.__name__} must subclass QlerError"
 
@@ -103,28 +97,16 @@ def test_exceptions_hierarchy():
 
     # Catch subclass as QlerError
     with pytest.raises(QlerError, match="sub error"):
-        raise JobNotFoundError("sub error", ulid="01ABC")
+        raise JobFailedError("sub error", ulid="01ABC")
 
     # Contextual attributes on subclasses
-    err = JobNotFoundError("not found", ulid="01ABC")
-    assert err.ulid == "01ABC"
-
     err = JobFailedError("failed", ulid="01DEF", failure_kind="exception")
     assert err.ulid == "01DEF"
     assert err.failure_kind == "exception"
 
-    err = TaskNotFoundError("no module", task_path="app.tasks.missing")
-    assert err.task_path == "app.tasks.missing"
-
-    err = SignatureMismatchError("wrong args", task_path="app.tasks.func")
-    assert err.task_path == "app.tasks.func"
-
     err = PayloadTooLargeError("too big", size=2_000_000, max_size=1_000_000)
     assert err.size == 2_000_000
     assert err.max_size == 1_000_000
-
-    err = ClaimConflictError("race", ulid="01GHI")
-    assert err.ulid == "01GHI"
 
 
 def test_cli_entrypoint():
@@ -133,4 +115,4 @@ def test_cli_entrypoint():
     runner = CliRunner()
     result = runner.invoke(cli, ["--version"])
     assert result.exit_code == 0
-    assert result.output.strip() == "qler, version 0.5.1"
+    assert result.output.strip() == "qler, version 0.6.0"

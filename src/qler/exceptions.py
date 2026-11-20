@@ -1,32 +1,18 @@
 """Unified exception hierarchy for qler."""
 
-from typing import Any, Optional
+from typing import Any
 
 
 class QlerError(Exception):
     """Base exception for all qler errors."""
 
-    def __init__(self, message: str, *, details: Optional[dict[str, Any]] = None):
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.message = message
         self.details = details or {}
 
 
 # Job lifecycle errors
-
-
-class JobNotFoundError(QlerError):
-    """Raised when a job with the given ULID does not exist."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-    ):
-        super().__init__(message, details=details)
-        self.ulid = ulid
 
 
 class JobFailedError(QlerError):
@@ -36,9 +22,9 @@ class JobFailedError(QlerError):
         self,
         message: str,
         *,
-        ulid: Optional[str] = None,
-        failure_kind: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        ulid: str | None = None,
+        failure_kind: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.ulid = ulid
@@ -52,28 +38,14 @@ class JobCancelledError(QlerError):
         self,
         message: str,
         *,
-        ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        ulid: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.ulid = ulid
 
 
 # Task resolution errors
-
-
-class TaskNotFoundError(QlerError):
-    """Raised when the task module/function cannot be imported."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        task_path: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-    ):
-        super().__init__(message, details=details)
-        self.task_path = task_path
 
 
 class TaskNotRegisteredError(QlerError):
@@ -83,22 +55,8 @@ class TaskNotRegisteredError(QlerError):
         self,
         message: str,
         *,
-        task_path: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-    ):
-        super().__init__(message, details=details)
-        self.task_path = task_path
-
-
-class SignatureMismatchError(QlerError):
-    """Raised when job payload args don't match the task's signature."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        task_path: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        task_path: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.task_path = task_path
@@ -114,9 +72,9 @@ class PayloadTooLargeError(QlerError):
         self,
         message: str,
         *,
-        size: Optional[int] = None,
-        max_size: Optional[int] = None,
-        details: Optional[dict[str, Any]] = None,
+        size: int | None = None,
+        max_size: int | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.size = size
@@ -130,26 +88,12 @@ class PayloadNotSerializableError(QlerError):
         self,
         message: str,
         *,
-        details: Optional[dict[str, Any]] = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
 
 
 # Concurrency errors
-
-
-class ClaimConflictError(QlerError):
-    """Raised when a job claim fails due to concurrent modification."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
-    ):
-        super().__init__(message, details=details)
-        self.ulid = ulid
 
 
 # Dependency errors
@@ -162,8 +106,8 @@ class DependencyError(QlerError):
         self,
         message: str,
         *,
-        dependency_ulid: Optional[str] = None,
-        details: Optional[dict[str, Any]] = None,
+        dependency_ulid: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         super().__init__(message, details=details)
         self.dependency_ulid = dependency_ulid
@@ -176,3 +120,25 @@ class ConfigurationError(QlerError):
     """Raised when queue or task configuration is invalid."""
 
     pass
+
+
+class UniqueKeyConflictError(QlerError):
+    """Raised when moving a job back to pending would make a second active job with its unique key.
+
+    ``Job.retry`` and ``Queue.replay_job`` raise it, and change nothing, while another job with the
+    same ``unique_key`` is pending or running. ``active_ulid`` names that job.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ulid: str | None = None,
+        unique_key: str | None = None,
+        active_ulid: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(message, details=details)
+        self.ulid = ulid
+        self.unique_key = unique_key
+        self.active_ulid = active_ulid

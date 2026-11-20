@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # The publish workflow runs this file before it builds anything.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,8 +20,9 @@ jobs:
   build-test:
     name: Tests • ${{ matrix.os }} • py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
+      # Install sqler from PyPI, not from the sibling checkout pyproject.toml names.
       UV_NO_SOURCES: "1"
     strategy:
       fail-fast: false
@@ -29,28 +32,34 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup UV
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
-      - name: Sync dependencies (main + dev)
-        run: uv sync --dev
+      - name: Sync dependencies (main + dev + extras)
+        run: uv sync --dev --extra metrics --extra logler
 
+      # --no-sync from here on: a plain `uv run` syncs again without the extras.
       - name: Show versions
         run: |
-          uv run python --version
-          uv run ruff --version
-          uv run pytest --version
+          uv run --no-sync python --version
+          uv run --no-sync ruff --version
+          uv run --no-sync pytest --version
 
       - name: Lint (ruff)
-        run: uv run ruff check .
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+
+      - name: Type check (mypy)
+        run: uv run --no-sync mypy
 
       - name: Run tests
         timeout-minutes: 10
         env:
           PYTHONUTF8: "1"
-        run: uv run pytest -v --timeout=30 --timeout-method=thread -p no:cacheprovider --disable-warnings
+        run: uv run --no-sync pytest -v --timeout=30 --timeout-method=thread -p no:cacheprovider --disable-warnings

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from qler.exceptions import ConfigurationError, PayloadNotSerializableError
 from qler.rate_limit import RateSpec, parse_rate
@@ -23,17 +24,17 @@ class TaskWrapper:
         fn: Callable,
         queue: Queue,
         *,
-        queue_name: Optional[str] = None,
-        max_retries: Optional[int] = None,
-        retry_delay: Optional[int] = None,
-        priority: Optional[int] = None,
-        lease_duration: Optional[int] = None,
+        queue_name: str | None = None,
+        max_retries: int | None = None,
+        retry_delay: int | None = None,
+        priority: int | None = None,
+        lease_duration: int | None = None,
         sync: bool = False,
-        rate_limit: Optional[str] = None,
-        idempotency_key: Optional[Callable[..., str]] = None,
-        timeout: Optional[int] = None,
+        rate_limit: str | None = None,
+        idempotency_key: Callable[..., str] | None = None,
+        timeout: int | None = None,
         unique: bool = False,
-        unique_key: Optional[Callable[..., str]] = None,
+        unique_key: Callable[..., str] | None = None,
     ) -> None:
         self.fn = fn
         self.queue = queue
@@ -47,7 +48,7 @@ class TaskWrapper:
         self.unique_key_fn = unique_key
         self.sync = sync
         self.task_path = f"{fn.__module__}.{fn.__qualname__}"
-        self.rate_spec: Optional[RateSpec] = parse_rate(rate_limit) if rate_limit else None
+        self.rate_spec: RateSpec | None = parse_rate(rate_limit) if rate_limit else None
         self.idempotency_key_fn = idempotency_key
 
         # Register on queue
@@ -84,16 +85,16 @@ class TaskWrapper:
     async def enqueue(
         self,
         *args: Any,
-        _delay: Optional[int] = None,
-        _eta: Optional[int] = None,
-        _priority: Optional[int] = None,
-        _idempotency_key: Optional[str] = None,
-        _correlation_id: Optional[str] = None,
-        _depends_on: Optional[list[str]] = None,
-        _timeout: Optional[int] = None,
-        _unique_key: Optional[str] = None,
+        _delay: int | None = None,
+        _eta: int | None = None,
+        _priority: int | None = None,
+        _idempotency_key: str | None = None,
+        _correlation_id: str | None = None,
+        _depends_on: list[str] | None = None,
+        _timeout: int | None = None,
+        _unique_key: str | None = None,
         **kwargs: Any,
-    ) -> "Job":
+    ) -> Job:
         """Enqueue this task for background execution."""
         if _idempotency_key is None and self.idempotency_key_fn is not None:
             _idempotency_key = self.idempotency_key_fn(*args, **kwargs)
@@ -108,8 +109,7 @@ class TaskWrapper:
                 _unique_key = self.unique_key_fn(*args, **kwargs)
                 if not isinstance(_unique_key, str):
                     raise TypeError(
-                        f"unique_key function must return str, "
-                        f"got {type(_unique_key).__name__}"
+                        f"unique_key function must return str, got {type(_unique_key).__name__}"
                     )
             elif self._unique:
                 _unique_key = self.task_path
@@ -134,7 +134,7 @@ class TaskWrapper:
     async def enqueue_many(
         self,
         arg_list: list[tuple | dict],
-    ) -> list["Job"]:
+    ) -> list[Job]:
         """Enqueue multiple instances of this task at once.
 
         Each element can be:
@@ -150,9 +150,7 @@ class TaskWrapper:
             elif isinstance(item, dict):
                 spec = dict(item)
             else:
-                raise TypeError(
-                    f"Each item must be a tuple or dict, got {type(item).__name__}"
-                )
+                raise TypeError(f"Each item must be a tuple or dict, got {type(item).__name__}")
 
             spec.setdefault("task_path", self.task_path)
             spec.setdefault("queue_name", self.queue_name)
@@ -170,8 +168,7 @@ class TaskWrapper:
                 key = self.idempotency_key_fn(*args, **kwargs)
                 if not isinstance(key, str):
                     raise TypeError(
-                        f"idempotency_key function must return str, "
-                        f"got {type(key).__name__}"
+                        f"idempotency_key function must return str, got {type(key).__name__}"
                     )
                 spec["idempotency_key"] = key
 
@@ -183,8 +180,7 @@ class TaskWrapper:
                     ukey = self.unique_key_fn(*args, **kwargs)
                     if not isinstance(ukey, str):
                         raise TypeError(
-                            f"unique_key function must return str, "
-                            f"got {type(ukey).__name__}"
+                            f"unique_key function must return str, got {type(ukey).__name__}"
                         )
                     spec["unique_key"] = ukey
                 elif self._unique:
@@ -200,9 +196,7 @@ class TaskWrapper:
         try:
             json.dumps(payload)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise PayloadNotSerializableError(
-                f"Payload is not JSON-serializable: {exc}"
-            ) from exc
+            raise PayloadNotSerializableError(f"Payload is not JSON-serializable: {exc}") from exc
 
         if self.sync:
             return await asyncio.to_thread(self.fn, *args, **kwargs)
@@ -218,17 +212,17 @@ class TaskWrapper:
 def task(
     queue: Queue,
     *,
-    queue_name: Optional[str] = None,
-    max_retries: Optional[int] = None,
-    retry_delay: Optional[int] = None,
-    priority: Optional[int] = None,
-    lease_duration: Optional[int] = None,
+    queue_name: str | None = None,
+    max_retries: int | None = None,
+    retry_delay: int | None = None,
+    priority: int | None = None,
+    lease_duration: int | None = None,
     sync: bool = False,
-    rate_limit: Optional[str] = None,
-    idempotency_key: Optional[Callable[..., str]] = None,
-    timeout: Optional[int] = None,
+    rate_limit: str | None = None,
+    idempotency_key: Callable[..., str] | None = None,
+    timeout: int | None = None,
     unique: bool = False,
-    unique_key: Optional[Callable[..., str]] = None,
+    unique_key: Callable[..., str] | None = None,
 ) -> Callable[[Callable], TaskWrapper]:
     """Decorator to register a function as a qler task.
 
@@ -256,9 +250,7 @@ def task(
         )
 
     if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
-        raise ConfigurationError(
-            f"timeout must be a positive integer, got {timeout!r}"
-        )
+        raise ConfigurationError(f"timeout must be a positive integer, got {timeout!r}")
 
     if unique and unique_key is not None:
         raise ConfigurationError(
@@ -266,9 +258,7 @@ def task(
         )
 
     if unique_key is not None and not callable(unique_key):
-        raise ConfigurationError(
-            f"unique_key must be callable, got {type(unique_key).__name__}"
-        )
+        raise ConfigurationError(f"unique_key must be callable, got {type(unique_key).__name__}")
 
     def decorator(fn: Callable) -> TaskWrapper:
         # Reject nested functions (methods, closures, inner functions)
@@ -292,9 +282,7 @@ def task(
 
         # Validate retry_delay
         if retry_delay is not None and retry_delay < 1:
-            raise ConfigurationError(
-                f"retry_delay must be >= 1, got {retry_delay}"
-            )
+            raise ConfigurationError(f"retry_delay must be >= 1, got {retry_delay}")
 
         return TaskWrapper(
             fn,

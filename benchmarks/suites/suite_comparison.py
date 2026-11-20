@@ -30,6 +30,7 @@ from benchmarks.core.timer import AsyncPrecisionTimer
 
 from qler import Worker
 from qler.task import TaskWrapper
+import contextlib
 
 SUITE_NAME = "comparison"
 TASK_PATH = "bench.noop"
@@ -46,7 +47,7 @@ def _make_queue(db_path: str):
 def _check_celery_available() -> bool:
     """Check if both Redis and celery are available."""
     try:
-        from benchmarks.celery_app import app  # noqa: F401
+        from benchmarks.celery_app import app
 
         if app is None:
             return False
@@ -94,13 +95,18 @@ class EnqueueLatency:
             stats = await timer.async_measure(do_qler)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "qler"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "qler"},
+                )
+            )
 
             # --- Celery ---
             from benchmarks.celery_app import noop
@@ -120,13 +126,18 @@ class EnqueueLatency:
             stats = timer._compute_stats(timings_ms)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "celery"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "celery"},
+                )
+            )
 
         return results
 
@@ -134,10 +145,8 @@ class EnqueueLatency:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class BatchEnqueue:
@@ -166,10 +175,7 @@ class BatchEnqueue:
                 q = _make_queue(db_path)
                 await q.init_db()
 
-                specs = [
-                    {"task_path": TASK_PATH, "args": (i,)}
-                    for i in range(count)
-                ]
+                specs = [{"task_path": TASK_PATH, "args": (i,)} for i in range(count)]
                 await q.enqueue_many(specs)
 
                 await q.close()
@@ -177,13 +183,18 @@ class BatchEnqueue:
             stats = await timer.async_measure(do_qler_batch)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "qler"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "qler"},
+                )
+            )
 
             # --- Celery ---
             from celery import group as celery_group
@@ -204,13 +215,18 @@ class BatchEnqueue:
             stats = timer._compute_stats(timings_ms)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "celery"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "celery"},
+                )
+            )
 
         return results
 
@@ -218,10 +234,8 @@ class BatchEnqueue:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class RoundTrip:
@@ -268,13 +282,18 @@ class RoundTrip:
             stats = await timer.async_measure(do_qler_rt)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "qler"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "qler"},
+                )
+            )
 
             # --- Celery ---
             from benchmarks.celery_app import noop
@@ -296,13 +315,18 @@ class RoundTrip:
             stats = timer._compute_stats(timings_ms)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "celery"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "celery"},
+                )
+            )
 
         return results
 
@@ -310,10 +334,8 @@ class RoundTrip:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class Throughput:
@@ -353,13 +375,18 @@ class Throughput:
             stats = await timer.async_measure(do_qler_throughput)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "qler"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "qler"},
+                )
+            )
 
             # --- Celery ---
             from benchmarks.celery_app import noop
@@ -381,13 +408,18 @@ class Throughput:
             stats = timer._compute_stats(timings_ms)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "celery"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "celery"},
+                )
+            )
 
         return results
 
@@ -395,10 +427,8 @@ class Throughput:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class WorkerRoundTrip:
@@ -451,22 +481,25 @@ class WorkerRoundTrip:
                 finally:
                     worker._running = False
                     worker_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await worker_task
-                    except asyncio.CancelledError:
-                        pass
                     await q.close()
 
             stats = await timer.async_measure(do_qler_worker_rt)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "qler"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "qler"},
+                )
+            )
 
             # --- Celery ---
             from benchmarks.celery_app import noop
@@ -489,13 +522,18 @@ class WorkerRoundTrip:
             stats = timer._compute_stats(timings_ms)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "celery"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "celery"},
+                )
+            )
 
         return results
 
@@ -503,10 +541,8 @@ class WorkerRoundTrip:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class WorkerThroughput:
@@ -554,22 +590,25 @@ class WorkerThroughput:
                 finally:
                     worker._running = False
                     worker_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await worker_task
-                    except asyncio.CancelledError:
-                        pass
                     await q.close()
 
             stats = await timer.async_measure(do_qler_worker_tp)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "qler"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "qler"},
+                )
+            )
 
             # --- Celery ---
             from benchmarks.celery_app import noop
@@ -591,13 +630,18 @@ class WorkerThroughput:
             stats = timer._compute_stats(timings_ms)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "celery"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "celery"},
+                )
+            )
 
         return results
 
@@ -605,10 +649,8 @@ class WorkerThroughput:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 class ColdStart:
@@ -656,22 +698,25 @@ class ColdStart:
                 finally:
                     worker._running = False
                     worker_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await worker_task
-                    except asyncio.CancelledError:
-                        pass
                     await q.close()
 
             stats = await timer.async_measure(do_qler_cold)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "qler"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "qler"},
+                )
+            )
 
             # --- Celery ---
             # Cold start: worker subprocess started/stopped per iteration
@@ -696,13 +741,18 @@ class ColdStart:
             stats = timer._compute_stats(timings_ms)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"system": "celery"},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"system": "celery"},
+                )
+            )
 
         return results
 
@@ -710,10 +760,8 @@ class ColdStart:
         for tmp in getattr(self, "_tmp_dirs", []):
             tmp.cleanup()
         self._tmp_dirs = []
-        try:
+        with contextlib.suppress(Exception):
             flush_redis()
-        except Exception:
-            pass
 
 
 def check_available() -> bool:

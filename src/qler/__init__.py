@@ -5,18 +5,15 @@ from qler._time import generate_ulid
 from qler.cron import CronWrapper, cron
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
-    ClaimConflictError,
     ConfigurationError,
     DependencyError,
     JobCancelledError,
     JobFailedError,
-    JobNotFoundError,
     PayloadNotSerializableError,
     PayloadTooLargeError,
     QlerError,
-    SignatureMismatchError,
-    TaskNotFoundError,
     TaskNotRegisteredError,
+    UniqueKeyConflictError,
 )
 from qler.metrics import QlerMetrics
 from qler.models import Job, JobAttempt
@@ -24,39 +21,33 @@ from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
-    "__version__",
-    # Core
-    "Queue",
-    "QlerMetrics",
-    "Worker",
-    "task",
-    "cron",
+    "AttemptStatus",
+    "ConfigurationError",
     "CronWrapper",
-    "current_job",
-    "current_queue",
-    "is_cancellation_requested",
-    "set_progress",
-    "generate_ulid",
+    "DependencyError",
+    "FailureKind",
     "Job",
     "JobAttempt",
-    # Enums
-    "AttemptStatus",
-    "FailureKind",
-    "JobStatus",
-    # Exceptions
-    "QlerError",
-    "DependencyError",
-    "JobNotFoundError",
-    "JobFailedError",
     "JobCancelledError",
-    "TaskNotFoundError",
-    "TaskNotRegisteredError",
-    "SignatureMismatchError",
-    "PayloadTooLargeError",
+    "JobFailedError",
+    "JobStatus",
     "PayloadNotSerializableError",
-    "ClaimConflictError",
-    "ConfigurationError",
+    "PayloadTooLargeError",
+    "QlerError",
+    "QlerMetrics",
+    "Queue",
+    "TaskNotRegisteredError",
+    "UniqueKeyConflictError",
+    "Worker",
+    "__version__",
+    "cron",
+    "current_job",
+    "current_queue",
+    "generate_ulid",
+    "is_cancellation_requested",
+    "set_progress",
+    "task",
 ]

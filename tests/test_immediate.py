@@ -1,18 +1,19 @@
 """Tests for immediate mode — Queue(immediate=True) executes jobs inline."""
 
+import sqlite3
+
 import pytest
 import pytest_asyncio
+from sqler import AsyncSQLerDB, F
+
 from qler.enums import AttemptStatus, FailureKind, JobStatus
 from qler.exceptions import (
     PayloadNotSerializableError,
     PayloadTooLargeError,
     TaskNotRegisteredError,
 )
-from qler.models.attempt import JobAttempt
-from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
-from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required: @task rejects nested functions)
@@ -230,9 +231,7 @@ class TestImmediateTaskResolution:
             await imm_queue.enqueue("some.nonexistent.task", args=(1, 2))
 
         # Job should be FAILED, not left as a ghost RUNNING record
-        jobs = await Job.query().filter(
-            F("task") == "some.nonexistent.task"
-        ).all()
+        jobs = await imm_queue.jobs.filter(F("task") == "some.nonexistent.task").all()
         assert len(jobs) == 1
         assert jobs[0].status == JobStatus.FAILED.value
         assert jobs[0].last_failure_kind == FailureKind.TASK_NOT_FOUND.value
@@ -265,9 +264,7 @@ class TestImmediateAttemptRecord:
         wrapper = imm_queue._tasks[f"{__name__}.greet_task"]
         job = await wrapper.enqueue("world")
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await imm_queue.attempts.filter(F("job_ulid") == job.ulid).all()
 
         assert len(attempts) == 1
         attempt = attempts[0]
@@ -281,9 +278,7 @@ class TestImmediateAttemptRecord:
         wrapper = imm_queue._tasks[f"{__name__}.fail_oops_task"]
         job = await wrapper.enqueue()
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await imm_queue.attempts.filter(F("job_ulid") == job.ulid).all()
 
         assert len(attempts) == 1
         attempt = attempts[0]
@@ -305,9 +300,7 @@ class TestImmediateCorrelation:
         assert job.correlation_id == "req-abc-123"
         assert job.status == JobStatus.COMPLETED.value
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await imm_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.COMPLETED.value
         assert attempts[0].worker_id == "__immediate__"
@@ -429,10 +422,82 @@ class TestImmediateTimeout:
         wrapped = task(imm_timeout_queue, timeout=1)(imm_timeout_slow_task)
         job = await wrapped.enqueue()
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await imm_timeout_queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == AttemptStatus.FAILED.value
         assert "timed out" in attempts[0].error
         assert attempts[0].failure_kind == FailureKind.TIMEOUT.value
+
+
+class TestImmediateFailWriteRaises:
+    """A fail_job that raises in immediate mode reaches the caller with nothing written."""
+
+    async def test_failed_fail_write_reaches_caller_and_leaves_job_running(
+        self, imm_queue, raise_on_nth_update
+    ):
+        # fail_job's update of the job
+        raise_on_nth_update(lambda fields: "last_failure_kind" in fields)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await imm_queue.enqueue(f"{__name__}.boom_task")
+
+        jobs = await imm_queue.jobs.all()
+        assert [j.status for j in jobs] == [JobStatus.RUNNING.value]
+        attempts = await imm_queue.attempts.all()
+        assert [a.status for a in attempts] == [AttemptStatus.RUNNING.value]
+
+
+class TestImmediateRepeatedKeyInBatch:
+    """A key repeated in one batch is one job: run once, every entry is the executed job."""
+
+    @pytest.mark.parametrize("key_field", ["unique_key", "idempotency_key"])
+    async def test_repeated_key_runs_once_and_both_entries_are_executed(self, imm_queue, key_field):
+        global _call_count
+        _call_count = 0
+        path = f"{__name__}.counted_task"
+
+        results = await imm_queue.enqueue_many(
+            [{"task_path": path, key_field: "k"}, {"task_path": path, key_field: "k"}]
+        )
+
+        assert len(results) == 2
+        assert results[0].ulid == results[1].ulid
+        assert [r.status for r in results] == [JobStatus.COMPLETED.value] * 2
+        assert [r.result for r in results] == [1, 1]
+        assert _call_count == 1
+        attempts = await imm_queue.attempts.all()
+        assert len(attempts) == 1
+
+
+class TestImmediateMatchedPendingJob:
+    """A key that matches a pending job written by a non-immediate queue on the same
+    database returns that job as it is: immediate mode runs only what the call created."""
+
+    @pytest.mark.parametrize("key_field", ["unique_key", "idempotency_key"])
+    @pytest.mark.parametrize("entry", ["enqueue", "enqueue_many"])
+    async def test_matched_pending_job_is_returned_unrun(self, imm_queue, key_field, entry):
+        global _call_count
+        _call_count = 0
+        path = f"{__name__}.counted_task"
+        other = Queue(imm_queue.db)
+        await other.init_db()
+        pending = await other.enqueue(path, **{key_field: "k"})
+        assert pending.status == JobStatus.PENDING.value
+
+        if entry == "enqueue":
+            results = [await imm_queue.enqueue(path, **{key_field: "k"})]
+        else:
+            results = await imm_queue.enqueue_many(
+                [{"task_path": path, key_field: "k"}, {"task_path": path, "args": ()}]
+            )
+
+        assert results[0].ulid == pending.ulid
+        assert results[0].status == JobStatus.PENDING.value
+        assert results[0].attempts == 0
+        new_runs = len(results) - 1
+        assert [r.status for r in results[1:]] == [JobStatus.COMPLETED.value] * new_runs
+        assert _call_count == new_runs
+        attempts = await other.attempts.all()
+        assert [a.job_ulid for a in attempts] == [r.ulid for r in results[1:]]
+        stored = await other.jobs.filter(F("ulid") == pending.ulid).first()
+        assert stored.status == JobStatus.PENDING.value

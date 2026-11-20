@@ -11,6 +11,8 @@ import pytest_asyncio
 prometheus_client = pytest.importorskip("prometheus_client")
 
 from prometheus_client import CollectorRegistry
+from sqler import AsyncSQLerDB, F
+
 from qler._time import now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.metrics import QlerMetrics
@@ -18,7 +20,6 @@ from qler.models.job import Job
 from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
-from sqler import AsyncSQLerDB, F
 
 # ---------------------------------------------------------------------------
 # Module-level task functions (required — @task rejects nested functions)
@@ -122,9 +123,8 @@ def _sample_value(registry, name, labels=None):
     """Extract a single sample value from a registry."""
     for metric in registry.collect():
         for sample in metric.samples:
-            if sample.name == name:
-                if labels is None or sample.labels == labels:
-                    return sample.value
+            if sample.name == name and (labels is None or sample.labels == labels):
+                return sample.value
     return None
 
 
@@ -173,9 +173,11 @@ class TestOptIn:
         assert q._metrics.registry is reg
 
     async def test_metrics_true_without_prometheus_raises(self, db):
-        with patch.dict("sys.modules", {"prometheus_client": None}):
-            with pytest.raises(ImportError):
-                QlerMetrics()
+        with (
+            patch.dict("sys.modules", {"prometheus_client": None}),
+            pytest.raises(ImportError),
+        ):
+            QlerMetrics()
 
     async def test_metrics_invalid_type_raises(self, db):
         from qler.exceptions import ConfigurationError
@@ -195,11 +197,19 @@ class TestCounters:
         tw = task(mq)(counter_task)
 
         await tw.enqueue(1)
-        val = _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "counter_task"})
+        val = _sample_value(
+            reg,
+            "qler_jobs_enqueued_total",
+            {"queue": "default", "task": TASK_PREFIX + "counter_task"},
+        )
         assert val == 1.0
 
         await tw.enqueue(2)
-        val = _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "counter_task"})
+        val = _sample_value(
+            reg,
+            "qler_jobs_enqueued_total",
+            {"queue": "default", "task": TASK_PREFIX + "counter_task"},
+        )
         assert val == 2.0
 
     async def test_claim_increments_counter(self, mq):
@@ -209,7 +219,11 @@ class TestCounters:
         await mq.enqueue(TASK_PREFIX + "claim_counter_task")
         await mq.claim_job("w1", ["default"])
 
-        val = _sample_value(reg, "qler_jobs_claimed_total", {"queue": "default", "task": TASK_PREFIX + "claim_counter_task"})
+        val = _sample_value(
+            reg,
+            "qler_jobs_claimed_total",
+            {"queue": "default", "task": TASK_PREFIX + "claim_counter_task"},
+        )
         assert val == 1.0
 
     async def test_complete_increments_counter(self, mq):
@@ -221,7 +235,11 @@ class TestCounters:
         assert claimed is not None
         await mq.complete_job(claimed, "w1", result="ok")
 
-        val = _sample_value(reg, "qler_jobs_completed_total", {"queue": "default", "task": TASK_PREFIX + "success_task"})
+        val = _sample_value(
+            reg,
+            "qler_jobs_completed_total",
+            {"queue": "default", "task": TASK_PREFIX + "success_task"},
+        )
         assert val == 1.0
 
     async def test_fail_increments_counter_with_kind(self, mq):
@@ -250,7 +268,9 @@ class TestCounters:
         assert claimed is not None
         await mq.fail_job(claimed, "w1", ValueError("oops"), failure_kind=FailureKind.EXCEPTION)
 
-        retried = _sample_value(reg, "qler_jobs_retried_total", {"queue": "default", "task": TASK_PREFIX + "retry_task"})
+        retried = _sample_value(
+            reg, "qler_jobs_retried_total", {"queue": "default", "task": TASK_PREFIX + "retry_task"}
+        )
         assert retried == 1.0
 
         failed = _sample_value(
@@ -273,11 +293,19 @@ class TestCounters:
         failed = _sample_value(
             reg,
             "qler_jobs_failed_total",
-            {"queue": "default", "task": TASK_PREFIX + "terminal_task", "failure_kind": "exception"},
+            {
+                "queue": "default",
+                "task": TASK_PREFIX + "terminal_task",
+                "failure_kind": "exception",
+            },
         )
         assert failed == 1.0
 
-        retried = _sample_value(reg, "qler_jobs_retried_total", {"queue": "default", "task": TASK_PREFIX + "terminal_task"})
+        retried = _sample_value(
+            reg,
+            "qler_jobs_retried_total",
+            {"queue": "default", "task": TASK_PREFIX + "terminal_task"},
+        )
         assert retried is None
 
     async def test_timeout_failure_kind_label(self, mq):
@@ -289,7 +317,8 @@ class TestCounters:
         claimed = await mq.claim_job("w1", ["default"])
         assert claimed is not None
         await mq.fail_job(
-            claimed, "w1",
+            claimed,
+            "w1",
             TimeoutError("timed out"),
             failure_kind=FailureKind.TIMEOUT,
         )
@@ -297,7 +326,11 @@ class TestCounters:
         val = _sample_value(
             reg,
             "qler_jobs_failed_total",
-            {"queue": "default", "task": TASK_PREFIX + "timeout_fail_task", "failure_kind": "timeout"},
+            {
+                "queue": "default",
+                "task": TASK_PREFIX + "timeout_fail_task",
+                "failure_kind": "timeout",
+            },
         )
         assert val == 1.0
 
@@ -310,7 +343,7 @@ class TestCounters:
         assert claimed is not None
 
         # Expire the lease by backdating it
-        await Job.query().filter(F("ulid") == claimed.ulid).update_one(
+        await mq.jobs.filter(F("ulid") == claimed.ulid).update_one(
             lease_expires_at=now_epoch() - 100,
         )
 
@@ -328,8 +361,14 @@ class TestCounters:
         await mq.enqueue(TASK_PREFIX + "email_task", queue_name="emails")
         await mq.enqueue(TASK_PREFIX + "report_task", queue_name="reports")
 
-        email_val = _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "emails", "task": TASK_PREFIX + "email_task"})
-        report_val = _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "reports", "task": TASK_PREFIX + "report_task"})
+        email_val = _sample_value(
+            reg, "qler_jobs_enqueued_total", {"queue": "emails", "task": TASK_PREFIX + "email_task"}
+        )
+        report_val = _sample_value(
+            reg,
+            "qler_jobs_enqueued_total",
+            {"queue": "reports", "task": TASK_PREFIX + "report_task"},
+        )
         assert email_val == 1.0
         assert report_val == 1.0
 
@@ -342,8 +381,12 @@ class TestCounters:
         await mq.enqueue(TASK_PREFIX + "task_a")
         await mq.enqueue(TASK_PREFIX + "task_b")
 
-        a_val = _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "task_a"})
-        b_val = _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "task_b"})
+        a_val = _sample_value(
+            reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "task_a"}
+        )
+        b_val = _sample_value(
+            reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "task_b"}
+        )
         assert a_val == 2.0
         assert b_val == 1.0
 
@@ -364,17 +407,25 @@ class TestHistogram:
         async def stop_after_one():
             while True:
                 await asyncio.sleep(0.05)
-                jobs = await Job.query().all()
+                jobs = await mq.jobs.all()
                 if any(j.status == JobStatus.COMPLETED.value for j in jobs):
                     worker._running = False
                     return
 
         await asyncio.gather(worker.run(), stop_after_one())
 
-        count = _sample_value(reg, "qler_job_duration_seconds_count", {"queue": "default", "task": TASK_PREFIX + "fast_task"})
+        count = _sample_value(
+            reg,
+            "qler_job_duration_seconds_count",
+            {"queue": "default", "task": TASK_PREFIX + "fast_task"},
+        )
         assert count == 1.0
 
-        total = _sample_value(reg, "qler_job_duration_seconds_sum", {"queue": "default", "task": TASK_PREFIX + "fast_task"})
+        total = _sample_value(
+            reg,
+            "qler_job_duration_seconds_sum",
+            {"queue": "default", "task": TASK_PREFIX + "fast_task"},
+        )
         assert 0 < total < 5.0  # instant task, must be positive but not absurd
 
     async def test_duration_observed_on_fail(self, mq):
@@ -387,14 +438,18 @@ class TestHistogram:
         async def stop_after_one():
             while True:
                 await asyncio.sleep(0.05)
-                jobs = await Job.query().all()
+                jobs = await mq.jobs.all()
                 if any(j.status == JobStatus.FAILED.value for j in jobs):
                     worker._running = False
                     return
 
         await asyncio.gather(worker.run(), stop_after_one())
 
-        count = _sample_value(reg, "qler_job_duration_seconds_count", {"queue": "default", "task": TASK_PREFIX + "boom_task"})
+        count = _sample_value(
+            reg,
+            "qler_job_duration_seconds_count",
+            {"queue": "default", "task": TASK_PREFIX + "boom_task"},
+        )
         assert count == 1.0
 
 
@@ -428,6 +483,20 @@ class TestQueueDepth:
         await mq._metrics.update_depth()
         depths = _sample_values(reg, "qler_queue_depth")
         assert len(depths) == 0
+
+    async def test_queue_depth_failure_returns_empty_and_logs_one_warning(self, mq, caplog):
+        """A failing depth query still returns [] (a scrape must not fail) and says why."""
+        with (
+            patch.object(Job, "using", side_effect=RuntimeError("depth boom")),
+            caplog.at_level("WARNING", logger="qler.queue"),
+        ):
+            assert await mq._query_queue_depth() == []
+
+        records = [r for r in caplog.records if r.name == "qler.queue"]
+        assert len(records) == 1
+        assert records[0].levelname == "WARNING"
+        assert records[0].exc_info is not None
+        assert str(records[0].exc_info[1]) == "depth boom"
 
     async def test_update_depth_noop_when_not_wired(self):
         """update_depth returns silently when no query function is set."""
@@ -526,17 +595,45 @@ class TestIntegration:
         async def stop_when_done():
             while True:
                 await asyncio.sleep(0.05)
-                jobs = await Job.query().all()
+                jobs = await mq.jobs.all()
                 if any(j.status == JobStatus.COMPLETED.value for j in jobs):
                     worker._running = False
                     return
 
         await asyncio.gather(worker.run(), stop_when_done())
 
-        assert _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"}) == 1.0
-        assert _sample_value(reg, "qler_jobs_claimed_total", {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"}) == 1.0
-        assert _sample_value(reg, "qler_jobs_completed_total", {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"}) == 1.0
-        assert _sample_value(reg, "qler_job_duration_seconds_count", {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"}) == 1.0
+        assert (
+            _sample_value(
+                reg,
+                "qler_jobs_enqueued_total",
+                {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"},
+            )
+            == 1.0
+        )
+        assert (
+            _sample_value(
+                reg,
+                "qler_jobs_claimed_total",
+                {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"},
+            )
+            == 1.0
+        )
+        assert (
+            _sample_value(
+                reg,
+                "qler_jobs_completed_total",
+                {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"},
+            )
+            == 1.0
+        )
+        assert (
+            _sample_value(
+                reg,
+                "qler_job_duration_seconds_count",
+                {"queue": "default", "task": TASK_PREFIX + "lifecycle_task"},
+            )
+            == 1.0
+        )
 
     async def test_enqueue_many_increments_counter(self, mq):
         reg = mq._metrics.registry
@@ -544,5 +641,9 @@ class TestIntegration:
 
         await tw.enqueue_many([(1,), (2,), (3,)])
 
-        val = _sample_value(reg, "qler_jobs_enqueued_total", {"queue": "default", "task": TASK_PREFIX + "batch_task"})
+        val = _sample_value(
+            reg,
+            "qler_jobs_enqueued_total",
+            {"queue": "default", "task": TASK_PREFIX + "batch_task"},
+        )
         assert val == 3.0
