@@ -453,7 +453,7 @@ class Worker:
 
     async def _execute_job(self, job: Any) -> None:
         """Execute a single job: resolve task, validate signature, run, complete/fail."""
-        start_time = time.monotonic()
+        start_time = time.perf_counter()
         token = _current_job.set(job)
         queue_token = _current_queue.set(self.queue)
         try:
@@ -601,7 +601,7 @@ class Worker:
             await self._finish("complete", job, self.worker_id, result=result)
 
         finally:
-            duration = time.monotonic() - start_time
+            duration = time.perf_counter() - start_time
             _lifecycle(
                 "job.executed",
                 job_id=job.ulid,
