@@ -12,8 +12,8 @@ from sqler import NO_REBASE_CONFIG, AsyncSQLerQuerySet, AsyncSQLerSafeModel, F, 
 from sqler.exceptions import UniqueConstraintError
 from sqler.models import as_ref
 
+from qler._cancel import cancel_job as _cancel_job
 from qler._notify import clear as _notify_clear
-from qler._notify import fire as _notify_fire
 from qler._notify import register as _notify_register
 from qler._time import now_epoch
 from qler.enums import ACTIVE_STATUSES, JobStatus
@@ -89,29 +89,15 @@ class Job(AsyncSQLerSafeModel):
         return json.loads(self.payload_json)
 
     async def cancel(self) -> bool:
-        """Cancel a job. PENDING jobs are cancelled immediately; RUNNING jobs
-        get a cooperative cancellation request.
+        """Cancel a job, as ``Queue.cancel_job(job)`` does, in the database its row lives in.
 
-        Returns True if cancelled or cancellation was requested, False otherwise.
+        A PENDING job and the pending jobs that depend on it are cancelled in one
+        transaction, and waiters are notified after the commit; a RUNNING job gets a
+        cooperative cancellation request. Returns True if cancelled or cancellation was
+        requested, False otherwise.
         Raises NotBoundError (sqler) for a job that was never enqueued or read.
         """
-        # Try immediate cancellation (PENDING → CANCELLED)
-        now = now_epoch()
-        updated = (
-            await Job.beside(self)
-            .filter((F("ulid") == self.ulid) & (F("status") == JobStatus.PENDING.value))
-            .update_one(
-                status=JobStatus.CANCELLED.value,
-                finished_at=now,
-                updated_at=now,
-            )
-        )
-        if updated is not None:
-            self._sync_from(updated)
-            _notify_fire(self.ulid)
-            return True
-        # If RUNNING, request cooperative cancellation instead
-        return await self.request_cancel()
+        return await _cancel_job(self)
 
     async def request_cancel(self) -> bool:
         """Request cancellation of a RUNNING job. Returns True if request was recorded.

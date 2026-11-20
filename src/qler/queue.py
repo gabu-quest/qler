@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 from sqler import AsyncSQLerDB, AsyncSQLerQuerySet, F, SQLerExpression
 from sqler.exceptions import UniqueConstraintError
 
+from qler._cancel import cancel_job as _cancel_job
+from qler._cancel import cascade_cancel_dependents, children_by_parent
 from qler._context import _current_job
 from qler._notify import fire as _notify_fire
 from qler._schema import ensure_schema
@@ -986,19 +988,8 @@ class Queue:
         return (await self._children_by_parent([parent_ulid])).get(parent_ulid, [])
 
     async def _children_by_parent(self, parents: list[str]) -> dict[str, list[str]]:
-        """Each parent's children, ascending: one read of the edges per 900 parents
-        (under SQLite's 999-variable limit); builds no model."""
-        children: dict[str, set[str]] = {}
-        for off in range(0, len(parents), 900):
-            for edge in (
-                await self._dependency_edges.filter(
-                    F("parent_ulid").in_list(parents[off : off + 900])
-                )
-                .select("parent_ulid", "child_ulid")
-                .as_dicts()
-            ):
-                children.setdefault(edge["parent_ulid"], set()).add(edge["child_ulid"])
-        return {parent: sorted(kids) for parent, kids in children.items()}
+        """Each parent's children, ascending, read from this queue's database."""
+        return await children_by_parent(self._dependency_edges, parents)
 
     async def _resolve_dependencies(self, completed_ulid: str) -> None:
         """Decrement pending_dep_count for jobs depending on the completed job.
@@ -1022,72 +1013,22 @@ class Queue:
                 )
 
     async def _cascade_cancel_dependents(self, failed_ulid: str) -> list[str]:
-        """Cancel PENDING jobs that depend on a failed/cancelled job, recursively.
-
-        One transaction (a savepoint inside the caller's): the whole cascade is
-        cancelled, or none of it. Returns the ULIDs it cancelled, in order, so the
-        caller notifies waiters only after its own commit.
-        """
-        jobs = self.jobs
-        now = now_epoch()
-        cancelled_ulids: list[str] = []
-        async with self.db.transaction():
-            # A level at a time: one read for the edges of every job on the level, then
-            # its parents in order, each one's children ascending, as a job-by-job walk
-            # would go. A child is tried once, under the first parent that reaches it.
-            level = [failed_ulid]
-            tried: set[str] = set()
-            while level:
-                children = await self._children_by_parent(level)
-                next_level: list[str] = []
-                for parent_ulid in level:
-                    for child_ulid in children.get(parent_ulid, []):
-                        if child_ulid in tried:
-                            continue
-                        tried.add(child_ulid)
-                        updated = await jobs.filter(
-                            (F("ulid") == child_ulid) & (F("status") == JobStatus.PENDING.value)
-                        ).update_one(
-                            status=JobStatus.CANCELLED.value,
-                            last_error=f"Dependency {parent_ulid} failed/cancelled",
-                            finished_at=now,
-                            updated_at=now,
-                        )
-                        if updated is not None:
-                            cancelled_ulids.append(child_ulid)
-                            next_level.append(child_ulid)
-                level = next_level
-        return cancelled_ulids
+        """Cancel the pending jobs that depend on ``failed_ulid``, in this queue's
+        database, as one savepoint; returns the ULIDs cancelled, for notice after the
+        caller's commit."""
+        return await cascade_cancel_dependents(self.jobs, failed_ulid)
 
     async def cancel_job(self, job: Job) -> bool:
-        """Cancel a job and cascade-cancel its dependents.
+        """Cancel a job and cascade-cancel its dependents, as ``job.cancel()`` does.
 
-        A PENDING job and its pending dependents are cancelled in one transaction; a
-        RUNNING job gets a cooperative cancellation request. Waiters are notified after
-        the commit, and only for what was committed.
+        Works on the database the job's row lives in. A PENDING job and its pending
+        dependents are cancelled in one transaction; a RUNNING job gets a cooperative
+        cancellation request. Waiters are notified after the commit, and only for what
+        was committed. Raises RuntimeError on a queue that was never initialized, as
+        every other finishing call does.
         """
-        now = now_epoch()
-        async with self.db.transaction():
-            updated = await self.jobs.filter(
-                (F("ulid") == job.ulid) & (F("status") == JobStatus.PENDING.value)
-            ).update_one(
-                status=JobStatus.CANCELLED.value,
-                finished_at=now,
-                updated_at=now,
-            )
-            cancelled = (
-                await self._cascade_cancel_dependents(job.ulid) if updated is not None else []
-            )
-
-        if updated is None:
-            # Not PENDING: if RUNNING, request cooperative cancellation instead
-            return await job.request_cancel()
-
-        job._sync_from(updated)
-        _notify_fire(job.ulid)
-        for child_ulid in cancelled:
-            _notify_fire(child_ulid)
-        return True
+        _ = self.db
+        return await _cancel_job(job)
 
     async def replay_job(self, job: Job, *, queue_name: str | None = None) -> Job | None:
         """Replay a FAILED DLQ job back to its original queue.
