@@ -229,6 +229,45 @@ class TestRenewLease:
         assert result is False
 
 
+class TestLateResultAfterRecovery:
+    """A worker whose job was recovered and claimed by another cannot finish it."""
+
+    @pytest.mark.parametrize("finish", ["complete", "fail"])
+    async def test_first_workers_late_finish_is_refused(self, queue, finish):
+        first = await _make_running_job(queue, lease_offset=-10, worker_id="worker-a")
+        assert await queue.recover_expired_leases() == 1
+        second = await queue.claim_job("worker-b", ["default"])
+        assert second.ulid == first.ulid
+
+        def state(row):
+            return (
+                row.status,
+                row.worker_id,
+                row.lease_expires_at,
+                row.retry_count,
+                row.result_json,
+                row.last_error,
+                row.last_failure_kind,
+                row.finished_at,
+                row.last_attempt_id,
+            )
+
+        before = await queue.jobs.filter(F("ulid") == first.ulid).first()
+        if finish == "complete":
+            await queue.complete_job(first, "worker-a", result="late")
+        else:
+            await queue.fail_job(first, "worker-a", RuntimeError("late"))
+
+        after = await queue.jobs.filter(F("ulid") == first.ulid).first()
+        assert state(after) == state(before)
+        assert (after.status, after.worker_id) == (JobStatus.RUNNING.value, "worker-b")
+        attempts = await queue.attempts.filter(F("job_ulid") == first.ulid).all()
+        assert sorted((a.attempt_number, a.status, a.worker_id) for a in attempts) == [
+            (1, AttemptStatus.LEASE_EXPIRED.value, "worker-a"),
+            (2, AttemptStatus.RUNNING.value, "worker-b"),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Worker._lease_renewal_loop: a running job keeps its lease
 # ---------------------------------------------------------------------------

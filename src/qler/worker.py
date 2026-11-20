@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import inspect
 import json
 import logging
@@ -12,6 +14,9 @@ import platform
 import signal
 import socket
 import time
+import weakref
+from collections.abc import Awaitable, Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -44,23 +49,87 @@ _RENEWAL_MIN_SLEEP = 0.25
 
 
 def _run_then_signal(
-    fn: Any,
-    args: list[Any],
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
     kwargs: dict[str, Any],
     loop: asyncio.AbstractEventLoop,
     returned: asyncio.Future[None],
 ) -> Any:
-    """Run a sync task's function in its thread; set `returned` on the loop once it is over."""
+    """Run a job's function in its thread; set `returned` on the loop once it is over."""
     try:
         return fn(*args, **kwargs)
     finally:
-        with suppress(RuntimeError):  # the loop has closed: no one is waiting
-            loop.call_soon_threadsafe(_set_returned, returned)
+        _signal_returned(loop, returned)
+
+
+def _signal_returned(loop: asyncio.AbstractEventLoop, returned: asyncio.Future[None]) -> None:
+    """From any thread: set `returned` on its loop."""
+    with suppress(RuntimeError):  # the loop has closed: no one is waiting
+        loop.call_soon_threadsafe(_set_returned, returned)
 
 
 def _set_returned(returned: asyncio.Future[None]) -> None:
     if not returned.done():
         returned.set_result(None)
+
+
+class _LoopPool(ThreadPoolExecutor):
+    """The default thread pool a worker gives its loop: Python's own kind and size.
+
+    A function submitted from inside a job (`asyncio.to_thread`,
+    `loop.run_in_executor(None, ...)`, from the job's task or a task it started)
+    is known to that job's worker until it has returned, through the worker's
+    `_track_thread`. Any other submit passes through untouched.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        super().__init__(thread_name_prefix="asyncio")
+        # Weak, so the pool kept for this loop in _loop_pools does not keep the loop alive.
+        self._loop = weakref.ref(loop)
+        # worker_id -> worker, for the workers running on this loop now.
+        self._workers: dict[str, Worker] = {}
+
+    def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        job = _current_job.get()
+        try:
+            loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:  # submitted from a thread with no running loop
+            loop = None
+        worker = None
+        if job is not None and loop is not None and loop is self._loop():
+            worker = self._workers.get(job.worker_id)
+        if job is None or loop is None or worker is None:
+            return super().submit(fn, *args, **kwargs)
+
+        returned = worker._track_thread(job.ulid)
+        try:
+            submitted = super().submit(_run_then_signal, fn, args, kwargs, loop, returned)
+        except BaseException:
+            _set_returned(returned)
+            raise
+
+        def if_never_run(f: Future[Any]) -> None:
+            if f.cancelled():  # cancelled before a thread took it: fn never runs
+                _signal_returned(loop, returned)
+
+        submitted.add_done_callback(if_never_run)
+        return submitted
+
+
+# One pool per loop, so a worker run again, or a second worker on the same
+# loop, installs the same pool instead of stacking a new one.
+_loop_pools: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _LoopPool] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _install_pool(loop: asyncio.AbstractEventLoop) -> _LoopPool:
+    """Make the loop's pool its default executor; create the pool on first use."""
+    pool = _loop_pools.get(loop)
+    if pool is None:
+        pool = _loop_pools[loop] = _LoopPool(loop)
+    loop.set_default_executor(pool)
+    return pool
 
 
 class Worker:
@@ -137,10 +206,13 @@ class Worker:
         self._cut_by_shutdown: set[str] = set()
         self._left_for_recovery: list[str] = []
         self._failed_on_cut: list[str] = []
-        # ulid -> a future set once a sync task's function has returned in its
-        # thread; the entry goes when it is set. A cancelled to_thread await ends
-        # while the thread runs on, so this, not the task, says the work is over.
-        self._thread_running: dict[str, asyncio.Future[None]] = {}
+        # ulid -> one future per thread of the job still running: a sync task's
+        # own thread, and every function the job submitted to the loop's default
+        # pool. Each is set once its function has returned and then leaves the
+        # set; the entry goes with its last future. A cancelled await of a thread
+        # ends while the thread runs on, so this, not the task, says the work is over.
+        self._thread_running: dict[str, set[asyncio.Future[None]]] = {}
+        self._pool: _LoopPool | None = None
 
     @property
     def status(self) -> str:
@@ -273,6 +345,10 @@ class Worker:
 
         # Install signal handlers (may fail in non-main thread / pytest)
         loop = asyncio.get_running_loop()
+        # The loop's default pool becomes one that tells this worker of the
+        # threads its jobs start, so the drain can wait for them.
+        pool = self._pool = _install_pool(loop)
+        pool._workers[self.worker_id] = self
         self._original_handlers: dict[int, Any] = {}
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -309,7 +385,10 @@ class Worker:
             # Main claim loop
             await self._claim_loop()
         finally:
-            await self._shutdown()
+            try:
+                await self._shutdown()
+            finally:
+                pool._workers.pop(self.worker_id, None)
 
     def _signal_handler(self) -> None:
         """Handle SIGTERM/SIGINT — set running to False for graceful drain."""
@@ -429,14 +508,15 @@ class Worker:
                     self._in_task_body[job.ulid] = current
                 try:
                     with correlation_context(correlation_id):
+                        coro: Awaitable[Any]
                         if task_wrapper.sync:
-                            coro = asyncio.to_thread(
-                                _run_then_signal,
-                                fn,
-                                args,
-                                kwargs,
-                                asyncio.get_running_loop(),
-                                self._track_thread(job.ulid),
+                            # In this worker's pool, which tracks the thread as the
+                            # job's work; with the context copied, as to_thread does.
+                            coro = asyncio.get_running_loop().run_in_executor(
+                                self._pool,
+                                functools.partial(
+                                    contextvars.copy_context().run, fn, *args, **kwargs
+                                ),
                             )
                         else:
                             coro = fn(*args, **kwargs)
@@ -552,16 +632,34 @@ class Worker:
             )
 
     def _track_thread(self, ulid: str) -> asyncio.Future[None]:
-        """Register a sync job's thread in _thread_running; return the future it sets."""
+        """Register a thread of a job in _thread_running; return the future it sets."""
         returned: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._thread_running[ulid] = returned
+        running = self._thread_running.setdefault(ulid, set())
+        running.add(returned)
 
         def forget(fut: asyncio.Future[None]) -> None:
-            if self._thread_running.get(ulid) is fut:
+            running.discard(fut)
+            if not running and self._thread_running.get(ulid) is running:
                 del self._thread_running[ulid]
 
         returned.add_done_callback(forget)
         return returned
+
+    def _work_of(self, ulid: str, job_task: asyncio.Task) -> set[asyncio.Future[Any]]:
+        """What of a job still runs: its own task, its threads, and the tasks it started.
+
+        A task the job started is one whose context carries this job: a child task
+        copies the context `_execute_job` set `_current_job` in. Empty means the
+        job's work is proven over.
+        """
+        work: set[asyncio.Future[Any]] = set(self._thread_running.get(ulid, ()))
+        if not job_task.done():
+            work.add(job_task)
+        for t in asyncio.all_tasks():
+            job = t.get_context().get(_current_job)
+            if job is not None and job.ulid == ulid and job.worker_id == self.worker_id:
+                work.add(t)
+        return {f for f in work if not f.done()}
 
     async def _cancel_was_requested(self, job: Any) -> bool:
         """Return True if the user has asked to cancel this job (cancel_requested)."""
@@ -778,13 +876,18 @@ class Worker:
     async def _drain(self) -> None:
         """Wait for active jobs; cut those still running after shutdown_timeout.
 
-        After the cut, wait at most SHUTDOWN_CUT_GRACE for the cut tasks to end,
-        and for the threads of cut sync tasks to return. Within that same bound,
-        each cut job whose work is over (its task done and, for a sync task, its
-        function returned) is released: lease recovery's transition, at once, so
-        another worker claims it without waiting out the lease. A job still going
-        then (it swallowed the cancel, or its thread runs on), or whose release
-        failed, keeps its lease and is logged by job id; lease recovery takes it.
+        The cut cancels each job's own task, and no other: a task the job started
+        is not the worker's to cancel (it may be one the program keeps, such as a
+        client's reader started on first use). Then wait at most SHUTDOWN_CUT_GRACE
+        for the cut jobs' work to end: their tasks, the tasks they started, and
+        their threads (a sync task's own, and those the job submitted to the
+        loop's default pool) to return. Within that same
+        bound, each cut job whose work is proven over (`_work_of` is empty) is
+        released: lease recovery's transition, at once, so another worker claims
+        it without waiting out the lease. A job with work still going then (its
+        task swallowed the cancel, a task it started or a thread runs on), or
+        whose release failed,
+        keeps its lease and is logged by job id; lease recovery takes it.
         """
         if not self._active_tasks:
             return
@@ -803,30 +906,38 @@ class Worker:
             return
         loop = asyncio.get_running_loop()
         deadline = loop.time() + SHUTDOWN_CUT_GRACE
-        # A cut sync task's await ends at once; its thread may run on.
-        waiting: set[asyncio.Future[Any]] = set(pending)
-        waiting.update(self._thread_running[u] for u in cut if u in self._thread_running)
         handled: set[str] = set()
         released = 0
         failed: list[str] = []
         while True:
-            # Release each job the cut left whose work is proven over: its task is
-            # done and no thread of it is still running. As soon as it is, so a
-            # task that ignores the cut does not spend the others' time.
+            # Release each job the cut left whose work is proven over: its task and
+            # the tasks it started are done and no thread of it is still running.
+            # As soon as it is, so a task that ignores the cut does not spend the
+            # others' time.
             # Only this shutdown's cut: a worker run a second time still lists the
             # jobs its earlier shutdown left.
+            wrote = False
             for ulid in self._left_for_recovery:
                 if ulid in handled or ulid not in cut:
                     continue
-                if not cut[ulid].done() or ulid in self._thread_running:
+                if self._work_of(ulid, cut[ulid]):
                     continue
                 handled.add(ulid)
+                wrote = True
                 outcome = await self._release(ulid, deadline - loop.time())
                 if outcome == "released":
                     released += 1
                 elif outcome == "failed":
                     failed.append(ulid)
-            waiting = {f for f in waiting if not f.done()}
+            if wrote and deadline - loop.time() > 0:
+                # A release is a write, and the loop ran during it: the work of a job
+                # this pass had already looked at may have ended. Look at them all again.
+                continue
+            # A cut task's await of a thread ends at once; the thread may run on.
+            waiting: set[asyncio.Future[Any]] = {t for t in pending if not t.done()}
+            for ulid, t in cut.items():
+                if ulid not in handled:
+                    waiting |= self._work_of(ulid, t)
             remaining = deadline - loop.time()
             if not waiting or remaining <= 0:
                 break
