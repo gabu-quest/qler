@@ -209,6 +209,134 @@ async def ignoring_task():
     return "ignored"
 
 
+# Set per test by TestShutdownSeesWorkAJobStarted.
+_children: set[asyncio.Task] = set()
+_job_task: asyncio.Task | None = None
+_outside_go: threading.Event | None = None
+
+
+async def job_awaiting_a_thread():
+    """An async job that hands its work to the loop's default pool and awaits it."""
+    return await asyncio.to_thread(blocking_sync_task)
+
+
+async def job_leaving_an_executor_call():
+    """Submits to the default pool without awaiting it, then waits; honours the cut."""
+    asyncio.get_running_loop().run_in_executor(None, blocking_sync_task)
+    _held_started.set()
+    await asyncio.Event().wait()
+
+
+async def job_whose_thread_finished_earlier():
+    """Its to_thread call is over before the cut; then it waits and honours the cut."""
+    assert await asyncio.to_thread(sync_task, 21) == 42
+    _held_started.set()
+    await asyncio.Event().wait()
+
+
+def raising_after_go():
+    _thread_entered.set()
+    try:
+        _thread_go.wait(30)
+        raise RuntimeError("thread failed")
+    finally:
+        _thread_returned.set()
+
+
+async def job_whose_thread_raises():
+    return await asyncio.to_thread(raising_after_go)
+
+
+_child_cancels: list[str] = []
+
+
+async def child_running_on():
+    """Runs until the test lets it go; records a cancel if one reaches it."""
+    _ignore_started.set()
+    try:
+        await _ignore_release.wait()
+    except asyncio.CancelledError:
+        _child_cancels.append("child_running_on")
+        raise
+
+
+async def job_with_a_child_running_on():
+    _children.add(asyncio.create_task(child_running_on()))
+    await asyncio.Event().wait()
+
+
+async def child_ending_after_its_job():
+    """Ends a few passes of the loop after the job's own task has ended."""
+    _ignore_started.set()
+    await asyncio.wait({_job_task})
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+async def job_with_a_child_that_ends_in_the_grace():
+    global _job_task
+    _job_task = asyncio.current_task()
+    _children.add(asyncio.create_task(child_ending_after_its_job()))
+    await asyncio.Event().wait()
+
+
+_other_listed: asyncio.Event | None = None
+
+
+async def honouring_once_the_other_is_listed():
+    """Honours the cut, but only after the other cut job is listed as left for recovery."""
+    _honour_started.set()
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        await _other_listed.wait()
+        raise
+
+
+class _SignalOnAppend(list):
+    """A list that calls `on_append` after each append."""
+
+    def __init__(self, on_append):
+        super().__init__()
+        self._on_append = on_append
+
+    def append(self, item):
+        super().append(item)
+        self._on_append()
+
+
+_blockers_wanted = 0
+_blockers_ran = 0
+_blockers_lock = threading.Lock()
+_blockers_all_in: threading.Event | None = None
+
+
+def counting_blocker():
+    """Counts itself in, then blocks its thread until the test sets _thread_go."""
+    global _blockers_ran
+    with _blockers_lock:
+        _blockers_ran += 1
+        if _blockers_ran == _blockers_wanted:
+            _blockers_all_in.set()
+    _thread_go.wait(30)
+
+
+async def job_with_more_calls_than_threads():
+    """Hands the pool eight calls more than it has threads. On the cut, gather has cancelled
+    them all before this handler runs: the calls still queued never run; then the threads go."""
+    calls = [asyncio.to_thread(counting_blocker) for _ in range(_blockers_wanted + 8)]
+    try:
+        await asyncio.gather(*calls)
+    except asyncio.CancelledError:
+        _thread_go.set()
+        raise
+
+
+async def started_task():
+    _held_started.set()
+    return "started"
+
+
 class _SignalOnAdd(set):
     """A set that calls `on_add` after each add: tells a test the shutdown cut a job."""
 
@@ -1117,6 +1245,347 @@ class TestShutdownRelease:
             "with 1 job(s) unfinished: released 1 to be claimed at once, "
             "0 keep their lease for lease recovery, failed 0 as cancelled"
         ) in caplog.text
+
+
+class TestShutdownSeesWorkAJobStarted:
+    """Threads and tasks an async job started itself keep its lease while they run."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch):
+        global _held_started, _held_runs, _thread_entered, _thread_go, _thread_returned
+        global _ignore_started, _ignore_release, _children, _job_task, _outside_go
+        global _honour_started, _other_listed, _blockers_wanted, _blockers_ran, _blockers_all_in
+        import qler.worker as worker_module
+
+        monkeypatch.setattr(worker_module, "SHUTDOWN_CUT_GRACE", 0.3)
+        _held_started = asyncio.Event()
+        _held_runs = 0
+        _thread_entered = threading.Event()
+        _thread_go = threading.Event()
+        _thread_returned = threading.Event()
+        _ignore_started = asyncio.Event()
+        _ignore_release = asyncio.Event()
+        _honour_started = asyncio.Event()
+        _children = set()
+        _child_cancels.clear()
+        _job_task = None
+        _outside_go = threading.Event()
+        _other_listed = asyncio.Event()
+        _blockers_wanted = _blockers_ran = 0
+        _blockers_all_in = threading.Event()
+        yield
+        _thread_go.set()  # never leave a test's thread blocked
+        _outside_go.set()
+
+    async def _queue(self, db):
+        q = Queue(db, default_lease_duration=30, default_max_retries=3)
+        await q.init_db()
+        return q
+
+    async def _row(self, queue, job):
+        return await queue.jobs.filter(F("ulid") == job.ulid).first()
+
+    async def _stop(self, w, w_task):
+        """Stop the worker; return the seconds from the stop to run()'s return."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        w._running = False
+        await asyncio.wait_for(asyncio.shield(w_task), timeout=5.0)
+        return loop.time() - started
+
+    async def _end_thread(self):
+        _thread_go.set()
+        assert await asyncio.to_thread(_thread_returned.wait, 5.0) is True
+
+    async def test_to_thread_running_past_the_grace_keeps_the_lease(self, worker_db, caplog):
+        """The cut ends the job's task; the thread it awaited runs on: nothing is claimable."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_awaiting_a_thread).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        try:
+            assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+            before = await self._row(q, job)
+            with caplog.at_level("WARNING", logger="qler.worker"):
+                elapsed = await self._stop(w, w_task)
+            thread_returned_at_exit = _thread_returned.is_set()
+            after = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
+        finally:
+            await self._end_thread()
+
+        assert thread_returned_at_exit is False
+        assert other is None
+        assert (after.status, after.worker_id, after.lease_expires_at) == (
+            JobStatus.RUNNING.value,
+            w.worker_id,
+            before.lease_expires_at,
+        )
+        kept = [
+            r.getMessage() for r in caplog.records if "job(s) keep their lease" in r.getMessage()
+        ]
+        assert len(kept) == 1
+        assert kept[0].endswith(f": {job.ulid}")
+        # The shutdown is held no longer than before: timeout 0.2 + grace 0.3,
+        # with room for a busy machine.
+        assert elapsed < 0.2 + 0.3 + 1.5
+
+    async def test_to_thread_returning_in_the_grace_is_released(self, worker_db):
+        """The thread returns after the cut, inside the grace: claimable at once."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_awaiting_a_thread).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w._cut_by_shutdown = _SignalOnAdd(_thread_go.set)
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+        await self._stop(w, w_task)
+
+        assert _thread_returned.is_set() is True
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id, row.lease_expires_at, row.retry_count) == (
+            JobStatus.PENDING.value,
+            "",
+            None,
+            0,
+        )
+        other = await q.claim_job("other-worker", ["default"])
+        assert other.ulid == job.ulid
+
+    async def test_executor_call_not_awaited_keeps_the_lease(self, worker_db):
+        """run_in_executor(None, fn) left running by a job that honours the cut."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_leaving_an_executor_call).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+            assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+            await self._stop(w, w_task)
+            thread_returned_at_exit = _thread_returned.is_set()
+            row = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
+        finally:
+            await self._end_thread()
+
+        assert thread_returned_at_exit is False
+        assert other is None
+        assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+
+    async def test_thread_that_finished_before_the_cut_does_not_hold_the_lease(self, worker_db):
+        """A to_thread call that is over before the cut: nothing of it runs, so released."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_whose_thread_finished_earlier).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        await self._stop(w, w_task)
+
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+        assert w._thread_running == {}
+
+    async def test_thread_that_raises_in_the_grace_is_released(self, worker_db):
+        """The thread's function raises after the cut: it has returned, so released."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_whose_thread_raises).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w._cut_by_shutdown = _SignalOnAdd(_thread_go.set)
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+        await self._stop(w, w_task)
+
+        assert _thread_returned.is_set() is True
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+        assert w._thread_running == {}
+
+    async def test_two_jobs_only_the_one_without_a_running_thread_is_released(self, worker_db):
+        q = await self._queue(worker_db)
+        threaded = await task(q)(job_awaiting_a_thread).enqueue()
+        plain = await task(q)(honouring_task).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2, concurrency=2)
+        w_task = asyncio.create_task(w.run())
+        try:
+            assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+            await asyncio.wait_for(_honour_started.wait(), timeout=5.0)
+            await self._stop(w, w_task)
+            row_t, row_p = await self._row(q, threaded), await self._row(q, plain)
+        finally:
+            await self._end_thread()
+
+        assert (row_t.status, row_t.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+        assert (row_p.status, row_p.worker_id) == (JobStatus.PENDING.value, "")
+
+    async def test_job_whose_thread_returns_during_another_release_is_released_too(self, worker_db):
+        """The threaded job is listed first and its thread still runs when the drain looks at
+        it; the thread returns while the other job's release is being written. Both are
+        claimable at once."""
+        q = await self._queue(worker_db)
+        threaded = await task(q)(job_awaiting_a_thread).enqueue()
+        plain = await task(q)(honouring_once_the_other_is_listed).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2, concurrency=2)
+        w._left_for_recovery = _SignalOnAppend(_other_listed.set)
+        release = w._release
+        released: list[str] = []
+
+        async def ending_the_thread_during_the_first(ulid, remaining):
+            released.append(ulid)
+            if len(released) == 1:
+                await self._end_thread()
+                # The thread's return reaches the loop through these futures.
+                running = set().union(*w._thread_running.values())
+                if running:
+                    await asyncio.wait(running, timeout=5.0)
+                assert w._thread_running == {}
+            return await release(ulid, remaining)
+
+        w._release = ending_the_thread_during_the_first
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_thread_entered.wait, 5.0) is True
+        await asyncio.wait_for(_honour_started.wait(), timeout=5.0)
+        await self._stop(w, w_task)
+
+        assert list(w._left_for_recovery) == [threaded.ulid, plain.ulid]
+        assert released == [plain.ulid, threaded.ulid]
+        row_t, row_p = await self._row(q, threaded), await self._row(q, plain)
+        assert (row_t.status, row_t.worker_id) == (JobStatus.PENDING.value, "")
+        assert (row_p.status, row_p.worker_id) == (JobStatus.PENDING.value, "")
+
+    async def test_pool_call_cancelled_before_a_thread_took_it_does_not_hold_the_lease(
+        self, worker_db
+    ):
+        """A job handed the pool more calls than it has threads; the cut cancels the queued
+        ones, which never run. Once the running ones return, the job is claimable at once."""
+        import concurrent.futures
+
+        global _blockers_wanted
+        stock = concurrent.futures.ThreadPoolExecutor()
+        _blockers_wanted = stock._max_workers
+        stock.shutdown()
+        q = await self._queue(worker_db)
+        job = await task(q)(job_with_more_calls_than_threads).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        assert await asyncio.to_thread(_blockers_all_in.wait, 5.0) is True
+        await self._stop(w, w_task)
+
+        assert _blockers_ran == _blockers_wanted
+        assert w._thread_running == {}
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+
+    async def test_thread_started_outside_any_job_is_not_counted(self, worker_db):
+        """A default-pool thread the host started is still running at the cut: the job is released."""
+        q = await self._queue(worker_db)
+        job = await task(q)(held_task).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        outside = asyncio.ensure_future(asyncio.to_thread(_outside_go.wait, 30))
+        try:
+            await self._stop(w, w_task)
+            outside_done_at_exit = outside.done()
+            row = await self._row(q, job)
+        finally:
+            _outside_go.set()
+            assert await outside is True
+
+        assert outside_done_at_exit is False
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+        assert w._thread_running == {}
+
+    async def test_child_task_running_on_keeps_the_lease_and_is_not_cancelled(self, worker_db):
+        """A task the job started and did not await runs past the cut: nothing is
+        claimable, and the stop has not cancelled a task the worker did not start."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_with_a_child_running_on).enqueue()
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_ignore_started.wait(), timeout=5.0)
+        children = set(_children)
+        try:
+            elapsed = await self._stop(w, w_task)
+            child_done_at_exit = [c.done() for c in children]
+            row = await self._row(q, job)
+            other = await q.claim_job("other-worker", ["default"])
+        finally:
+            _ignore_release.set()
+            await asyncio.wait_for(asyncio.gather(*children, return_exceptions=True), 5.0)
+
+        assert child_done_at_exit == [False]
+        assert _child_cancels == []
+        assert other is None
+        assert (row.status, row.worker_id) == (JobStatus.RUNNING.value, w.worker_id)
+        assert elapsed < 0.2 + 0.3 + 1.5
+
+    async def test_child_task_ending_in_the_grace_is_waited_for(self, worker_db, monkeypatch):
+        """The job is released only once the task it started has ended."""
+        q = await self._queue(worker_db)
+        job = await task(q)(job_with_a_child_that_ends_in_the_grace).enqueue()
+        child_done_at_release: list[bool] = []
+        release = q._release_lease
+
+        async def recording(*args, **kwargs):
+            child_done_at_release.append(all(c.done() for c in _children))
+            return await release(*args, **kwargs)
+
+        monkeypatch.setattr(q, "_release_lease", recording)
+        w = make_worker(q, shutdown_timeout=0.2)
+        w_task = asyncio.create_task(w.run())
+        await asyncio.wait_for(_ignore_started.wait(), timeout=5.0)
+        await self._stop(w, w_task)
+
+        assert len(_children) == 1
+        assert child_done_at_release == [True]
+        row = await self._row(q, job)
+        assert (row.status, row.worker_id) == (JobStatus.PENDING.value, "")
+
+
+class TestWorkerDefaultPool:
+    """The worker gives its loop a default thread pool of its own, once."""
+
+    async def _run_one_job(self, w, q):
+        """Run the worker until it has started a job, then stop it."""
+        global _held_started
+        _held_started = asyncio.Event()
+        await task(q)(started_task).enqueue()
+        run = asyncio.create_task(w.run())
+        await asyncio.wait_for(_held_started.wait(), timeout=5.0)
+        w._running = False
+        await asyncio.wait_for(run, timeout=5.0)
+
+    async def test_pool_is_installed_once_for_runs_on_one_loop(self, worker_queue):
+        import concurrent.futures
+
+        stock = concurrent.futures.ThreadPoolExecutor()
+        stock.shutdown()
+        loop = asyncio.get_running_loop()
+        pools = []
+        for w in (make_worker(worker_queue), make_worker(worker_queue)):
+            for _ in range(2):
+                await self._run_one_job(w, worker_queue)
+                pools.append(loop._default_executor)
+
+        assert len(pools) == 4
+        assert all(p is pools[0] for p in pools)
+        assert isinstance(pools[0], concurrent.futures.ThreadPoolExecutor)
+        assert pools[0]._max_workers == stock._max_workers
+        # Left installed and working after run() returns.
+        assert await asyncio.to_thread(sync_task, 4) == 8
+
+    async def test_a_pool_the_host_set_is_replaced_and_left_open(self, worker_queue):
+        import concurrent.futures
+
+        loop = asyncio.get_running_loop()
+        host_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(host_pool)
+        try:
+            await self._run_one_job(make_worker(worker_queue), worker_queue)
+
+            assert loop._default_executor is not host_pool
+            assert host_pool.submit(sync_task, 5).result(timeout=5.0) == 10
+        finally:
+            host_pool.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
