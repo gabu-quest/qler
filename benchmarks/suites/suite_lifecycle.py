@@ -20,6 +20,7 @@ WORKER_ID = "bench-worker-001"
 def _make_queue(db_path: str):
     """Create a Queue pointing at the given DB file."""
     from qler import Queue
+
     return Queue(db=db_path, default_max_retries=1, default_retry_delay=1)
 
 
@@ -66,12 +67,17 @@ class FullCycle:
             stats = await timer.async_measure(do_cycle)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                )
+            )
 
         return results
 
@@ -118,8 +124,11 @@ class RetryCycle:
                 # Enqueue all with max_retries=1
                 for args, kwargs in payloads:
                     await q.enqueue(
-                        TASK_PATH, args=args, kwargs=kwargs,
-                        max_retries=1, retry_delay=1,
+                        TASK_PATH,
+                        args=args,
+                        kwargs=kwargs,
+                        max_retries=1,
+                        retry_delay=1,
                     )
 
                 # First pass: claim and fail
@@ -127,7 +136,8 @@ class RetryCycle:
                     job = await q.claim_job(f"{WORKER_ID}-a{i}", ["default"])
                     if job:
                         await q.fail_job(
-                            job, f"{WORKER_ID}-a{i}",
+                            job,
+                            f"{WORKER_ID}-a{i}",
                             exc=RuntimeError("bench error"),
                             failure_kind=FailureKind.EXCEPTION,
                         )
@@ -143,13 +153,18 @@ class RetryCycle:
             stats = await timer.async_measure(do_retry)
             throughput = count / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="job_count", value=count,
-                timing=stats, rows=count,
-                throughput=round(throughput, 1),
-                metadata={"retries": 1},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="job_count",
+                    value=count,
+                    timing=stats,
+                    rows=count,
+                    throughput=round(throughput, 1),
+                    metadata={"retries": 1},
+                )
+            )
 
         return results
 
@@ -183,7 +198,7 @@ class DependencyChain:
         for n_children in child_counts:
             gen = PayloadGenerator(seed=42)
 
-            async def do_deps(n_children=n_children):
+            async def do_deps(n_children=n_children, gen=gen):
                 tmp = tempfile.TemporaryDirectory()
                 self._tmp_dirs.append(tmp)
                 db_path = str(Path(tmp.name) / "bench.db")
@@ -197,7 +212,9 @@ class DependencyChain:
                 child_payloads = gen.generate("tiny", n_children)
                 for args, kwargs in child_payloads:
                     await q.enqueue(
-                        TASK_PATH, args=args, kwargs=kwargs,
+                        TASK_PATH,
+                        args=args,
+                        kwargs=kwargs,
                         depends_on=[parent.ulid],
                     )
 
@@ -218,12 +235,17 @@ class DependencyChain:
             total_jobs = 1 + n_children
             throughput = total_jobs / (stats.median_ms / 1000) if stats.median_ms > 0 else 0
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="children", value=n_children,
-                timing=stats, rows=total_jobs,
-                throughput=round(throughput, 1),
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="children",
+                    value=n_children,
+                    timing=stats,
+                    rows=total_jobs,
+                    throughput=round(throughput, 1),
+                )
+            )
 
         return results
 
@@ -267,7 +289,7 @@ class ArchivalImpact:
                 payloads = gen.generate("tiny", depth)
                 batch_size = 500
                 for start in range(0, depth, batch_size):
-                    batch = payloads[start:start + batch_size]
+                    batch = payloads[start : start + batch_size]
                     specs = [
                         {"task_path": TASK_PATH, "args": args, "kwargs": kwargs}
                         for args, kwargs in batch
@@ -312,20 +334,34 @@ class ArchivalImpact:
             stats_before = timer._compute_stats(timings_before)
             stats_after = timer._compute_stats(timings_after)
 
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="phase", value=f"before_archive_{depth}",
-                timing=stats_before, rows=1,
-                throughput=round(1000 / stats_before.median_ms, 1) if stats_before.median_ms > 0 else 0,
-                metadata={"dead_weight": depth},
-            ))
-            results.append(BenchmarkResult(
-                scenario=self.name, suite=self.suite,
-                parameter="phase", value=f"after_archive_{depth}",
-                timing=stats_after, rows=1,
-                throughput=round(1000 / stats_after.median_ms, 1) if stats_after.median_ms > 0 else 0,
-                metadata={"dead_weight": depth, "archived": True},
-            ))
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="phase",
+                    value=f"before_archive_{depth}",
+                    timing=stats_before,
+                    rows=1,
+                    throughput=round(1000 / stats_before.median_ms, 1)
+                    if stats_before.median_ms > 0
+                    else 0,
+                    metadata={"dead_weight": depth},
+                )
+            )
+            results.append(
+                BenchmarkResult(
+                    scenario=self.name,
+                    suite=self.suite,
+                    parameter="phase",
+                    value=f"after_archive_{depth}",
+                    timing=stats_after,
+                    rows=1,
+                    throughput=round(1000 / stats_after.median_ms, 1)
+                    if stats_after.median_ms > 0
+                    else 0,
+                    metadata={"dead_weight": depth, "archived": True},
+                )
+            )
 
         return results
 

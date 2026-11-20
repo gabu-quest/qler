@@ -1,0 +1,3 @@
+# Text files are LF in the repository and in every checkout, Windows included.
+# The formatter is set to LF in pyproject.toml, so a CRLF checkout fails `ruff format --check`.
+* text=auto eol=lf

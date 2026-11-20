@@ -1,10 +1,15 @@
 """Tests for Queue — init, enqueue, claim, complete, fail operations."""
 
+import asyncio
+import logging
 import re
+import sqlite3
 import time
 from unittest.mock import patch
 
 import pytest
+from sqler import F
+
 from qler._time import now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.exceptions import (
@@ -15,9 +20,9 @@ from qler.exceptions import (
 )
 from qler.models.attempt import JobAttempt
 from qler.models.bucket import RateLimitBucket
+from qler.models.dependency import JobDependency
 from qler.models.job import Job
 from qler.queue import Queue, _calculate_retry_eta
-from sqler import F
 
 _ULID_PATTERN = re.compile(r"^[0-9A-Z]{26}$")
 
@@ -103,7 +108,7 @@ class TestQueueInit:
         assert "bucket_key" in col_names
         assert "key" not in col_names
 
-        bucket = await RateLimitBucket.query().filter(F("bucket_key") == "task:legacy").first()
+        bucket = await RateLimitBucket.using(db).filter(F("bucket_key") == "task:legacy").first()
         assert bucket is not None
         assert bucket.bucket_key == "task:legacy"
 
@@ -166,6 +171,141 @@ class TestEnqueue:
         assert before <= job.created_at <= after
         assert before <= job.updated_at <= after
 
+    @pytest.mark.parametrize("task_path", ["", None])
+    async def test_falsy_task_path_is_refused_as_in_the_batch(self, queue, task_path):
+        with pytest.raises(ConfigurationError, match=r"^task_path is required$"):
+            await queue.enqueue(task_path)
+        assert await queue.jobs.count() == 0
+
+    async def test_int_in_depends_on_is_refused_with_a_clear_error(self, queue):
+        await queue.enqueue("parent")
+        with pytest.raises(
+            DependencyError,
+            match=r"^Integer dependency index 0 is only meaningful in enqueue_many; "
+            r"enqueue takes job ULIDs$",
+        ) as info:
+            await queue.enqueue("child", depends_on=[0])
+        assert info.value.dependency_ulid == "0"
+        assert await queue.jobs.count() == 1
+        assert await JobDependency.using(queue.db).count() == 0
+
+
+class _EnqueuedEvents(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "event", None) == "job.enqueued":
+            self.records.append(record)
+
+
+class TestPayloadIsCheckedBeforeTheWriteLock:
+    """A payload that cannot be stored is refused without waiting for the database."""
+
+    @pytest.mark.parametrize("entry", ["enqueue", "enqueue_many"])
+    async def test_bad_payload_is_refused_while_another_write_is_open(self, disk_queue, entry):
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def hold_the_write_lock():
+            async with disk_queue.db.transaction():
+                held.set()
+                await release.wait()
+
+        holder = asyncio.create_task(hold_the_write_lock())
+        await held.wait()
+        try:
+            if entry == "enqueue":
+                call = disk_queue.enqueue("t", args=(object(),))
+            else:
+                call = disk_queue.enqueue_many([{"task_path": "t", "args": (object(),)}])
+            with pytest.raises(PayloadNotSerializableError, match="not JSON-serializable"):
+                await asyncio.wait_for(call, 1)
+        finally:
+            release.set()
+            await holder
+        assert await disk_queue.jobs.count() == 0
+
+
+class TestBatchOfOneIsTheSingleCall:
+    """enqueue_many([spec]) gives what enqueue(**spec) gives, in a list, with batch=True."""
+
+    _FIELDS = (
+        "status",
+        "queue_name",
+        "priority",
+        "task",
+        "payload_json",
+        "max_retries",
+        "retry_delay",
+        "lease_duration",
+        "correlation_id",
+        "idempotency_key",
+        "unique_key",
+        "dependencies",
+        "pending_dep_count",
+        "timeout",
+        "attempts",
+    )
+
+    async def test_same_job_and_event_apart_from_batch(self, queue):
+        from qler.lifecycle import logger as lifecycle_logger
+
+        parent = await queue.enqueue("parent")
+        spec = {
+            "args": (1, "a"),
+            "kwargs": {"k": 2},
+            "queue_name": "q1",
+            "priority": 4,
+            "max_retries": 2,
+            "retry_delay": 7,
+            "lease_duration": 33,
+            "correlation_id": "corr",
+            "depends_on": [parent.ulid],
+            "timeout": 9,
+        }
+        handler = _EnqueuedEvents()
+        level = lifecycle_logger.level
+        lifecycle_logger.addHandler(handler)
+        lifecycle_logger.setLevel(logging.INFO)
+        try:
+            one = await queue.enqueue("t", idempotency_key="i1", unique_key="u1", **spec)
+            many = await queue.enqueue_many(
+                [{"task_path": "t", "idempotency_key": "i2", "unique_key": "u2", **spec}]
+            )
+        finally:
+            lifecycle_logger.removeHandler(handler)
+            lifecycle_logger.setLevel(level)
+
+        assert len(many) == 1
+        for f in self._FIELDS:
+            if f in ("idempotency_key", "unique_key"):
+                continue
+            assert getattr(many[0], f) == getattr(one, f), f
+        assert (one.idempotency_key, one.unique_key) == ("i1", "u1")
+        assert (many[0].idempotency_key, many[0].unique_key) == ("i2", "u2")
+        assert one.pending_dep_count == 1
+        assert one.dependencies == [parent.ulid]
+        assert len(handler.records) == 2
+        single_rec, batch_rec = handler.records
+        assert single_rec.job_id == one.ulid
+        assert batch_rec.job_id == many[0].ulid
+        assert not hasattr(single_rec, "batch")
+        assert batch_rec.batch is True
+        edges = await JobDependency.using(queue.db).order_by("child_ulid").all()
+        assert [(e.parent_ulid, e.child_ulid) for e in edges] == [
+            (parent.ulid, one.ulid),
+            (parent.ulid, many[0].ulid),
+        ]
+
+    async def test_matched_key_returns_the_existing_job_in_both(self, queue):
+        existing = await queue.enqueue("t", unique_key="same")
+        one = await queue.enqueue("t", unique_key="same")
+        many = await queue.enqueue_many([{"task_path": "t", "unique_key": "same"}])
+        assert one.ulid == existing.ulid
+        assert [j.ulid for j in many] == [existing.ulid]
+        assert await queue.jobs.count() == 1
+
 
 class TestEnqueueIdempotency:
     """Verify idempotency key deduplication."""
@@ -185,6 +325,134 @@ class TestEnqueueIdempotency:
         await job1.cancel()
         job2 = await queue.enqueue("my_task", idempotency_key="key-cancel")
         assert job1.ulid != job2.ulid
+
+
+async def _idem_rows(queue: Queue, key: str) -> int:
+    return await queue.jobs.filter(F("idempotency_key") == key).count()
+
+
+async def _failing_edge_save(*args, **kwargs):
+    """Stands in for ``JobDependency.save_many``: the write of the edges fails."""
+    raise RuntimeError("edge insert failed")
+
+
+class TestEnqueueOneJobPerIdempotencyKey:
+    """An idempotency key makes one job, also when enqueues run at the same time."""
+
+    async def test_eight_concurrent_enqueues_make_one_job(self, disk_queue):
+        jobs = await asyncio.gather(
+            *[disk_queue.enqueue("my_task", idempotency_key="k1") for _ in range(8)]
+        )
+        assert len({j.ulid for j in jobs}) == 1
+        assert await _idem_rows(disk_queue, "k1") == 1
+
+    async def test_two_queues_on_one_file_make_one_job(self, tmp_path):
+        path = str(tmp_path / "two.db")
+        q1, q2 = Queue(path), Queue(path)
+        await q1.init_db()
+        await q2.init_db()
+        try:
+            jobs = await asyncio.gather(
+                *[q.enqueue("my_task", idempotency_key="k2") for q in (q1, q2) * 4]
+            )
+            assert len({j.ulid for j in jobs}) == 1
+            assert (
+                await Job.using(q1.db, "qler_jobs").filter(F("idempotency_key") == "k2").count()
+                == 1
+            )
+        finally:
+            await q1.close()
+            await q2.close()
+
+    async def test_two_enqueue_many_with_overlapping_keys(self, disk_queue):
+        first = [{"task_path": "t", "idempotency_key": f"m{i}"} for i in range(0, 10)]
+        second = [{"task_path": "t", "idempotency_key": f"m{i}"} for i in range(5, 15)]
+        a, b = await asyncio.gather(disk_queue.enqueue_many(first), disk_queue.enqueue_many(second))
+        for i in range(15):
+            assert await _idem_rows(disk_queue, f"m{i}") == 1
+        assert [j.ulid for j in a[5:]] == [j.ulid for j in b[:5]]
+
+    async def test_enqueue_and_enqueue_many_at_once(self, disk_queue):
+        one, many = await asyncio.gather(
+            disk_queue.enqueue("t", idempotency_key="mix"),
+            disk_queue.enqueue_many([{"task_path": "t", "idempotency_key": "mix"}]),
+        )
+        assert await _idem_rows(disk_queue, "mix") == 1
+        assert many[0].ulid == one.ulid
+
+    async def test_cancelled_key_can_be_used_again_with_index(self, disk_queue):
+        job1 = await disk_queue.enqueue("t", idempotency_key="again")
+        assert await disk_queue.cancel_job(job1) is True
+        job2 = await disk_queue.enqueue("t", idempotency_key="again")
+        assert job2.ulid != job1.ulid
+        assert await _idem_rows(disk_queue, "again") == 2
+        names = {i["name"] for i in await disk_queue.db.list_indexes("qler_jobs")}
+        assert "idx_qler_jobs_idempotency_uq" in names
+
+    async def test_failed_edge_insert_leaves_no_job(self, disk_queue):
+        parent = await disk_queue.enqueue("parent")
+        with (
+            patch.object(JobDependency, "save_many", _failing_edge_save),
+            pytest.raises(RuntimeError, match="edge insert failed"),
+        ):
+            await disk_queue.enqueue("child", depends_on=[parent.ulid])
+        assert await disk_queue.jobs.count() == 1
+
+    async def test_failed_edge_insert_in_enqueue_many_leaves_no_job(self, disk_queue):
+        parent = await disk_queue.enqueue("parent")
+        with (
+            patch.object(JobDependency, "save_many", _failing_edge_save),
+            pytest.raises(RuntimeError, match="edge insert failed"),
+        ):
+            await disk_queue.enqueue_many([{"task_path": "child", "depends_on": [parent.ulid]}])
+        assert await disk_queue.jobs.count() == 1
+
+    async def test_start_with_duplicate_keys(self, tmp_path, caplog):
+        path = str(tmp_path / "dups.db")
+        old = Queue(path)
+        await old.init_db()
+        # An older qler had no unique index: drop it and write two jobs with one key.
+        await old.db.drop_index("idx_qler_jobs_idempotency_uq")
+        first = await old.enqueue("t", idempotency_key="dup-a")
+        second = Job(
+            ulid="01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+            task="t",
+            idempotency_key="dup-a",
+            created_at=first.created_at,
+            updated_at=first.created_at,
+        )
+        await second.save(db=old.db)
+        await old.close()
+
+        caplog.set_level(logging.ERROR, logger="qler.queue")
+        q = Queue(path)
+        await q.init_db()
+        try:
+            errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+            assert len(errors) == 1
+            assert "idempotency" in errors[0].getMessage()
+            assert "dup-a" in errors[0].getMessage()
+            names = {i["name"] for i in await q.db.list_indexes("qler_jobs")}
+            assert "idx_qler_jobs_idempotency_uq" not in names
+            assert "idx_qler_jobs_idempotency" in names
+
+            again = await q.enqueue("t", idempotency_key="dup-a")
+            assert again.ulid == first.ulid
+            assert await _idem_rows(q, "dup-a") == 2
+
+            assert await q.cancel_job(second) is True
+        finally:
+            await q.close()
+
+        q = Queue(path)
+        await q.init_db()
+        try:
+            indexes = {i["name"]: i for i in await q.db.list_indexes("qler_jobs")}
+            # sqler's "unique" flag reads UNIQUE anywhere in the text: check the head.
+            assert indexes["idx_qler_jobs_idempotency_uq"]["sql"].startswith("CREATE UNIQUE INDEX ")
+            assert "idx_qler_jobs_idempotency" not in indexes
+        finally:
+            await q.close()
 
 
 class TestEnqueuePayloadValidation:
@@ -261,9 +529,7 @@ class TestClaim:
         job = await queue.claim_job("worker-1", ["default"])
         assert job is not None
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == "running"
         assert attempts[0].worker_id == "worker-1"
@@ -277,7 +543,121 @@ class TestClaim:
         await queue.enqueue("my_task")
         job = await queue.claim_job("worker-1", ["default"])
         assert job is not None
-        assert _ULID_PATTERN.match(job.last_attempt_id), f"Expected ULID, got {job.last_attempt_id!r}"
+        assert _ULID_PATTERN.match(job.last_attempt_id), (
+            f"Expected ULID, got {job.last_attempt_id!r}"
+        )
+
+
+async def _claim_one(queue, how):
+    if how == "claim_job":
+        return await queue.claim_job("worker-1", ["default"])
+    return await queue.claim_jobs("worker-1", ["default"], 1)
+
+
+class TestClaimOfOne:
+    """claim_job is claim_jobs(n=1): same result, same state left behind."""
+
+    @pytest.mark.parametrize("how", ["claim_job", "claim_jobs"])
+    async def test_rate_limited_returns_nothing_and_requeues_the_job(self, db, how):
+        q = Queue(db, rate_limits={"default": "1/m"})
+        await q.init_db()
+        first = await q.enqueue("my_task")
+        second = await q.enqueue("my_task")
+        got = await _claim_one(q, how)
+        got = got if how == "claim_job" else got[0]
+        assert got.ulid == first.ulid
+        before = now_epoch()
+
+        claimed = await _claim_one(q, how)
+
+        assert claimed == (None if how == "claim_job" else [])
+        await second.refresh()
+        assert second.status == JobStatus.PENDING.value
+        assert second.attempts == 0
+        assert second.worker_id == ""
+        assert second.lease_expires_at is None
+        assert before + 60 <= second.eta <= now_epoch() + 60
+        # The claim named an attempt that was never written; the requeue keeps the name.
+        assert _ULID_PATTERN.match(second.last_attempt_id)
+        attempts = await q.attempts.all()
+        assert [a.job_ulid for a in attempts] == [first.ulid]
+
+
+class TestClaimIsOneWrite:
+    """A claim is one transaction, and leases the job for the job's own lease."""
+
+    async def test_attempt_save_failure_rolls_the_claim_back(self, queue, monkeypatch):
+        job = await queue.enqueue("my_task")
+        original_save = JobAttempt.save
+        calls = 0
+
+        async def save_locked_once(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return await original_save(self, *args, **kwargs)
+
+        monkeypatch.setattr(JobAttempt, "save", save_locked_once)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await queue.claim_job("worker-1", ["default"])
+
+        await job.refresh()
+        assert job.status == JobStatus.PENDING.value
+        assert job.attempts == 0
+        assert job.worker_id == ""
+        assert job.lease_expires_at is None
+        assert job.last_attempt_id is None
+        assert await queue.attempts.count() == 0
+
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed is not None
+        assert claimed.ulid == job.ulid
+        assert claimed.status == JobStatus.RUNNING.value
+        assert claimed.attempts == 1
+        assert await queue.attempts.count() == 1
+
+    @pytest.mark.parametrize("lease_duration", [600, 30])
+    async def test_claim_leases_for_the_jobs_own_lease(self, db, lease_duration):
+        q = Queue(db, default_lease_duration=300)
+        await q.init_db()
+        fixed_now = now_epoch()
+        with patch("qler.queue.now_epoch", return_value=fixed_now):
+            job = await q.enqueue("my_task", lease_duration=lease_duration)
+            claimed = await q.claim_job("worker-1", ["default"])
+
+        assert claimed is not None
+        assert claimed.ulid == job.ulid
+        assert claimed.lease_expires_at - fixed_now == lease_duration
+        stored = await q.jobs.filter(F("ulid") == job.ulid).first()
+        assert stored.lease_expires_at - fixed_now == lease_duration
+        attempts = await q.attempts.filter(F("job_ulid") == job.ulid).all()
+        assert len(attempts) == 1
+        assert attempts[0].lease_expires_at - fixed_now == lease_duration
+
+    async def test_two_queues_on_one_file_never_claim_the_same_job(self, tmp_path):
+        path = str(tmp_path / "shared.db")
+        q1 = Queue(path)
+        q2 = Queue(path)
+        await q1.init_db()
+        await q2.init_db()
+        try:
+            enqueued = {(await q1.enqueue("my_task")).ulid for _ in range(20)}
+
+            async def drain(q: Queue, worker_id: str) -> list[str]:
+                got: list[str] = []
+                while (job := await q.claim_job(worker_id, ["default"])) is not None:
+                    got.append(job.ulid)
+                return got
+
+            first, second = await asyncio.gather(drain(q1, "w1"), drain(q2, "w2"))
+            assert set(first) & set(second) == set()
+            assert len(first) + len(second) == 20
+            assert set(first) | set(second) == enqueued
+        finally:
+            await q1.close()
+            await q2.close()
 
 
 class TestComplete:
@@ -302,9 +682,7 @@ class TestComplete:
         await queue.complete_job(job, "worker-1")
         after = now_epoch()
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == "completed"
         assert before <= attempts[0].finished_at <= after
@@ -386,7 +764,7 @@ class TestFail:
         assert job.retry_count == 1
 
         # Reset ETA to now via atomic update so we can reclaim
-        await Job.query().filter(F("ulid") == job.ulid).update_one(eta=now_epoch())
+        await queue.jobs.filter(F("ulid") == job.ulid).update_one(eta=now_epoch())
 
         # Re-claim
         job = await queue.claim_job("worker-1", ["default"])
@@ -402,7 +780,9 @@ class TestFail:
         await queue.enqueue("my_task", max_retries=3)
         job = await queue.claim_job("worker-1", ["default"])
         await queue.fail_job(
-            job, "worker-1", RuntimeError("bad"),
+            job,
+            "worker-1",
+            RuntimeError("bad"),
             failure_kind=FailureKind.TASK_NOT_FOUND,
         )
 
@@ -417,9 +797,7 @@ class TestFail:
         await queue.fail_job(job, "worker-1", exc)
         after = now_epoch()
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == "failed"
         assert attempts[0].error == "boom"
@@ -483,9 +861,7 @@ class TestPoisonPill:
         """A job with invalid JSON payload is marked FAILED on claim."""
         # Enqueue a valid job, then corrupt its payload_json directly
         job = await queue.enqueue("my_task")
-        await Job.query().filter(F("ulid") == job.ulid).update_one(
-            payload_json="NOT VALID JSON {{{"
-        )
+        await queue.jobs.filter(F("ulid") == job.ulid).update_one(payload_json="NOT VALID JSON {{{")
 
         # Claim should return None (skips the poison pill)
         claimed = await queue.claim_job("worker-1", ["default"])
@@ -499,12 +875,49 @@ class TestPoisonPill:
         assert job.finished_at is not None
 
         # Verify a failed attempt was recorded
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].status == "failed"
         assert attempts[0].failure_kind == "payload_invalid"
+
+
+async def _schema_rows(queue):
+    cur = await queue.db.adapter.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+    )
+    rows = [tuple(r) for r in await cur.fetchall()]
+    await cur.close()
+    return rows
+
+
+class TestInitDbOnAnExistingFile:
+    """A database made by an earlier start opens unchanged and keeps working."""
+
+    async def test_reopen_makes_no_new_schema_and_the_queue_works(self, tmp_path):
+        path = str(tmp_path / "older.db")
+        first = Queue(path)
+        await first.init_db()
+        parent = await first.enqueue("t.parent")
+        await first.enqueue("t.child", depends_on=[parent.ulid])
+        await first.enqueue("t.idem", idempotency_key="idem-1")
+        await first.enqueue("t.uniq", unique_key="uniq-1")
+        await first.enqueue("t.late", queue_name="other", priority=5)
+        claimed = await first.claim_job("w1", ["default"])
+        await first.complete_job(claimed, "w1", {"ok": 1})
+        assert await first.archive_jobs(older_than_seconds=-5) == 1
+        before = await _schema_rows(first)
+        await first.close()
+
+        second = Queue(path)
+        await second.init_db()
+        assert await _schema_rows(second) == before
+
+        job = await second.claim_job("w2", ["default"])
+        assert job is not None
+        await second.complete_job(job, "w2", {"ok": 2})
+        refreshed = await Job.using(second.db, "qler_jobs").filter(F("ulid") == job.ulid).first()
+        assert refreshed.status == JobStatus.COMPLETED.value
+        await second.close()
 
 
 class TestQueueClose:
@@ -541,7 +954,24 @@ class TestQueueClose:
     def test_db_property_raises_before_init(self):
         q = Queue("/tmp/nonexistent.db")
         with pytest.raises(RuntimeError, match="not initialized"):
-            q.db
+            _ = q.db
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda q, job: q.complete_job(job, "worker-1"),
+            lambda q, job: q.fail_job(job, "worker-1", ValueError("boom")),
+            lambda q, job: q.cancel_job(job),
+            lambda q, job: q.replay_job(job),
+        ],
+        ids=["complete_job", "fail_job", "cancel_job", "replay_job"],
+    )
+    async def test_public_calls_raise_before_init(self, call):
+        """A call that does not set the database up itself says the queue is not initialized."""
+        q = Queue("/tmp/nonexistent.db")
+        job = Job(ulid="01ARZ3NDEKTSV4RRFFQ69G5FAV", queue_name="default", task="t")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await call(q, job)
 
 
 class TestErrorTruncation:
@@ -562,9 +992,7 @@ class TestErrorTruncation:
         job = await queue.claim_job("worker-1", ["default"])
         await queue.fail_job(job, "worker-1", ValueError("traceback test"))
 
-        attempts = await JobAttempt.query().filter(
-            F("job_ulid") == job.ulid
-        ).all()
+        attempts = await queue.attempts.filter(F("job_ulid") == job.ulid).all()
         assert len(attempts) == 1
         assert attempts[0].traceback is not None
         assert "ValueError" in attempts[0].traceback
@@ -576,11 +1004,13 @@ class TestBatchEnqueue:
 
     async def test_batch_creates_all_jobs(self, queue):
         """All jobs in a batch are created in a single call."""
-        jobs = await queue.enqueue_many([
-            {"task_path": "app.task_a", "args": (1,)},
-            {"task_path": "app.task_b", "args": (2,)},
-            {"task_path": "app.task_c", "args": (3,)},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "app.task_a", "args": (1,)},
+                {"task_path": "app.task_b", "args": (2,)},
+                {"task_path": "app.task_c", "args": (3,)},
+            ]
+        )
         assert len(jobs) == 3
         assert jobs[0].task == "app.task_a"
         assert jobs[1].task == "app.task_b"
@@ -595,11 +1025,13 @@ class TestBatchEnqueue:
 
     async def test_batch_per_job_options(self, queue):
         """Each job can have individual options."""
-        jobs = await queue.enqueue_many([
-            {"task_path": "t1", "priority": 10, "queue_name": "high"},
-            {"task_path": "t2", "delay": 60, "max_retries": 3},
-            {"task_path": "t3", "timeout": 30},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "t1", "priority": 10, "queue_name": "high"},
+                {"task_path": "t2", "delay": 60, "max_retries": 3},
+                {"task_path": "t3", "timeout": 30},
+            ]
+        )
         assert len(jobs) == 3
         assert jobs[0].priority == 10
         assert jobs[0].queue_name == "high"
@@ -610,14 +1042,16 @@ class TestBatchEnqueue:
     async def test_batch_atomic_on_bad_payload(self, queue):
         """If any job has a bad payload, none are created."""
         with pytest.raises(PayloadNotSerializableError, match="index 1"):
-            await queue.enqueue_many([
-                {"task_path": "good", "args": (1,)},
-                {"task_path": "bad", "args": (object(),)},
-                {"task_path": "good2", "args": (3,)},
-            ])
+            await queue.enqueue_many(
+                [
+                    {"task_path": "good", "args": (1,)},
+                    {"task_path": "bad", "args": (object(),)},
+                    {"task_path": "good2", "args": (3,)},
+                ]
+            )
 
         # Verify no jobs were created
-        count = await Job.query().count()
+        count = await queue.jobs.count()
         assert count == 0
 
     async def test_batch_missing_task_path(self, queue):
@@ -629,10 +1063,12 @@ class TestBatchEnqueue:
         # Pre-create a job with idempotency key
         existing = await queue.enqueue("existing_task", idempotency_key="key-1")
 
-        jobs = await queue.enqueue_many([
-            {"task_path": "new_task", "args": (1,)},
-            {"task_path": "dupe_task", "idempotency_key": "key-1"},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "new_task", "args": (1,)},
+                {"task_path": "dupe_task", "idempotency_key": "key-1"},
+            ]
+        )
         assert len(jobs) == 2
         assert jobs[0].task == "new_task"
         # Second job should be the existing one (idempotency match)
@@ -646,20 +1082,24 @@ class TestBatchEnqueue:
         parents = await queue.enqueue_many(batch)
         parent_ulid = parents[0].ulid
 
-        children = await queue.enqueue_many([
-            {"task_path": "child", "depends_on": [parent_ulid]},
-        ])
+        children = await queue.enqueue_many(
+            [
+                {"task_path": "child", "depends_on": [parent_ulid]},
+            ]
+        )
         assert len(children) == 1
         assert children[0].pending_dep_count == 1
         assert children[0].dependencies == [parent_ulid]
 
     async def test_batch_intra_batch_integer_index_deps(self, queue):
         """Integer indices in depends_on resolve to earlier jobs in the batch."""
-        jobs = await queue.enqueue_many([
-            {"task_path": "step_a"},
-            {"task_path": "step_b", "depends_on": [0]},
-            {"task_path": "step_c", "depends_on": [0, 1]},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "step_a"},
+                {"task_path": "step_b", "depends_on": [0]},
+                {"task_path": "step_c", "depends_on": [0, 1]},
+            ]
+        )
         assert len(jobs) == 3
         # step_b depends on step_a
         assert jobs[1].dependencies == [jobs[0].ulid]
@@ -674,25 +1114,31 @@ class TestBatchEnqueue:
     async def test_batch_integer_index_self_dep(self, queue):
         """Integer index pointing to self raises DependencyError."""
         with pytest.raises(DependencyError, match="index 1.*out of range"):
-            await queue.enqueue_many([
-                {"task_path": "step_a"},
-                {"task_path": "step_b", "depends_on": [1]},
-            ])
+            await queue.enqueue_many(
+                [
+                    {"task_path": "step_a"},
+                    {"task_path": "step_b", "depends_on": [1]},
+                ]
+            )
 
     async def test_batch_integer_index_out_of_bounds(self, queue):
         """Integer index beyond batch size raises DependencyError."""
         with pytest.raises(DependencyError, match="index 0.*out of range"):
-            await queue.enqueue_many([
-                {"task_path": "step_a", "depends_on": [5]},
-            ])
+            await queue.enqueue_many(
+                [
+                    {"task_path": "step_a", "depends_on": [5]},
+                ]
+            )
 
     async def test_batch_integer_index_negative(self, queue):
         """Negative integer index raises DependencyError."""
         with pytest.raises(DependencyError, match="index 1.*out of range"):
-            await queue.enqueue_many([
-                {"task_path": "step_a"},
-                {"task_path": "step_b", "depends_on": [-1]},
-            ])
+            await queue.enqueue_many(
+                [
+                    {"task_path": "step_a"},
+                    {"task_path": "step_b", "depends_on": [-1]},
+                ]
+            )
 
     async def test_batch_mixed_integer_and_ulid_deps(self, queue):
         """Integer indices and ULID strings can be mixed in depends_on."""
@@ -700,10 +1146,12 @@ class TestBatchEnqueue:
         external = await queue.enqueue_many([{"task_path": "external"}])
         ext_ulid = external[0].ulid
 
-        jobs = await queue.enqueue_many([
-            {"task_path": "step_a"},
-            {"task_path": "step_b", "depends_on": [0, ext_ulid]},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "step_a"},
+                {"task_path": "step_b", "depends_on": [0, ext_ulid]},
+            ]
+        )
         assert len(jobs) == 2
         assert ext_ulid in jobs[1].dependencies
         assert jobs[0].ulid in jobs[1].dependencies
@@ -713,22 +1161,28 @@ class TestBatchEnqueue:
         """Payload size check applies per job in batch."""
         large = "x" * (queue.max_payload_size + 1)
         with pytest.raises(PayloadTooLargeError, match="index 0"):
-            await queue.enqueue_many([
-                {"task_path": "big", "args": (large,)},
-            ])
+            await queue.enqueue_many(
+                [
+                    {"task_path": "big", "args": (large,)},
+                ]
+            )
 
     async def test_batch_dependency_not_found(self, queue):
         """Missing dependency raises DependencyError with index."""
         with pytest.raises(DependencyError, match="index 0.*not found"):
-            await queue.enqueue_many([
-                {"task_path": "child", "depends_on": ["NONEXISTENT"]},
-            ])
+            await queue.enqueue_many(
+                [
+                    {"task_path": "child", "depends_on": ["NONEXISTENT"]},
+                ]
+            )
 
     async def test_batch_default_values(self, queue):
         """Jobs use queue defaults when options not specified."""
-        jobs = await queue.enqueue_many([
-            {"task_path": "t1"},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "t1"},
+            ]
+        )
         assert len(jobs) == 1
         assert jobs[0].queue_name == "default"
         assert jobs[0].priority == 0
@@ -738,11 +1192,13 @@ class TestBatchEnqueue:
 
     async def test_batch_intra_batch_idempotency(self, queue):
         """Two specs with the same idempotency_key in one batch → only 1 job created."""
-        jobs = await queue.enqueue_many([
-            {"task_path": "task_a", "idempotency_key": "dup"},
-            {"task_path": "task_b", "idempotency_key": "dup"},
-            {"task_path": "task_c", "idempotency_key": "unique"},
-        ])
+        jobs = await queue.enqueue_many(
+            [
+                {"task_path": "task_a", "idempotency_key": "dup"},
+                {"task_path": "task_b", "idempotency_key": "dup"},
+                {"task_path": "task_c", "idempotency_key": "unique"},
+            ]
+        )
         assert len(jobs) == 3  # 3 entries returned (2nd is reference to 1st)
 
         # First and second should be the same job object
@@ -756,7 +1212,7 @@ class TestBatchEnqueue:
         unique_ulids = {j.ulid for j in jobs}
         assert len(unique_ulids) == 2
 
-        total = await Job.query().count()
+        total = await queue.jobs.count()
         assert total == 2
 
 
@@ -765,10 +1221,7 @@ class TestBatchEnqueuePerformance:
 
     async def test_enqueue_many_5k_no_deps(self, queue):
         """5K items with no deps/idem/unique completes in <10s."""
-        specs = [
-            {"task_path": f"task_{i}", "kwargs": {"i": i}}
-            for i in range(5000)
-        ]
+        specs = [{"task_path": f"task_{i}", "kwargs": {"i": i}} for i in range(5000)]
         t0 = time.perf_counter()
         jobs = await queue.enqueue_many(specs)
         elapsed = time.perf_counter() - t0
@@ -778,7 +1231,7 @@ class TestBatchEnqueuePerformance:
         assert len({j.ulid for j in jobs}) == 5000  # all unique
         assert elapsed < 10, f"enqueue_many(5K) took {elapsed:.1f}s, expected <10s"
 
-        total = await Job.query().count()
+        total = await queue.jobs.count()
         assert total == 5000
 
     async def test_enqueue_many_1k_with_intra_batch_deps(self, queue):
@@ -797,12 +1250,8 @@ class TestBatchEnqueuePerformance:
         assert elapsed < 10, f"enqueue_many(1K deps) took {elapsed:.1f}s, expected <10s"
 
         # Verify dep edges in the DB
-        cur = await queue._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_job_deps", []
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row[0] == 999  # 999 edges (each job depends on previous)
+        # 999 edges (each job depends on previous)
+        assert await JobDependency.using(queue.db).count() == 999
 
         # First job has no deps
         assert jobs[0].pending_dep_count == 0
@@ -813,10 +1262,7 @@ class TestBatchEnqueuePerformance:
     async def test_enqueue_many_batch_idempotency_prefetch(self, queue):
         """Batch idempotency pre-fetch deduplicates against DB in one query."""
         # Pre-create 50 jobs with idempotency keys
-        pre_specs = [
-            {"task_path": "pre_task", "idempotency_key": f"key_{i}"}
-            for i in range(50)
-        ]
+        pre_specs = [{"task_path": "pre_task", "idempotency_key": f"key_{i}"} for i in range(50)]
         pre_jobs = await queue.enqueue_many(pre_specs)
         assert len(pre_jobs) == 50
 
@@ -839,7 +1285,7 @@ class TestBatchEnqueuePerformance:
         new_ulids = {j.ulid for j in jobs[50:]}
         assert len(new_ulids) == 150
 
-        total = await Job.query().count()
+        total = await queue.jobs.count()
         assert total == 200  # 50 pre-existing + 150 new
 
     async def test_enqueue_many_fan_in_deps(self, queue):
@@ -848,21 +1294,15 @@ class TestBatchEnqueuePerformance:
         parent = await queue.enqueue("parent_task")
 
         # 500 children all depending on the parent
-        specs = [
-            {"task_path": f"child_{i}", "depends_on": [parent.ulid]}
-            for i in range(500)
-        ]
+        specs = [{"task_path": f"child_{i}", "depends_on": [parent.ulid]} for i in range(500)]
         jobs = await queue.enqueue_many(specs)
         assert len(jobs) == 500
 
         # All dep edges should exist
-        cur = await queue._db.adapter.execute(
-            "SELECT COUNT(*) FROM qler_job_deps WHERE parent_ulid = ?",
-            [parent.ulid],
+        assert (
+            await JobDependency.using(queue.db).filter(F("parent_ulid") == parent.ulid).count()
+            == 500
         )
-        row = await cur.fetchone()
-        await cur.close()
-        assert row[0] == 500
 
         # Each child has exactly 1 pending dep (the parent)
         assert all(j.pending_dep_count == 1 for j in jobs)

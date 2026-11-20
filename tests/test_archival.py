@@ -6,17 +6,19 @@ import logging
 
 import pytest
 from click.testing import CliRunner
+from sqler import F
+
 from qler._time import now_epoch
 from qler.cli import cli
 from qler.enums import JobStatus
 from qler.models.job import Job
 from qler.queue import Queue
 from qler.worker import Worker
-from sqler import F
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 async def _complete_job(queue: Queue, task_path: str = "my_task") -> Job:
     """Enqueue -> claim -> complete a job. Returns the completed job."""
@@ -44,20 +46,18 @@ async def _cancel_job(queue: Queue, task_path: str = "my_task") -> Job:
     return job
 
 
-async def _backdate_finished_at(job: Job, seconds_ago: int) -> None:
+async def _backdate_finished_at(queue: Queue, job: Job, seconds_ago: int) -> None:
     """Set a job's finished_at to N seconds in the past."""
     old_ts = now_epoch() - seconds_ago
-    await Job.query().filter(F("ulid") == job.ulid).update_one(
-        finished_at=old_ts
-    )
+    await queue.jobs.filter(F("ulid") == job.ulid).update_one(finished_at=old_ts)
 
 
 # ---------------------------------------------------------------------------
 # Archive table creation
 # ---------------------------------------------------------------------------
 
-class TestArchiveTableCreation:
 
+class TestArchiveTableCreation:
     async def test_archive_table_created(self, queue):
         """init_db() creates the qler_jobs_archive table."""
         cur = await queue.db.adapter.execute(
@@ -84,17 +84,17 @@ class TestArchiveTableCreation:
 # archive_jobs()
 # ---------------------------------------------------------------------------
 
-class TestArchiveJobs:
 
+class TestArchiveJobs:
     async def test_archive_completed_jobs(self, queue):
         """Completed jobs older than threshold are moved to archive."""
         job = await _complete_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
 
         count = await queue.archive_jobs(older_than_seconds=300)
 
         assert count == 1
-        remaining = await Job.query().filter(F("ulid") == job.ulid).all()
+        remaining = await queue.jobs.filter(F("ulid") == job.ulid).all()
         assert len(remaining) == 0
         assert await queue.archive_count() == 1
         archived = await queue.archived_jobs()
@@ -103,12 +103,12 @@ class TestArchiveJobs:
     async def test_archive_failed_jobs(self, queue):
         """Failed jobs older than threshold are moved to archive."""
         job = await _fail_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
 
         count = await queue.archive_jobs(older_than_seconds=300)
 
         assert count == 1
-        remaining = await Job.query().filter(F("ulid") == job.ulid).all()
+        remaining = await queue.jobs.filter(F("ulid") == job.ulid).all()
         assert len(remaining) == 0
         archived = await queue.archived_jobs()
         assert archived[0].ulid == job.ulid
@@ -117,12 +117,12 @@ class TestArchiveJobs:
     async def test_archive_cancelled_jobs(self, queue):
         """Cancelled jobs older than threshold are moved to archive."""
         job = await _cancel_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
 
         count = await queue.archive_jobs(older_than_seconds=300)
 
         assert count == 1
-        remaining = await Job.query().filter(F("ulid") == job.ulid).all()
+        remaining = await queue.jobs.filter(F("ulid") == job.ulid).all()
         assert len(remaining) == 0
         archived = await queue.archived_jobs()
         assert archived[0].ulid == job.ulid
@@ -135,7 +135,7 @@ class TestArchiveJobs:
         count = await queue.archive_jobs(older_than_seconds=0)
 
         assert count == 0
-        all_jobs = await Job.query().all()
+        all_jobs = await queue.jobs.all()
         assert len(all_jobs) == 1
         assert all_jobs[0].ulid == job.ulid
 
@@ -147,7 +147,7 @@ class TestArchiveJobs:
         count = await queue.archive_jobs(older_than_seconds=0)
 
         assert count == 0
-        all_jobs = await Job.query().all()
+        all_jobs = await queue.jobs.all()
         assert len(all_jobs) == 1
         assert all_jobs[0].status == JobStatus.RUNNING.value
 
@@ -158,7 +158,7 @@ class TestArchiveJobs:
         count = await queue.archive_jobs(older_than_seconds=300)
 
         assert count == 0
-        remaining = await Job.query().filter(F("ulid") == job.ulid).all()
+        remaining = await queue.jobs.filter(F("ulid") == job.ulid).all()
         assert len(remaining) == 1
 
     async def test_archive_returns_count(self, queue):
@@ -166,7 +166,7 @@ class TestArchiveJobs:
         archived_ulids = []
         for _ in range(3):
             job = await _complete_job(queue)
-            await _backdate_finished_at(job, 600)
+            await _backdate_finished_at(queue, job, 600)
             archived_ulids.append(job.ulid)
         recent = await _complete_job(queue)
 
@@ -174,20 +174,18 @@ class TestArchiveJobs:
 
         assert count == 3
         assert await queue.archive_count() == 3
-        remaining = await Job.query().filter(
-            F("status") == JobStatus.COMPLETED.value
-        ).all()
+        remaining = await queue.jobs.filter(F("status") == JobStatus.COMPLETED.value).all()
         assert len(remaining) == 1
         assert remaining[0].ulid == recent.ulid
 
     async def test_archive_atomic(self, queue):
         """After archival, job exists in exactly one table."""
         job = await _complete_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
 
         await queue.archive_jobs(older_than_seconds=300)
 
-        main = await Job.query().filter(F("ulid") == job.ulid).all()
+        main = await queue.jobs.filter(F("ulid") == job.ulid).all()
         assert len(main) == 0
         assert await queue.archive_count() == 1
         archived = await queue.archived_jobs()
@@ -197,7 +195,7 @@ class TestArchiveJobs:
     async def test_archive_idempotent(self, queue):
         """Calling archive twice doesn't duplicate or error."""
         job = await _complete_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
 
         first = await queue.archive_jobs(older_than_seconds=300)
         second = await queue.archive_jobs(older_than_seconds=300)
@@ -209,17 +207,17 @@ class TestArchiveJobs:
     async def test_archive_mixed_statuses(self, queue):
         """Archives all three terminal statuses in one sweep."""
         completed = await _complete_job(queue)
-        await _backdate_finished_at(completed, 600)
+        await _backdate_finished_at(queue, completed, 600)
         failed = await _fail_job(queue)
-        await _backdate_finished_at(failed, 600)
+        await _backdate_finished_at(queue, failed, 600)
         cancelled = await _cancel_job(queue)
-        await _backdate_finished_at(cancelled, 600)
+        await _backdate_finished_at(queue, cancelled, 600)
         pending = await queue.enqueue("pending_task")
 
         count = await queue.archive_jobs(older_than_seconds=300)
 
         assert count == 3
-        remaining = await Job.query().all()
+        remaining = await queue.jobs.all()
         assert len(remaining) == 1
         assert remaining[0].ulid == pending.ulid
         assert remaining[0].status == JobStatus.PENDING.value
@@ -229,12 +227,12 @@ class TestArchiveJobs:
 # archived_jobs() query
 # ---------------------------------------------------------------------------
 
-class TestArchivedJobsQuery:
 
+class TestArchivedJobsQuery:
     async def test_archived_jobs_returns_job_instances(self, queue):
         """archived_jobs() returns proper Job objects with all fields."""
         job = await _complete_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
         await queue.archive_jobs(older_than_seconds=300)
 
         archived = await queue.archived_jobs()
@@ -250,7 +248,7 @@ class TestArchivedJobsQuery:
         job = await queue.enqueue("my_task", queue_name="special")
         claimed = await queue.claim_job("worker-1", ["special"])
         await queue.complete_job(claimed, "worker-1", result="ok")
-        await _backdate_finished_at(claimed, 600)
+        await _backdate_finished_at(queue, claimed, 600)
         await queue.archive_jobs(older_than_seconds=300)
 
         found = await queue.archived_jobs(queue_name="special")
@@ -263,9 +261,9 @@ class TestArchivedJobsQuery:
     async def test_archived_jobs_filter_by_status(self, queue):
         """Status filter works on archived jobs."""
         completed = await _complete_job(queue)
-        await _backdate_finished_at(completed, 600)
+        await _backdate_finished_at(queue, completed, 600)
         failed = await _fail_job(queue)
-        await _backdate_finished_at(failed, 600)
+        await _backdate_finished_at(queue, failed, 600)
         await queue.archive_jobs(older_than_seconds=300)
 
         only_completed = await queue.archived_jobs(status="completed")
@@ -280,7 +278,7 @@ class TestArchivedJobsQuery:
         """Limit parameter is respected."""
         for _ in range(5):
             job = await _complete_job(queue)
-            await _backdate_finished_at(job, 600)
+            await _backdate_finished_at(queue, job, 600)
         await queue.archive_jobs(older_than_seconds=300)
 
         limited = await queue.archived_jobs(limit=2)
@@ -292,20 +290,20 @@ class TestArchivedJobsQuery:
     async def test_archived_jobs_restores_table_binding(self, queue):
         """After archived_jobs(), Job model is bound back to qler_jobs."""
         job = await _complete_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
         await queue.archive_jobs(older_than_seconds=300)
 
         await queue.archived_jobs()
 
         pending = await queue.enqueue("after_archive")
-        found = await Job.query().filter(F("ulid") == pending.ulid).all()
+        found = await queue.jobs.filter(F("ulid") == pending.ulid).all()
         assert len(found) == 1
         assert found[0].ulid == pending.ulid
 
     async def test_archived_jobs_restores_binding_on_error(self, queue):
         """Table binding is restored even if archived_jobs() query fails."""
         job = await _complete_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
         await queue.archive_jobs(older_than_seconds=300)
 
         # Force an error by querying with invalid filter (should not corrupt binding)
@@ -313,7 +311,7 @@ class TestArchivedJobsQuery:
 
         # Main table still works
         new_job = await queue.enqueue("recovery_test")
-        found = await Job.query().filter(F("ulid") == new_job.ulid).all()
+        found = await queue.jobs.filter(F("ulid") == new_job.ulid).all()
         assert len(found) == 1
 
 
@@ -321,8 +319,8 @@ class TestArchivedJobsQuery:
 # archive_count()
 # ---------------------------------------------------------------------------
 
-class TestArchiveCount:
 
+class TestArchiveCount:
     async def test_archive_count_zero(self, queue):
         """archive_count() returns 0 when archive is empty."""
         assert await queue.archive_count() == 0
@@ -331,7 +329,7 @@ class TestArchiveCount:
         """archive_count() returns correct count after archival."""
         for _ in range(5):
             job = await _complete_job(queue)
-            await _backdate_finished_at(job, 600)
+            await _backdate_finished_at(queue, job, 600)
         await queue.archive_jobs(older_than_seconds=300)
 
         assert await queue.archive_count() == 5
@@ -341,12 +339,12 @@ class TestArchiveCount:
 # Lifecycle event
 # ---------------------------------------------------------------------------
 
-class TestArchivalLifecycleEvent:
 
+class TestArchivalLifecycleEvent:
     async def test_lifecycle_event_emitted(self, queue, caplog):
         """job.archived lifecycle event fires with correct structured data."""
         job = await _complete_job(queue)
-        await _backdate_finished_at(job, 600)
+        await _backdate_finished_at(queue, job, 600)
 
         with caplog.at_level(logging.INFO, logger="qler.lifecycle"):
             await queue.archive_jobs(older_than_seconds=300)
@@ -371,8 +369,8 @@ class TestArchivalLifecycleEvent:
 # Auto-archival in Worker
 # ---------------------------------------------------------------------------
 
-class TestAutoArchival:
 
+class TestAutoArchival:
     async def test_worker_accepts_archive_params(self, queue):
         """Worker can be created with archive_interval and archive_after."""
         w = Worker(queue, archive_interval=60.0, archive_after=120)
@@ -385,13 +383,50 @@ class TestAutoArchival:
         assert w.archive_interval is None
         assert w.archive_after == 300
 
+    async def test_running_worker_archives_a_finished_job(self, queue, monkeypatch):
+        """The worker's loop moves a completed job to the archive."""
+        job = await _complete_job(queue)
+        assert await queue.archive_count() == 0
+
+        real_archive = Queue.archive_jobs
+        archived_by_loop = asyncio.Event()
+
+        async def archive_and_note(self, *args, **kwargs):
+            count = await real_archive(self, *args, **kwargs)
+            if count:
+                archived_by_loop.set()
+            return count
+
+        monkeypatch.setattr(Queue, "archive_jobs", archive_and_note)
+
+        w = Worker(
+            queue,
+            queues=["other"],
+            poll_interval=0.01,
+            archive_interval=1.0,
+            archive_after=0,
+            shutdown_timeout=2.0,
+        )
+        worker_task = asyncio.create_task(w.run())
+        try:
+            await asyncio.wait_for(archived_by_loop.wait(), timeout=10.0)
+        finally:
+            w._running = False
+            await asyncio.wait_for(worker_task, timeout=10.0)
+
+        assert await queue.jobs.filter(F("ulid") == job.ulid).count() == 0
+        assert await queue.archive_count() == 1
+        archived = await queue.archived_jobs()
+        assert [j.ulid for j in archived] == [job.ulid]
+        assert archived[0].status == JobStatus.COMPLETED.value
+
 
 # ---------------------------------------------------------------------------
 # CLI: qler archive
 # ---------------------------------------------------------------------------
 
-class TestCLIArchive:
 
+class TestCLIArchive:
     @pytest.fixture
     def runner(self):
         return CliRunner()
@@ -436,7 +471,9 @@ class TestCLIArchive:
 
     def test_archive_json(self, runner, populated_db):
         """qler archive --json outputs correct structure."""
-        result = runner.invoke(cli, ["archive", "--db", populated_db, "--older-than", "5m", "--json"])
+        result = runner.invoke(
+            cli, ["archive", "--db", populated_db, "--older-than", "5m", "--json"]
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data == {"archived": 2}
@@ -461,7 +498,6 @@ class TestCLIArchive:
 
 
 class TestCLIStatusIncludeArchive:
-
     @pytest.fixture
     def runner(self):
         return CliRunner()
@@ -507,9 +543,16 @@ class TestCLIStatusIncludeArchive:
 
     def test_status_with_archive_json(self, runner, db_with_archive):
         """qler status --include-archive --json includes archived counts."""
-        result = runner.invoke(cli, [
-            "status", "--db", db_with_archive, "--include-archive", "--json",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "status",
+                "--db",
+                db_with_archive,
+                "--include-archive",
+                "--json",
+            ],
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert "archived" in data
@@ -517,7 +560,6 @@ class TestCLIStatusIncludeArchive:
 
 
 class TestCLIJobsIncludeArchive:
-
     @pytest.fixture
     def runner(self):
         return CliRunner()
@@ -552,7 +594,7 @@ class TestCLIJobsIncludeArchive:
         """qler jobs without --include-archive shows only active jobs."""
         result = runner.invoke(cli, ["jobs", "--db", db_with_archive])
         assert result.exit_code == 0
-        assert "1 jobs shown" in result.output
+        assert "1 job shown" in result.output
         assert "(archived)" not in result.output
 
     def test_jobs_with_archive(self, runner, db_with_archive):
@@ -565,9 +607,16 @@ class TestCLIJobsIncludeArchive:
 
     def test_jobs_with_archive_json(self, runner, db_with_archive):
         """qler jobs --include-archive --json marks archived jobs."""
-        result = runner.invoke(cli, [
-            "jobs", "--db", db_with_archive, "--include-archive", "--json",
-        ])
+        result = runner.invoke(
+            cli,
+            [
+                "jobs",
+                "--db",
+                db_with_archive,
+                "--include-archive",
+                "--json",
+            ],
+        )
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert len(data) == 2

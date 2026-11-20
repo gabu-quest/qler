@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, RebaseConfig
 
@@ -10,6 +10,7 @@ from sqler import NO_REBASE_CONFIG, AsyncSQLerSafeModel, RebaseConfig
 class JobAttempt(AsyncSQLerSafeModel):
     """Tracks a single execution attempt of a job."""
 
+    __tablename__: ClassVar[str] = "qler_job_attempts"
     __promoted__: ClassVar[dict[str, str]] = {
         "ulid": "TEXT NOT NULL",
         "job_ulid": "TEXT NOT NULL",
@@ -26,8 +27,8 @@ class JobAttempt(AsyncSQLerSafeModel):
     attempt_number: int = 0
     worker_id: str = ""
     started_at: int = 0
-    finished_at: Optional[int] = None
-    failure_kind: Optional[str] = None
-    error: Optional[str] = None
-    traceback: Optional[str] = None
-    lease_expires_at: Optional[int] = None
+    finished_at: int | None = None
+    failure_kind: str | None = None
+    error: str | None = None
+    traceback: str | None = None
+    lease_expires_at: int | None = None

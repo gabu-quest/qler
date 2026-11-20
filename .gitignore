@@ -25,6 +25,8 @@ htmlcov/
 *.db
 *.db-wal
 *.db-shm
+# a queue database written by qler 0.5.1, the upgrade tests open copies of it
+!tests/fixtures/qler_0_5_1.db
 
 # IDE
 .idea/

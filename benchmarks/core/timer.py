@@ -7,7 +7,7 @@ import math
 import statistics
 import time
 import warnings
-from typing import Callable
+from collections.abc import Callable
 
 from .base import TimingStats
 
@@ -23,9 +23,7 @@ class PrecisionTimer:
         self.warmup = warmup
         self.iterations = iterations
 
-    def measure(
-        self, fn: Callable[[], object], *, gc_isolate: bool = True
-    ) -> TimingStats:
+    def measure(self, fn: Callable[[], object], *, gc_isolate: bool = True) -> TimingStats:
         """Run fn with warmup + measured iterations, return stats.
 
         Args:
@@ -75,8 +73,14 @@ class PrecisionTimer:
         if n == 0:
             return TimingStats(
                 iterations=0,
-                min_ms=0, max_ms=0, mean_ms=0, median_ms=0,
-                p95_ms=0, p99_ms=0, stddev_ms=0, total_ms=0,
+                min_ms=0,
+                max_ms=0,
+                mean_ms=0,
+                median_ms=0,
+                p95_ms=0,
+                p99_ms=0,
+                stddev_ms=0,
+                total_ms=0,
                 reliable_p95=False,
             )
 
@@ -123,9 +127,7 @@ class PrecisionTimer:
 class AsyncPrecisionTimer(PrecisionTimer):
     """Async-aware precision timer for benchmarking coroutines."""
 
-    async def async_measure(
-        self, fn: Callable, *, gc_isolate: bool = True
-    ) -> TimingStats:
+    async def async_measure(self, fn: Callable, *, gc_isolate: bool = True) -> TimingStats:
         """Run async fn with warmup + measured iterations, return stats."""
         # Warmup — discard results
         for _ in range(self.warmup):

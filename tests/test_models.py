@@ -10,7 +10,15 @@ class TestJobDefaults:
     """Verify Job model field defaults and promoted column definitions."""
 
     def test_promoted_columns(self):
-        expected = {"ulid", "status", "queue_name", "priority", "eta", "lease_expires_at", "pending_dep_count"}
+        expected = {
+            "ulid",
+            "status",
+            "queue_name",
+            "priority",
+            "eta",
+            "lease_expires_at",
+            "pending_dep_count",
+        }
         assert set(Job.__promoted__.keys()) == expected
 
     def test_check_constraints(self):
@@ -113,10 +121,10 @@ class TestJobRoundTrip:
             created_at=1000,
             updated_at=1000,
         )
-        await job.save()
+        await job.save(db=queue.db)
         assert isinstance(job._id, int)
 
-        loaded = await Job.from_id(job._id)
+        loaded = await Job.from_id(job._id, db=queue.db)
         assert loaded is not None
         assert loaded.ulid == "01H0000000000000000000TEST"
         assert loaded.status == "pending"
@@ -135,10 +143,10 @@ class TestJobRoundTrip:
             worker_id="worker-1",
             started_at=1000,
         )
-        await attempt.save()
+        await attempt.save(db=queue.db)
         assert isinstance(attempt._id, int)
 
-        loaded = await JobAttempt.from_id(attempt._id)
+        loaded = await JobAttempt.from_id(attempt._id, db=queue.db)
         assert loaded is not None
         assert loaded.ulid == "01H0000000000000000ATTEMPT"
         assert loaded.job_ulid == "01H0000000000000000000TEST"

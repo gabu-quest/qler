@@ -3,6 +3,7 @@
 import re
 
 import pytest
+
 from qler._time import now_epoch
 from qler.exceptions import ConfigurationError, PayloadNotSerializableError
 from qler.task import TaskWrapper, task
@@ -169,9 +170,7 @@ class TestIdempotencyKeyFn:
 
     async def test_key_fn_generates_key_and_deduplicates(self, queue):
         """Key fn is called and its output used for dedup."""
-        wrapped = task(
-            queue, idempotency_key=lambda x, y: f"order:{x}"
-        )(add_task)
+        wrapped = task(queue, idempotency_key=lambda x, y: f"order:{x}")(add_task)
         job1 = await wrapped.enqueue(42, 0)
         job2 = await wrapped.enqueue(42, 0)
         assert job1.ulid == job2.ulid
@@ -180,9 +179,7 @@ class TestIdempotencyKeyFn:
 
     async def test_key_fn_discriminates_different_args(self, queue):
         """Different args produce different keys and different jobs."""
-        wrapped = task(
-            queue, idempotency_key=lambda x, y: f"order:{x}"
-        )(add_task)
+        wrapped = task(queue, idempotency_key=lambda x, y: f"order:{x}")(add_task)
         job_a = await wrapped.enqueue(1, 0)
         job_b = await wrapped.enqueue(2, 0)
         assert job_a.ulid != job_b.ulid
@@ -191,9 +188,7 @@ class TestIdempotencyKeyFn:
 
     async def test_key_fn_with_kwargs(self, queue):
         """Key fn receives kwargs correctly and deduplicates."""
-        wrapped = task(
-            queue, idempotency_key=lambda x, y=0: f"add:{x}:{y}"
-        )(add_task_default)
+        wrapped = task(queue, idempotency_key=lambda x, y=0: f"add:{x}:{y}")(add_task_default)
         job1 = await wrapped.enqueue(1, y=2)
         assert job1.idempotency_key == "add:1:2"
         job2 = await wrapped.enqueue(1, y=2)
@@ -201,9 +196,7 @@ class TestIdempotencyKeyFn:
 
     async def test_explicit_key_overrides_fn(self, queue):
         """Explicit _idempotency_key= takes precedence over fn."""
-        wrapped = task(
-            queue, idempotency_key=lambda x, y: f"auto:{x}"
-        )(add_task)
+        wrapped = task(queue, idempotency_key=lambda x, y: f"auto:{x}")(add_task)
         job1 = await wrapped.enqueue(1, 2, _idempotency_key="manual:override")
         assert job1.idempotency_key == "manual:override"
         job2 = await wrapped.enqueue(1, 2, _idempotency_key="manual:override")
@@ -232,6 +225,7 @@ class TestIdempotencyKeyFn:
 
     async def test_key_fn_exception_propagates(self, queue):
         """Exception in key fn propagates to caller."""
+
         def bad_key(*args, **kwargs):
             raise ValueError("key generation failed")
 
@@ -241,9 +235,7 @@ class TestIdempotencyKeyFn:
 
     async def test_key_fn_returns_non_string_raises_type_error(self, queue):
         """Non-string return from key fn raises TypeError."""
-        wrapped = task(
-            queue, idempotency_key=lambda: 42
-        )(noop_task)
+        wrapped = task(queue, idempotency_key=lambda: 42)(noop_task)
         with pytest.raises(TypeError, match="must return str"):
             await wrapped.enqueue()
 
@@ -353,10 +345,12 @@ class TestEnqueueMany:
     async def test_enqueue_many_with_dicts(self, queue):
         """Dicts can specify args, kwargs, and per-job overrides."""
         wrapped = task(queue)(add_task)
-        jobs = await wrapped.enqueue_many([
-            {"args": (1, 2)},
-            {"args": (3,), "kwargs": {"y": 4}, "priority": 5},
-        ])
+        jobs = await wrapped.enqueue_many(
+            [
+                {"args": (1, 2)},
+                {"args": (3,), "kwargs": {"y": 4}, "priority": 5},
+            ]
+        )
         assert len(jobs) == 2
         assert jobs[1].priority == 5
 
