@@ -1897,7 +1897,7 @@ class TestTasksCommand:
             f"""
 from qler import Queue, task
 
-q = Queue("{db_path}")
+q = Queue({db_path!r})
 
 @task(q, max_retries=3, retry_delay=10, priority=5)
 async def send_email():
@@ -1947,7 +1947,7 @@ def process_sync():
             f"""
 from qler import Queue, task
 
-q = Queue("{db_path}", default_max_retries=2, default_retry_delay=30)
+q = Queue({db_path!r}, default_max_retries=2, default_retry_delay=30)
 
 @task(q, max_retries=5, retry_delay=15, priority=10, lease_duration=600)
 async def my_task():
@@ -1987,7 +1987,7 @@ async def my_task():
             f"""
 from qler import Queue, task
 
-q = Queue("{db_path}")
+q = Queue({db_path!r})
 
 @task(q, rate_limit="10/m")
 async def rate_limited():
@@ -2016,7 +2016,7 @@ async def rate_limited():
             f"""
 from qler import Queue, cron
 
-q = Queue("{db_path}")
+q = Queue({db_path!r})
 
 @cron(q, "*/5 * * * *")
 async def periodic_cleanup():
@@ -2047,7 +2047,7 @@ async def periodic_cleanup():
             f"""
 from qler import Queue, task
 
-q = Queue("{db_path}")
+q = Queue({db_path!r})
 
 @task(q)
 async def counted_task():
@@ -2114,7 +2114,7 @@ async def counted_task():
             f"""
 from qler import Queue, task
 
-q = Queue("{db_path}")
+q = Queue({db_path!r})
 
 @task(q, queue_name="emails")
 async def send_email():
