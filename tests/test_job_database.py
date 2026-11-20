@@ -216,3 +216,30 @@ class TestArchivedJob:
         rows = await queue.archive.as_dicts()
         assert [(r["ulid"], r["status"]) for r in rows] == [(claimed.ulid, JobStatus.FAILED.value)]
         assert await queue.jobs.count() == 0
+
+
+class TestCancelOfAJobInTheOtherFile:
+    @pytest.mark.parametrize(
+        "cancel",
+        [lambda first, job: job.cancel(), lambda first, job: first.cancel_job(job)],
+        ids=["job.cancel", "first.cancel_job"],
+    )
+    async def test_cancels_job_and_dependents_in_its_own_file(self, two_queues, cancel):
+        first, second = two_queues
+        await first.enqueue("mod.task", max_retries=0)
+        parent = await second.enqueue("mod.task", max_retries=0)
+        child = await second.enqueue("mod.task", depends_on=[parent.ulid])
+        grandchild = await second.enqueue("mod.task", depends_on=[child.ulid])
+        before = await _rows(first)
+
+        assert await cancel(first, parent) is True
+
+        assert [
+            ((await _row(second, j.ulid)).status, (await _row(second, j.ulid)).last_error)
+            for j in (parent, child, grandchild)
+        ] == [
+            (JobStatus.CANCELLED.value, None),
+            (JobStatus.CANCELLED.value, f"Dependency {parent.ulid} failed/cancelled"),
+            (JobStatus.CANCELLED.value, f"Dependency {child.ulid} failed/cancelled"),
+        ]
+        assert await _rows(first) == before

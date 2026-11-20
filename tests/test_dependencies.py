@@ -13,6 +13,8 @@ import pytest_asyncio
 from sqler import F
 from sqler.models.async_queryset import AsyncSQLerQuerySet
 
+from qler import _cancel as qler_cancel
+from qler import _notify as qler_notify
 from qler import _schema as qler_schema
 from qler._time import now_epoch
 from qler.enums import JobStatus
@@ -544,13 +546,13 @@ class TestCascadeReadsALevelAtATime:
     async def test_one_edge_read_per_level(self, queue, monkeypatch):
         root = await _shared_child_tree(queue)
         reads = {"n": 0}
-        original = Queue._dependency_edges
+        original = qler_cancel.children_by_parent
 
-        def counted(self):
+        async def counted(edges, parents):
             reads["n"] += 1
-            return original.fget(self)
+            return await original(edges, parents)
 
-        monkeypatch.setattr(Queue, "_dependency_edges", property(counted))
+        monkeypatch.setattr(qler_cancel, "children_by_parent", counted)
         await queue.fail_job(root, "worker-1", ValueError("boom"))
 
         # Levels [P], [A, B], [C, E, D]: three reads (one per job would be six).
@@ -1579,3 +1581,180 @@ class TestDependencyEdgesModel:
         finally:
             await q1.close()
             await q2.close()
+
+
+# ---------------------------------------------------------------------------
+# A cancel is the same whichever public call made it
+# ---------------------------------------------------------------------------
+
+CANCEL_CALLS = pytest.mark.parametrize(
+    "cancel",
+    [lambda q, job: job.cancel(), lambda q, job: q.cancel_job(job)],
+    ids=["job.cancel", "queue.cancel_job"],
+)
+
+
+@pytest.fixture
+def cancel_writes(monkeypatch):
+    """Count the rows each call actually moved to cancelled."""
+    original = AsyncSQLerQuerySet.update_one
+    seen = {"n": 0}
+
+    async def update_one(self, **fields):
+        row = await original(self, **fields)
+        if row is not None and fields.get("status") == JobStatus.CANCELLED.value:
+            seen["n"] += 1
+        return row
+
+    monkeypatch.setattr(AsyncSQLerQuerySet, "update_one", update_one)
+    return seen
+
+
+async def _state(queue, ulid):
+    row = await _job(queue, ulid)
+    return row.status, row.last_error
+
+
+class TestEitherCallCancelsTheSame:
+    @CANCEL_CALLS
+    async def test_chain_of_three_dependents(self, queue, cancel, cancel_writes):
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        c = await queue.enqueue("my.task", depends_on=[b.ulid])
+        d = await queue.enqueue("my.task", depends_on=[c.ulid])
+
+        assert await cancel(queue, a) is True
+
+        assert a.status == JobStatus.CANCELLED.value
+        assert await _state(queue, a.ulid) == (JobStatus.CANCELLED.value, None)
+        assert await _state(queue, b.ulid) == (
+            JobStatus.CANCELLED.value,
+            f"Dependency {a.ulid} failed/cancelled",
+        )
+        assert await _state(queue, c.ulid) == (
+            JobStatus.CANCELLED.value,
+            f"Dependency {b.ulid} failed/cancelled",
+        )
+        assert await _state(queue, d.ulid) == (
+            JobStatus.CANCELLED.value,
+            f"Dependency {c.ulid} failed/cancelled",
+        )
+        assert cancel_writes["n"] == 4
+
+    @CANCEL_CALLS
+    async def test_diamond_cancels_each_job_once(self, queue, cancel, cancel_writes):
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        c = await queue.enqueue("my.task", depends_on=[a.ulid])
+        d = await queue.enqueue("my.task", depends_on=[b.ulid, c.ulid])
+
+        assert await cancel(queue, a) is True
+
+        assert await _state(queue, b.ulid) == (
+            JobStatus.CANCELLED.value,
+            f"Dependency {a.ulid} failed/cancelled",
+        )
+        assert await _state(queue, c.ulid) == (
+            JobStatus.CANCELLED.value,
+            f"Dependency {a.ulid} failed/cancelled",
+        )
+        assert await _state(queue, d.ulid) == (
+            JobStatus.CANCELLED.value,
+            f"Dependency {b.ulid} failed/cancelled",
+        )
+        assert cancel_writes["n"] == 4
+
+    @CANCEL_CALLS
+    async def test_job_claimed_after_the_read_is_asked_to_stop(self, queue, cancel, cancel_writes):
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        stale = await _job(queue, a.ulid)
+        claimed = await queue.claim_job("worker-1", ["default"])
+        assert claimed.ulid == a.ulid
+
+        assert await cancel(queue, stale) is True
+
+        row = await _job(queue, a.ulid)
+        assert (row.status, row.cancel_requested) == (JobStatus.RUNNING.value, True)
+        assert await _state(queue, b.ulid) == (JobStatus.PENDING.value, None)
+        assert cancel_writes["n"] == 0
+
+    @CANCEL_CALLS
+    @pytest.mark.parametrize(
+        "status",
+        [JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value],
+    )
+    async def test_finished_job_answers_false_and_writes_nothing(
+        self, queue, cancel, status, cancel_writes
+    ):
+        a = await queue.enqueue("my.task")
+        await queue.enqueue("my.task", depends_on=[a.ulid])
+        await queue.jobs.filter(F("ulid") == a.ulid).update_one(
+            status=status, finished_at=now_epoch(), updated_at=now_epoch()
+        )
+        cancel_writes["n"] = 0
+        finished = await _job(queue, a.ulid)
+        before = await queue.jobs.order_by("ulid").as_dicts()
+        event = qler_notify.register(a.ulid)
+        try:
+            assert await cancel(queue, finished) is False
+            assert event.is_set() is False
+        finally:
+            qler_notify.clear(a.ulid)
+        assert await queue.jobs.order_by("ulid").as_dicts() == before
+        assert cancel_writes["n"] == 0
+
+    @CANCEL_CALLS
+    async def test_cascade_failing_half_way_leaves_everything_pending(
+        self, queue, cancel, raise_on_nth_update
+    ):
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        c = await queue.enqueue("my.task", depends_on=[b.ulid])
+        raise_on_nth_update(_is_cascade_cancel, nth=2)
+        events = [qler_notify.register(u) for u in (a.ulid, b.ulid, c.ulid)]
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                await cancel(queue, a)
+            assert [e.is_set() for e in events] == [False, False, False]
+        finally:
+            for u in (a.ulid, b.ulid, c.ulid):
+                qler_notify.clear(u)
+        for ulid in (a.ulid, b.ulid, c.ulid):
+            assert await _state(queue, ulid) == (JobStatus.PENDING.value, None)
+
+    @CANCEL_CALLS
+    async def test_waiters_of_job_and_dependent_wake_cancelled(self, queue, cancel):
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        wait_a = asyncio.create_task(a.wait(poll_interval=60))
+        wait_b = asyncio.create_task((await _job(queue, b.ulid)).wait(poll_interval=60))
+        await asyncio.sleep(0.05)
+
+        assert await cancel(queue, a) is True
+
+        with pytest.raises(JobCancelledError):
+            await asyncio.wait_for(wait_a, 2)
+        with pytest.raises(JobCancelledError):
+            await asyncio.wait_for(wait_b, 2)
+
+    @CANCEL_CALLS
+    async def test_running_and_finished_dependents_are_left_alone(
+        self, queue, cancel, cancel_writes
+    ):
+        a = await queue.enqueue("my.task")
+        b = await queue.enqueue("my.task", depends_on=[a.ulid])
+        c = await queue.enqueue("my.task", depends_on=[a.ulid])
+        await queue.jobs.filter(F("ulid") == b.ulid).update_one(
+            status=JobStatus.RUNNING.value, updated_at=now_epoch()
+        )
+        await queue.jobs.filter(F("ulid") == c.ulid).update_one(
+            status=JobStatus.COMPLETED.value, finished_at=now_epoch(), updated_at=now_epoch()
+        )
+        cancel_writes["n"] = 0
+
+        assert await cancel(queue, a) is True
+
+        assert await _state(queue, b.ulid) == (JobStatus.RUNNING.value, None)
+        assert await _state(queue, c.ulid) == (JobStatus.COMPLETED.value, None)
+        assert cancel_writes["n"] == 1
