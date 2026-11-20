@@ -21,7 +21,7 @@ from qler.queue import Queue
 from qler.task import task
 from qler.worker import Worker
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
     "AttemptStatus",
