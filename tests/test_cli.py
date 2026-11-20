@@ -1740,6 +1740,14 @@ class TestHealthCommand:
         assert result.exit_code == 2
         assert "mutually exclusive" in result.output
 
+    def test_health_refuses_a_unix_socket_on_windows(self, runner, monkeypatch):
+        monkeypatch.setattr("sys.platform", "win32")
+        result = runner.invoke(cli, ["health", "--socket", "/tmp/h.sock"])
+        assert result.exit_code == 2
+        assert (
+            "--socket needs Unix sockets, which Windows does not have; use --port" in result.output
+        )
+
     def test_health_connection_refused(self, runner):
         """Connecting to a port with no listener → exit code 1."""
         result = runner.invoke(cli, ["health", "--port", "19199"])

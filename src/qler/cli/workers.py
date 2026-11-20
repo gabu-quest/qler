@@ -135,14 +135,18 @@ def health(
         raise click.UsageError("Either --port or --socket is required")
     if port is not None and socket_path is not None:
         raise click.UsageError("--port and --socket are mutually exclusive")
+    if socket_path is not None and sys.platform == "win32":
+        raise click.UsageError(
+            "--socket needs Unix sockets, which Windows does not have; use --port"
+        )
 
     try:
-        if socket_path is not None:
+        if socket_path is None:
+            s = socket_mod.create_connection((host, port), timeout=timeout)
+        elif sys.platform != "win32":  # refused above on Windows
             s = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
             s.settimeout(timeout)
             s.connect(socket_path)
-        else:
-            s = socket_mod.create_connection((host, port), timeout=timeout)
 
         safe_host = host.replace("\r", "").replace("\n", "")
         request = f"GET /health HTTP/1.0\r\nHost: {safe_host}\r\n\r\n"

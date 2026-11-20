@@ -13,6 +13,7 @@ import pathlib
 import platform
 import signal
 import socket
+import sys
 import time
 import weakref
 from collections.abc import Awaitable, Callable
@@ -163,6 +164,10 @@ class Worker:
             raise ConfigurationError(f"shutdown_timeout must be > 0, got {shutdown_timeout}")
         if health_port is not None and health_socket is not None:
             raise ConfigurationError("health_port and health_socket are mutually exclusive")
+        if health_socket is not None and sys.platform == "win32":
+            raise ConfigurationError(
+                "health_socket needs Unix sockets, which Windows does not have; use health_port"
+            )
         if health_port is not None and not (1 <= health_port <= 65535):
             raise ConfigurationError(f"health_port must be between 1 and 65535, got {health_port}")
         if archive_interval is not None and archive_interval < 1.0:
@@ -307,20 +312,20 @@ class Worker:
         """
         server: asyncio.AbstractServer | None = None
         try:
-            if self.health_socket is not None:
-                # Remove stale socket from a previous crash
-                pathlib.Path(self.health_socket).unlink(missing_ok=True)
-                server = await asyncio.start_unix_server(
-                    self._handle_health_request, path=self.health_socket
-                )
-                logger.info("Health endpoint listening on unix:%s", self.health_socket)
-            else:
+            if self.health_socket is None:
                 server = await asyncio.start_server(
                     self._handle_health_request,
                     host="127.0.0.1",
                     port=self.health_port,
                 )
                 logger.info("Health endpoint listening on 127.0.0.1:%d", self.health_port)
+            elif sys.platform != "win32":  # the constructor refuses health_socket on Windows
+                # Remove stale socket from a previous crash
+                pathlib.Path(self.health_socket).unlink(missing_ok=True)
+                server = await asyncio.start_unix_server(
+                    self._handle_health_request, path=self.health_socket
+                )
+                logger.info("Health endpoint listening on unix:%s", self.health_socket)
 
             # Serve until cancelled by _shutdown(). This means the health
             # endpoint stays up during graceful drain so procler can see
@@ -746,16 +751,15 @@ class Worker:
             if not self._running:
                 break
             try:
-                try:
-                    import resource
+                if sys.platform == "win32":
+                    continue  # no resource module on Windows, so nothing to measure
+                import resource
 
-                    rss_raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    if platform.system() == "Darwin":
-                        rss_mb = rss_raw / (1024 * 1024)  # macOS: bytes -> MB
-                    else:
-                        rss_mb = rss_raw / 1024  # Linux: KB -> MB
-                except ImportError:
-                    continue  # resource module unavailable on Windows
+                rss_raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                if platform.system() == "Darwin":
+                    rss_mb = rss_raw / (1024 * 1024)  # macOS: bytes -> MB
+                else:
+                    rss_mb = rss_raw / 1024  # Linux: KB -> MB
                 if rss_mb > limit_mb:
                     logger.warning(
                         "Memory watchdog: RSS %.0f MB exceeds limit %d MB, "

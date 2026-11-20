@@ -1749,6 +1749,14 @@ class TestHealthEndpoint:
         with pytest.raises(ConfigurationError, match="mutually exclusive"):
             Worker(worker_queue, health_port=9100, health_socket="/tmp/h.sock")
 
+    def test_constructor_rejects_a_unix_socket_on_windows(self, worker_queue, monkeypatch):
+        monkeypatch.setattr("sys.platform", "win32")
+        with pytest.raises(
+            ConfigurationError,
+            match="health_socket needs Unix sockets, which Windows does not have; use health_port",
+        ):
+            Worker(worker_queue, health_socket="/tmp/h.sock")
+
     def test_constructor_rejects_invalid_port_zero(self, worker_queue):
         with pytest.raises(ConfigurationError, match="health_port must be between 1 and 65535"):
             Worker(worker_queue, health_port=0)
