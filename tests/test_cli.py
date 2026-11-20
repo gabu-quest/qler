@@ -1392,7 +1392,7 @@ class TestVersionHelp:
     def test_version(self, runner):
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
-        assert result.output.strip() == "qler, version 0.6.0"
+        assert result.output.strip() == "qler, version 0.6.1"
 
     def test_help(self, runner):
         result = runner.invoke(cli, ["--help"])

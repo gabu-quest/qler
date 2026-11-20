@@ -2,15 +2,19 @@
 
 import asyncio
 import logging
+import os
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 from unittest.mock import patch
 
 import pytest
 from sqler import F
 
-from qler._time import now_epoch
+from qler import _time
+from qler._time import generate_ulid, now_epoch
 from qler.enums import FailureKind, JobStatus
 from qler.exceptions import (
     ConfigurationError,
@@ -581,6 +585,90 @@ class TestClaimOfOne:
         assert _ULID_PATTERN.match(second.last_attempt_id)
         attempts = await q.attempts.all()
         assert [a.job_ulid for a in attempts] == [first.ulid]
+
+
+# 2100-01-01 in milliseconds: later than any id the suite has made on the real clock.
+_T = 4_102_444_800_000
+
+
+def _clock(monkeypatch, read_ms):
+    """Give `time.time_ns` the milliseconds `read_ms(n)` returns for the n-th read (from 1)."""
+    reads = iter(range(1, 1_000_000))
+    monkeypatch.setattr(time, "time_ns", lambda: read_ms(next(reads)) * 1_000_000)
+
+
+# The clock stands still, so the parent's next id is its last id plus one.
+_PARENT_AND_FORKED_CHILD_EACH_MAKE_AN_ID = """
+import os, time
+from qler._time import generate_ulid
+
+time.time_ns = lambda: 4_102_444_800_000 * 1_000_000
+generate_ulid()
+read_end, write_end = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.write(write_end, generate_ulid().encode())
+    os._exit(0)
+os.close(write_end)
+os.waitpid(pid, 0)
+print(generate_ulid(), os.read(read_end, 26).decode())
+"""
+
+
+@pytest.fixture
+def ids_from_a_new_run(monkeypatch):
+    """Start the id generator anew for one test and put its state back after it."""
+    monkeypatch.setattr(_time, "_last_ms", 0, raising=False)
+    monkeypatch.setattr(_time, "_last_random", 0, raising=False)
+
+
+@pytest.mark.usefixtures("ids_from_a_new_run")
+class TestIdsSortInTheOrderMade:
+    """Jobs of equal priority and eta are claimed by id, so each id sorts after the one before it."""
+
+    def test_an_id_made_as_the_millisecond_turns(self, monkeypatch):
+        _clock(monkeypatch, lambda n: _T if n <= 3 else _T + 1)
+        fresh = iter([b"\x80" + bytes(9), bytes(10), bytes(10)])
+        monkeypatch.setattr(os, "urandom", lambda size: next(fresh))
+
+        ids = [generate_ulid() for _ in range(4)]
+
+        assert ids == sorted(ids)
+        assert len(set(ids)) == 4
+
+    def test_an_id_made_after_the_clock_steps_back(self, monkeypatch):
+        _clock(monkeypatch, lambda n: _T + 5 if n <= 2 else _T)
+
+        ids = [generate_ulid() for _ in range(4)]
+
+        assert ids == sorted(ids)
+        assert len(set(ids)) == 4
+
+    def test_the_last_id_of_a_millisecond_is_followed_by_the_next_millisecond(self, monkeypatch):
+        _clock(monkeypatch, lambda n: _T)
+        fresh = iter([b"\xff" * 10, b"\x01" + bytes(9)])
+        monkeypatch.setattr(os, "urandom", lambda size: next(fresh))
+
+        ids = [generate_ulid() for _ in range(2)]
+
+        assert ids == sorted(ids)
+        assert len(set(ids)) == 2
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork on this platform")
+    def test_a_forked_child_does_not_make_its_parents_next_id(self):
+        # In a process of its own: forking the test process, which has threads, warns.
+        result = subprocess.run(
+            [sys.executable, "-c", _PARENT_AND_FORKED_CHILD_EACH_MAKE_AN_ID],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+
+        parents, childs = result.stdout.split()
+        assert _ULID_PATTERN.match(parents)
+        assert _ULID_PATTERN.match(childs)
+        assert childs != parents
 
 
 class TestClaimIsOneWrite:

@@ -545,15 +545,32 @@ async def test_catchup_idempotent(queue):
     assert len(keys) == len(set(keys))
 
 
-async def test_catchup_no_history_skips(queue):
+class _SchedulerClockAt(datetime):
+    """The scheduler loop's clock, held at one instant.
+
+    A test that counts the runs of an every-minute schedule on the real clock counts
+    one more when the worker happens to run across a minute boundary.
+    """
+
+    instant: datetime
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.instant
+
+
+async def test_catchup_no_history_skips(queue, monkeypatch):
     """First-ever run with no prior jobs — no catchup, just normal scheduling."""
     wrapped = cron(queue, "* * * * *", catchup=5)(catchup_nohistory_task)
+    _SchedulerClockAt.instant = datetime(2026, 3, 9, 14, 7, 30, tzinfo=UTC)
+    monkeypatch.setattr("qler.worker.datetime", _SchedulerClockAt)
 
     await _run_worker_briefly(queue)
 
     all_jobs = await queue.jobs.filter(F("task") == wrapped.task_path).all()
-    # Should have exactly 1 job (from normal scheduling), not a flood
-    assert len(all_jobs) == 1
+    # The run of 14:07 from normal scheduling, and none of the five minutes before it.
+    slot = int(datetime(2026, 3, 9, 14, 7, tzinfo=UTC).timestamp())
+    assert [job.idempotency_key for job in all_jobs] == [wrapped.idempotency_key(slot)]
 
 
 async def test_catchup_latest_picks_most_recent(queue):
