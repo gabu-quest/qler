@@ -4,7 +4,7 @@ All notable changes to qler will be documented in this file.
 
 ## [Unreleased]
 
-Requires `sqler>=1.2026.11.2`.
+Requires `sqler>=1.2026.11.2`. The `logler` extra requires `logler>=2.0.0`, the first logler with wheels for Python 3.12 and later.
 
 ### Upgrading from 0.5
 

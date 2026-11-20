@@ -32,7 +32,8 @@ try:
 except ImportError:
 
     @contextmanager
-    def correlation_context(correlation_id: str):
+    def correlation_context(correlation_id: str, otel_bridge: bool = False):
+        # The signature is logler's, so either definition takes the same call.
         yield correlation_id
 
 
