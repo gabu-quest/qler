@@ -24,7 +24,6 @@ Fully implemented. The version is in `pyproject.toml`; what each release added i
 
 | File | Purpose |
 |------|---------|
-| `ROADMAP.md` | One line per finished milestone |
 | `CHANGELOG.md` | Release history |
 | `NORTH_STAR.md` | Vision, philosophy, non-negotiable principles |
 | `README.md` | User-facing introduction |
@@ -178,9 +177,3 @@ tests/
 ├── test_context.py          # current_job() context access
 └── test_cli.py              # CLI commands
 ```
-
----
-
-## Active Roadmaps
-
-- [ROADMAP.md](./ROADMAP.md) — every milestone is finished.
